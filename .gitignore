@@ -1,0 +1,13 @@
+node_modules/
+.env
+*.log
+.DS_Store
+npm-debug.log*
+
+# Legacy per-project installs
+Market_Making_Bitmart/node_modules/
+Market_making_Lbank/node_modules/
+Market_making _Dashboard/node_modules/
+
+# Archived legacy projects
+archive/legacy-projects/

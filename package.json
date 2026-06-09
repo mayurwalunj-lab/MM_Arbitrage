@@ -1,0 +1,39 @@
+{
+  "name": "mm-arbitrage-live-services",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Shared runtime dependencies and launch scripts for the active Bitmart, LBank, and dashboard services.",
+  "scripts": {
+    "start": "./run-all.sh all",
+    "start:all": "./run-all.sh all",
+    "start:bots": "./run-all.sh bots",
+    "start:grids": "./run-all.sh grids",
+    "start:bitmart": "./run-all.sh bitmart",
+    "start:lbank": "./run-all.sh lbank",
+    "start:dashboard": "./run-all.sh dashboard",
+    "bitmart:pattern": "node bitmart/Bitmart_Pattern_Trading.js",
+    "bitmart:grid": "node bitmart/grid_manager_bitmart.js",
+    "lbank:pattern": "node lbank/Lbank_Pattern_Trading.js",
+    "lbank:grid": "node lbank/LBank_GridManager.js",
+    "dashboard": "node dashboard/Server.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:restart": "pm2 restart ecosystem.config.js",
+    "check": "node --check bitmart/Bitmart_Pattern_Trading.js && node --check bitmart/grid_manager_bitmart.js && node --check lbank/Lbank_Pattern_Trading.js && node --check lbank/LBank_GridManager.js && node --check dashboard/Server.js",
+    "test:preflight": "node scripts/preflight.js",
+    "test:db": "node scripts/preflight.js --db",
+    "test:exchange": "node scripts/preflight.js --public-exchange",
+    "test:balances": "node scripts/preflight.js --private-balances",
+    "test:production": "node scripts/preflight.js --all --private-balances"
+  },
+  "dependencies": {
+    "ccxt": "^4.5.32",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "mysql2": "^3.16.1",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LBank Control Panel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body { background-color: #0b0e11; color: #848e9c; font-family: monospace; }
+        .text-bid { color: #0ecb81; }
+        .text-ask { color: #f6465d; }
+        .bg-bid { background-color: rgba(14, 203, 129, 0.15); }
+        .bg-ask { background-color: rgba(246, 70, 93, 0.15); }
+        
+        .panel { background-color: #151a1f; border-radius: 4px; display: flex; flex-direction: column; overflow: hidden; }
+        
+        .order-row { display: flex; position: relative; padding: 2px 4px; font-size: 11px; margin-bottom: 1px; }
+        .depth-bar { position: absolute; top: 0; bottom: 0; right: 0; opacity: 0.3; z-index: 0; }
+        .row-content { position: relative; z-index: 10; display: grid; grid-template-columns: 1fr 1fr 1fr; width: 100%; }
+        
+        .wall-order { border-left: 2px solid #0ecb81; font-weight: bold; color: white; background: rgba(14, 203, 129, 0.1); }
+        .wall-order-sell { border-left: 2px solid #f6465d; font-weight: bold; color: white; background: rgba(246, 70, 93, 0.1); }
+
+        /* Modal Styles */
+        .modal-bg { background-color: rgba(0,0,0,0.8); backdrop-filter: blur(2px); }
+        .input-group label { display: block; font-size: 10px; color: #848e9c; margin-bottom: 2px; }
+        .input-group input { width: 100%; background: #0b0e11; border: 1px solid #2b3139; color: white; padding: 4px; font-size: 12px; border-radius: 2px; }
+        .input-group input:focus { border-color: #f0b90b; outline: none; }
+    </style>
+</head>
+<body class="h-screen flex flex-col p-2 gap-2 overflow-hidden relative">
+
+    <!-- TOP BAR -->
+    <div class="flex justify-between items-center px-4 py-2 bg-[#151a1f] rounded border-b border-gray-800">
+        <div class="flex items-center gap-4">
+            <h1 class="text-white font-bold text-lg">L1X/USDT <span class="text-xs text-yellow-500">PRESSURE BOT</span></h1>
+            <button onclick="toggleSettings()" class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-xs border border-gray-600">⚙️ CONFIGURATION</button>
+        </div>
+        
+        <div class="flex gap-6 text-xs items-center">
+            <div id="statusIndicator" class="bg-red-900 text-red-200 px-3 py-1 rounded font-bold">● STOPPED</div>
+            <button id="btnStart" onclick="startBot()" class="bg-green-600 hover:bg-green-500 text-white px-4 py-1 rounded font-bold">START</button>
+            <button id="btnStop" onclick="stopBot()" class="bg-red-600 hover:bg-red-500 text-white px-4 py-1 rounded font-bold hidden">STOP</button>
+            
+            <div class="border-l border-gray-700 pl-4 ml-2">
+                <span class="text-gray-500">Vol Target:</span>
+                <span class="text-white ml-1" id="dispTarget">--</span>
+            </div>
+            <div>
+                <span class="text-gray-500">Current Vol:</span>
+                <span class="text-bid font-bold font-mono ml-1" id="dispVol">$0.00</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- MAIN GRID -->
+    <div class="flex-1 grid grid-cols-12 gap-2 min-h-0">
+        <!-- LEFT COLUMN (Chart & Logs) -->
+        <div class="col-span-9 flex flex-col gap-2">
+            <div class="panel flex-1 relative">
+                <div id="priceChart" class="w-full h-full absolute inset-0"></div>
+            </div>
+            <div class="panel h-64 bg-black border-t border-gray-700">
+                <div class="px-3 py-1 bg-gray-800 text-[10px] text-gray-400 font-bold flex justify-between">
+                    <span>TERMINAL OUTPUT</span>
+                    <span class="text-gray-500">socket connected</span>
+                </div>
+                <div id="consoleLog" class="p-2 overflow-y-auto flex-1 text-[11px] space-y-1 font-mono">
+                    <div class="text-blue-500">Waiting for command...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- RIGHT COLUMN (OrderBook & Balances) -->
+        <div class="col-span-3 panel">
+            <div class="px-3 py-2 bg-[#1e2329] border-b border-gray-800 text-xs font-bold text-white">Order Book (Sim/Real)</div>
+            <div class="grid grid-cols-3 px-2 py-1 text-[10px] text-gray-500">
+                <span>Price</span><span class="text-right">Amt</span><span class="text-right">Total</span>
+            </div>
+            <div id="obAsks" class="flex-1 overflow-hidden flex flex-col-reverse justify-end relative"></div>
+            <div class="py-2 px-3 text-lg font-bold text-bid text-center bg-[#1e2329] border-y border-gray-800" id="midPrice">--</div>
+            <div id="obBids" class="flex-1 overflow-hidden flex flex-col relative"></div>
+            <div class="p-2 border-t border-gray-800 text-[10px] space-y-1">
+                <div class="flex justify-between"><span>Bot A Bal:</span><span id="balA" class="text-white">--</span></div>
+                <div class="flex justify-between"><span>Bot B Bal:</span><span id="balB" class="text-white">--</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- SETTINGS MODAL -->
+    <div id="settingsModal" class="hidden absolute inset-0 modal-bg z-50 flex items-center justify-center p-10">
+        <div class="bg-[#1e2329] border border-gray-700 rounded shadow-2xl w-full max-w-5xl h-full max-h-[90vh] flex flex-col">
+            <div class="flex justify-between items-center p-4 border-b border-gray-700 bg-[#151a1f]">
+                <h2 class="text-white font-bold text-lg">Bot Configuration</h2>
+                <button onclick="toggleSettings()" class="text-gray-400 hover:text-white text-xl">&times;</button>
+            </div>
+            
+            <div class="p-6 overflow-y-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="configForm">
+                <!-- Inputs injected by JS -->
+            </div>
+
+            <div class="p-4 border-t border-gray-700 bg-[#151a1f] flex justify-end gap-3">
+                <button onclick="toggleSettings()" class="px-4 py-2 bg-gray-700 text-white rounded hover:bg-gray-600">Cancel</button>
+                <button onclick="saveAndStart()" class="px-6 py-2 bg-yellow-500 text-black font-bold rounded hover:bg-yellow-400">SAVE & START ENGINE</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let chart;
+        let candleSeries = [];
+        let currentCandle = null;
+        let currentConfig = {};
+
+        // --- CHART SETUP ---
+        document.addEventListener('DOMContentLoaded', () => {
+            const options = {
+                series: [{ data: [] }],
+                chart: { type: 'candlestick', height: '100%', background: 'transparent', toolbar: {show:false}, animations: {enabled: false}},
+                plotOptions: { candlestick: { colors: { upward: '#0ecb81', downward: '#f6465d' } } },
+                xaxis: { type: 'datetime', axisBorder: {show:false}, axisTicks: {show:false} },
+                yaxis: { opposite: true, labels: {style: {colors: '#848e9c'}, formatter: v => v.toFixed(4)} },
+                grid: { borderColor: '#2b3139', strokeDashArray: 2 },
+                theme: { mode: 'dark' }
+            };
+            chart = new ApexCharts(document.querySelector("#priceChart"), options);
+            chart.render();
+        });
+
+        function updateCandle(price) {
+            const now = new Date().getTime();
+            if (!currentCandle) {
+                currentCandle = { x: now, y: [price, price, price, price] };
+                candleSeries.push(currentCandle);
+            }
+            currentCandle.y[1] = Math.max(currentCandle.y[1], price);
+            currentCandle.y[2] = Math.min(currentCandle.y[2], price);
+            currentCandle.y[3] = price;
+            if(Math.random() > 0.8) currentCandle = null; 
+            if(candleSeries.length > 50) candleSeries.shift();
+            chart.updateSeries([{ data: candleSeries }]);
+        }
+
+        // --- SOCKET EVENTS ---
+        
+        socket.on('connect', () => {
+            console.log("Connected");
+            socket.emit('request_config'); // Get current config on load
+        });
+
+        socket.on('config_data', (config) => {
+            currentConfig = config;
+            renderConfigForm(config);
+            document.getElementById('dispTarget').innerText = config.dailyVolumeTarget.toLocaleString();
+        });
+
+        socket.on('status_update', (isRunning) => {
+            const status = document.getElementById('statusIndicator');
+            const btnStart = document.getElementById('btnStart');
+            const btnStop = document.getElementById('btnStop');
+
+            if(isRunning) {
+                status.innerHTML = "● ENGINE RUNNING";
+                status.className = "bg-green-900 text-green-200 px-3 py-1 rounded font-bold animate-pulse";
+                btnStart.classList.add('hidden');
+                btnStop.classList.remove('hidden');
+            } else {
+                status.innerHTML = "● STOPPED";
+                status.className = "bg-red-900 text-red-200 px-3 py-1 rounded font-bold";
+                btnStart.classList.remove('hidden');
+                btnStop.classList.add('hidden');
+            }
+        });
+
+        socket.on('log', (data) => {
+            const div = document.createElement('div');
+            let color = 'text-gray-400';
+            if(data.type === 'req') color = 'text-blue-400 font-bold';
+            if(data.type === 'res') color = 'text-green-400 font-bold';
+            if(data.type === 'warn') color = 'text-red-400 font-bold';
+            if(data.type === 'grid') color = 'text-yellow-500 border-b border-gray-800 pb-1 mb-1';
+            
+            div.className = `${color}`;
+            div.innerHTML = `<span class="opacity-50 text-xs">[${data.time}]</span> ${data.msg}`;
+            const c = document.getElementById('consoleLog');
+            c.appendChild(div);
+            c.scrollTop = c.scrollHeight;
+        });
+
+        socket.on('price', (price) => {
+            document.getElementById('midPrice').innerText = price.toFixed(4);
+            updateCandle(price);
+        });
+
+        socket.on('stats', (data) => {
+            document.getElementById('dispVol').innerText = '$' + Math.floor(data.volume).toLocaleString();
+            document.getElementById('balA').innerText = `${data.balances.botA.usdt.toFixed(0)} USDT / ${data.balances.botA.l1x.toFixed(0)} L1X`;
+            document.getElementById('balB').innerText = `${data.balances.botB.usdt.toFixed(0)} USDT / ${data.balances.botB.l1x.toFixed(0)} L1X`;
+        });
+
+        socket.on('orderbook', (grid) => {
+            const renderRow = (row, type) => {
+                const bg = type === 'ask' ? 'bg-ask' : 'bg-bid';
+                const txt = type === 'ask' ? 'text-ask' : 'text-bid';
+                const wallClass = row.isWall ? (type==='ask' ? 'wall-order-sell' : 'wall-order') : '';
+                const w = Math.min((row.amount/100)*100, 100); 
+                return `
+                <div class="order-row ${wallClass}">
+                    <div class="depth-bar ${bg}" style="width: ${w}%"></div>
+                    <div class="row-content">
+                        <span class="${txt} text-left">${row.price.toFixed(4)}</span>
+                        <span class="text-white text-right">${row.amount.toFixed(1)}</span>
+                        <span class="text-gray-500 text-right">${Math.floor(row.price*row.amount)}</span>
+                    </div>
+                </div>`;
+            };
+            document.getElementById('obAsks').innerHTML = grid.asks.slice(0, 12).reverse().map(r => renderRow(r, 'ask')).join('');
+            document.getElementById('obBids').innerHTML = grid.bids.slice(0, 12).map(r => renderRow(r, 'bid')).join('');
+        });
+
+        // --- CONTROLS & FORM ---
+
+        function toggleSettings() {
+            const modal = document.getElementById('settingsModal');
+            modal.classList.toggle('hidden');
+        }
+
+        function startBot() {
+            socket.emit('start_engine');
+        }
+
+        function stopBot() {
+            socket.emit('stop_engine');
+        }
+
+        function saveAndStart() {
+            // Harvest data from inputs
+            const newConfig = { ...currentConfig };
+            
+            // Basic fields
+            for (const key in newConfig) {
+                if (typeof newConfig[key] !== 'object') {
+                    const el = document.getElementById(`inp_${key}`);
+                    if(el) {
+                        if(el.type === 'checkbox') newConfig[key] = el.checked;
+                        else if(el.type === 'number') newConfig[key] = parseFloat(el.value);
+                        else newConfig[key] = el.value;
+                    }
+                }
+            }
+
+            // Handle Nested Objects (API Keys) manually for simplicity or specific logic
+            const botAKeys = {
+                apiKey: document.getElementById('inp_botA_apiKey').value,
+                secret: document.getElementById('inp_botA_secret').value,
+                uid: document.getElementById('inp_botA_uid').value,
+            };
+            const botBKeys = {
+                apiKey: document.getElementById('inp_botB_apiKey').value,
+                secret: document.getElementById('inp_botB_secret').value,
+                uid: document.getElementById('inp_botB_uid').value,
+            };
+            newConfig.botA = botAKeys;
+            newConfig.botB = botBKeys;
+
+            socket.emit('update_config', newConfig);
+            toggleSettings();
+            
+            // Give server a moment to update config then start
+            setTimeout(() => {
+                socket.emit('start_engine');
+            }, 500);
+        }
+
+        function renderConfigForm(config) {
+            const container = document.getElementById('configForm');
+            container.innerHTML = ''; // Clear
+
+            // Helper to create inputs
+            const createInput = (key, val, label, parentKey = null) => {
+                const id = parentKey ? `inp_${parentKey}_${key}` : `inp_${key}`;
+                const div = document.createElement('div');
+                div.className = "input-group";
+                
+                let inputHtml = '';
+                if (typeof val === 'boolean') {
+                    inputHtml = `
+                        <div class="flex items-center gap-2 mt-4 bg-gray-800 p-2 rounded border border-gray-600">
+                            <input type="checkbox" id="${id}" ${val ? 'checked' : ''} class="w-4 h-4 !bg-transparent">
+                            <label for="${id}" class="!mb-0 text-white font-bold cursor-pointer">${label.toUpperCase()}</label>
+                        </div>
+                    `;
+                } else {
+                    const type = typeof val === 'number' ? 'number' : 'text';
+                    const step = typeof val === 'number' && val % 1 !== 0 ? '0.0001' : '1';
+                    inputHtml = `
+                        <label>${label}</label>
+                        <input type="${type}" id="${id}" value="${val}" step="${step}">
+                    `;
+                }
+                div.innerHTML = inputHtml;
+                return div;
+            };
+
+            // 1. Main Config Fields
+            for (const [key, value] of Object.entries(config)) {
+                if (typeof value !== 'object') {
+                    container.appendChild(createInput(key, value, key.replace(/([A-Z])/g, ' $1').trim()));
+                }
+            }
+
+            // 2. API Keys (Hardcoded section for layout control)
+            const apiContainer = document.createElement('div');
+            apiContainer.className = "col-span-1 md:col-span-2 lg:col-span-3 grid grid-cols-2 gap-4 border-t border-gray-700 pt-4 mt-2";
+            
+            const createApiBlock = (botName, data) => {
+                const block = document.createElement('div');
+                block.className = "bg-black/30 p-3 rounded border border-gray-700";
+                block.innerHTML = `<h3 class="text-white font-bold mb-2">${botName.toUpperCase()} Credentials</h3>`;
+                block.appendChild(createInput('apiKey', data.apiKey, 'API Key', botName));
+                block.appendChild(createInput('secret', data.secret, 'Secret Key', botName));
+                block.appendChild(createInput('uid', data.uid, 'UID/Memo', botName));
+                return block;
+            };
+
+            apiContainer.appendChild(createApiBlock('botA', config.botA));
+            apiContainer.appendChild(createApiBlock('botB', config.botB));
+            container.appendChild(apiContainer);
+        }
+    </script>
+</body>
+</html>
