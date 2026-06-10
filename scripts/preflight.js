@@ -23,6 +23,7 @@ const activeFiles = [
   'lbank/public/index.html',
   'dashboard/Server.js',
   'dashboard/index.html',
+  'uniswap/uniswap_l1x_trader.js',
   'package.json',
   'package-lock.json',
   'ecosystem.config.js',
@@ -57,7 +58,21 @@ const requiredEnvKeys = [
   'LBANK_DB_USER',
   'LBANK_DB_PASSWORD',
   'LBANK_DB_NAME',
-  'DASHBOARD_PORT'
+  'DASHBOARD_PORT',
+  'UNISWAP_CHAIN_ID',
+  'L1X_TOKEN_ADDRESS',
+  'L1X_WETH_POOL_ADDRESS',
+  'WETH_ADDRESS',
+  'UNISWAP_QUOTER_V2_ADDRESS',
+  'UNISWAP_SWAP_ROUTER_02_ADDRESS',
+  'UNISWAP_DEFAULT_SLIPPAGE_BPS',
+  'UNISWAP_DEADLINE_SECONDS'
+];
+
+const optionalEnvKeys = [
+  'ETH_RPC_URL',
+  'UNISWAP_WALLET_PRIVATE_KEY',
+  'UNISWAP_WALLET_ADDRESS'
 ];
 
 const requiredPackages = ['ccxt', 'cors', 'dotenv', 'express', 'mysql2', 'socket.io'];
@@ -166,8 +181,10 @@ addCheck('env keys are complete and non-empty', () => {
   assert(duplicate.length === 0, `Duplicate env keys: ${duplicate.join(', ')}`);
   const missing = requiredEnvKeys.filter((key) => !found.has(key));
   const empty = requiredEnvKeys.filter((key) => !envValue(key));
+  const optionalMissing = optionalEnvKeys.filter((key) => !found.has(key));
   assert(missing.length === 0, `Missing env keys: ${missing.join(', ')}`);
   assert(empty.length === 0, `Empty env keys: ${empty.join(', ')}`);
+  assert(optionalMissing.length === 0, `Missing optional env keys: ${optionalMissing.join(', ')}`);
 });
 
 addCheck('active process.env keys match .env', () => {
@@ -176,7 +193,8 @@ addCheck('active process.env keys match .env', () => {
     'bitmart/grid_manager_bitmart.js',
     'lbank/Lbank_Pattern_Trading.js',
     'lbank/LBank_GridManager.js',
-    'dashboard/Server.js'
+    'dashboard/Server.js',
+    'uniswap/uniswap_l1x_trader.js'
   ];
   const used = new Set();
   for (const f of jsFiles) {
@@ -187,7 +205,8 @@ addCheck('active process.env keys match .env', () => {
   }
   const { found } = parseEnvFile();
   const missing = [...used].filter((key) => !found.has(key)).sort();
-  const unused = [...found.keys()].filter((key) => !used.has(key)).sort();
+  const allowed = new Set([...requiredEnvKeys, ...optionalEnvKeys]);
+  const unused = [...found.keys()].filter((key) => !used.has(key) && !allowed.has(key)).sort();
   assert(missing.length === 0, `Used env keys missing from .env: ${missing.join(', ')}`);
   assert(unused.length === 0, `Unused env keys in .env: ${unused.join(', ')}`);
 });

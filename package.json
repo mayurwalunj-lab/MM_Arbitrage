@@ -23,17 +23,25 @@
     "test:db": "node scripts/preflight.js --db",
     "test:exchange": "node scripts/preflight.js --public-exchange",
     "test:balances": "node scripts/preflight.js --private-balances",
-    "test:production": "node scripts/preflight.js --all --private-balances"
+    "test:production": "node scripts/preflight.js --all --private-balances",
+    "uniswap": "node uniswap/uniswap_l1x_trader.js",
+    "uniswap:check": "node uniswap/uniswap_l1x_trader.js check",
+    "uniswap:quote-buy": "node uniswap/uniswap_l1x_trader.js quote-buy",
+    "uniswap:quote-sell": "node uniswap/uniswap_l1x_trader.js quote-sell",
+    "uniswap:buy": "node uniswap/uniswap_l1x_trader.js buy",
+    "uniswap:sell": "node uniswap/uniswap_l1x_trader.js sell",
+    "uniswap:test": "node scripts/uniswap_preflight.js",
+    "uniswap:test:quote": "node scripts/uniswap_preflight.js --quote",
+    "uniswap:test:wallet": "node scripts/uniswap_preflight.js --wallet",
+    "uniswap:test:all": "node scripts/uniswap_preflight.js --all"
   },
   "dependencies": {
     "ccxt": "^4.5.32",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
+    "ethers": "^6.16.0",
     "express": "^5.2.1",
     "mysql2": "^3.16.1",
     "socket.io": "^4.8.1"
-  },
-  "devDependencies": {
-    "concurrently": "^9.2.1"
   }
 }
