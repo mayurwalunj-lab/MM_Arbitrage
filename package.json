@@ -18,7 +18,7 @@
     "dashboard": "node dashboard/Server.js",
     "pm2:start": "pm2 start ecosystem.config.js",
     "pm2:restart": "pm2 restart ecosystem.config.js",
-    "check": "node --check bitmart/Bitmart_Pattern_Trading.js && node --check bitmart/grid_manager_bitmart.js && node --check lbank/Lbank_Pattern_Trading.js && node --check lbank/LBank_GridManager.js && node --check dashboard/Server.js",
+    "check": "node --check bitmart/Bitmart_Pattern_Trading.js && node --check bitmart/grid_manager_bitmart.js && node --check lbank/Lbank_Pattern_Trading.js && node --check lbank/LBank_GridManager.js && node --check dashboard/Server.js && node --check uniswap/lib.js && node --check uniswap/uniswap_l1x_trader.js && node --check arb/orderbook.js && node --check arb/cex.js && node --check arb/edge.js && node --check arb/monitor.js",
     "test:preflight": "node scripts/preflight.js",
     "test:db": "node scripts/preflight.js --db",
     "test:exchange": "node scripts/preflight.js --public-exchange",
@@ -28,12 +28,18 @@
     "uniswap:check": "node uniswap/uniswap_l1x_trader.js check",
     "uniswap:quote-buy": "node uniswap/uniswap_l1x_trader.js quote-buy",
     "uniswap:quote-sell": "node uniswap/uniswap_l1x_trader.js quote-sell",
+    "uniswap:max-sell-size": "node uniswap/uniswap_l1x_trader.js max-sell-size",
+    "uniswap:impact": "node uniswap/uniswap_l1x_trader.js impact",
+    "uniswap:balance": "node uniswap/uniswap_l1x_trader.js balance",
     "uniswap:buy": "node uniswap/uniswap_l1x_trader.js buy",
     "uniswap:sell": "node uniswap/uniswap_l1x_trader.js sell",
     "uniswap:test": "node scripts/uniswap_preflight.js",
     "uniswap:test:quote": "node scripts/uniswap_preflight.js --quote",
     "uniswap:test:wallet": "node scripts/uniswap_preflight.js --wallet",
-    "uniswap:test:all": "node scripts/uniswap_preflight.js --all"
+    "uniswap:test:eth-price": "node scripts/uniswap_preflight.js --eth-price-only --eth-price",
+    "uniswap:test:all": "node scripts/uniswap_preflight.js --all",
+    "arb:monitor": "node arb/monitor.js",
+    "arb:monitor:once": "node arb/monitor.js --once"
   },
   "dependencies": {
     "ccxt": "^4.5.32",

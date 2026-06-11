@@ -71,8 +71,14 @@ const requiredEnvKeys = [
 
 const optionalEnvKeys = [
   'ETH_RPC_URL',
+  'ETH_USD_PRICE',
   'UNISWAP_WALLET_PRIVATE_KEY',
-  'UNISWAP_WALLET_ADDRESS'
+  'UNISWAP_WALLET_ADDRESS',
+  'ARB_BITMART_API_KEY',
+  'ARB_BITMART_SECRET',
+  'ARB_BITMART_UID',
+  'ARB_LBANK_API_KEY',
+  'ARB_LBANK_SECRET'
 ];
 
 const requiredPackages = ['ccxt', 'cors', 'dotenv', 'express', 'mysql2', 'socket.io'];

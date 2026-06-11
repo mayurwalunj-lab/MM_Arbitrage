@@ -7,7 +7,21 @@
 const ccxt = require('ccxt');
 const mysql = require('mysql2/promise');
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+// Signals the arb monitor (arb/monitor.js) that our orders are being
+// mass-cancelled, so it must not trust the L1X orderbook during this window.
+const GRID_REFRESH_FLAG = path.join(__dirname, '..', 'arb', 'state', 'grid_refreshing_lbank.flag');
+function setGridRefreshFlag() {
+    try {
+        fs.mkdirSync(path.dirname(GRID_REFRESH_FLAG), { recursive: true });
+        fs.writeFileSync(GRID_REFRESH_FLAG, String(Date.now()));
+    } catch (e) { /* flag I/O must never break trading */ }
+}
+function clearGridRefreshFlag() {
+    try { fs.unlinkSync(GRID_REFRESH_FLAG); } catch (e) { /* already gone */ }
+}
 
 // ============================================================
 // GRID MANAGER CONFIGURATION
@@ -881,10 +895,11 @@ async function cancelAllOrders(bot, symbol) {
         return;
     }
     
+    setGridRefreshFlag();
     try {
         const openOrders = await fetchOpenOrdersCached(bot, GRID_CONFIG.pair);
         const gridOrders = openOrders.filter(o => isGridOrder(o));
-        
+
         if (gridOrders.length === 0) {
             log("ℹ️ No grid orders to cancel" + (openOrders.length > 0 ? ` (${openOrders.length} manual order(s) left untouched)` : ''), 'info');
             return;
@@ -934,6 +949,8 @@ async function cancelAllOrders(bot, symbol) {
         log(`✅ Grid cancellation complete: ${cancelledCount} cancelled, ${failedCount} failed`, 'info');
     } catch (e) {
         log(`❌ Error cancelling orders: ${e.message}`, 'warn');
+    } finally {
+        clearGridRefreshFlag();
     }
 }
 

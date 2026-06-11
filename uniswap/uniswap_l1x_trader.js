@@ -3,37 +3,7 @@
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), quiet: true });
 
 const { ethers } = require('ethers');
-
-const ERC20_ABI = [
-  'function name() view returns (string)',
-  'function symbol() view returns (string)',
-  'function decimals() view returns (uint8)',
-  'function balanceOf(address account) view returns (uint256)',
-  'function allowance(address owner, address spender) view returns (uint256)',
-  'function approve(address spender, uint256 amount) returns (bool)'
-];
-
-const WETH_ABI = [
-  ...ERC20_ABI,
-  'function deposit() payable',
-  'function withdraw(uint256 amount)'
-];
-
-const V3_POOL_ABI = [
-  'function token0() view returns (address)',
-  'function token1() view returns (address)',
-  'function fee() view returns (uint24)',
-  'function liquidity() view returns (uint128)',
-  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)'
-];
-
-const QUOTER_V2_ABI = [
-  'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)'
-];
-
-const SWAP_ROUTER_02_ABI = [
-  'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)'
-];
+const lib = require('./lib');
 
 function usage() {
   console.log(`
@@ -42,6 +12,9 @@ Usage:
   node uniswap/uniswap_l1x_trader.js pool
   node uniswap/uniswap_l1x_trader.js quote-buy --eth 0.01 [--slippage 1]
   node uniswap/uniswap_l1x_trader.js quote-sell --l1x 100 [--slippage 1]
+  node uniswap/uniswap_l1x_trader.js max-sell-size --min-price-usd 8.5 --max-l1x 1000 [--eth-usd 3500] [--step-l1x 0.01]
+  node uniswap/uniswap_l1x_trader.js impact --l1x 10 [--eth-usd 3500]
+  node uniswap/uniswap_l1x_trader.js balance [--address 0x...]
   node uniswap/uniswap_l1x_trader.js buy --eth 0.01 [--slippage 1] [--execute]
   node uniswap/uniswap_l1x_trader.js sell --l1x 100 [--slippage 1] [--execute] [--unwrap]
 
@@ -49,6 +22,7 @@ Notes:
   - buy/sell are dry-run by default. Add --execute to broadcast.
   - buy swaps WETH -> L1X. It deposits ETH to WETH first only with --execute.
   - sell swaps L1X -> WETH. Add --unwrap with --execute to unwrap WETH to ETH after the swap.
+  - max-sell-size fetches live ETH/USDT first, then falls back to --eth-usd or ETH_USD_PRICE.
 `);
 }
 
@@ -72,132 +46,10 @@ function parseArgs(argv) {
   return out;
 }
 
-function envAddress(name) {
-  const value = requiredEnv(name);
-  if (!ethers.isAddress(value)) throw new Error(`${name} is not a valid address: ${value || '<empty>'}`);
-  return ethers.getAddress(value);
-}
-
-function requiredEnv(name) {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-}
-
-function envNumber(name, min, max) {
-  const value = Number(requiredEnv(name));
-  if (!Number.isFinite(value) || value < min || value > max) {
-    throw new Error(`${name} must be a number between ${min} and ${max}`);
-  }
-  return Math.trunc(value);
-}
-
-function getConfig() {
-  return {
-    rpcUrl: requiredEnv('ETH_RPC_URL'),
-    walletAddress: process.env.UNISWAP_WALLET_ADDRESS ? ethers.getAddress(process.env.UNISWAP_WALLET_ADDRESS) : null,
-    privateKey: process.env.UNISWAP_WALLET_PRIVATE_KEY || '',
-    chainId: envNumber('UNISWAP_CHAIN_ID', 1, 999999999),
-    l1xToken: envAddress('L1X_TOKEN_ADDRESS'),
-    poolAddress: envAddress('L1X_WETH_POOL_ADDRESS'),
-    weth: envAddress('WETH_ADDRESS'),
-    quoterV2: envAddress('UNISWAP_QUOTER_V2_ADDRESS'),
-    swapRouter02: envAddress('UNISWAP_SWAP_ROUTER_02_ADDRESS'),
-    defaultSlippageBps: envNumber('UNISWAP_DEFAULT_SLIPPAGE_BPS', 0, 5000),
-    deadlineSeconds: envNumber('UNISWAP_DEADLINE_SECONDS', 1, 86400)
-  };
-}
-
-function getProvider(config) {
-  return new ethers.JsonRpcProvider(config.rpcUrl, config.chainId);
-}
-
-function getWallet(config, provider, requirePrivateKey = false) {
-  if (!config.privateKey) {
-    if (requirePrivateKey) throw new Error('UNISWAP_WALLET_PRIVATE_KEY is required for --execute');
-    return null;
-  }
-  const wallet = new ethers.Wallet(config.privateKey, provider);
-  if (config.walletAddress && wallet.address.toLowerCase() !== config.walletAddress.toLowerCase()) {
-    throw new Error(`UNISWAP_WALLET_ADDRESS (${config.walletAddress}) does not match private key address (${wallet.address})`);
-  }
-  return wallet;
-}
-
-async function getPoolInfo(config, provider) {
-  const pool = new ethers.Contract(config.poolAddress, V3_POOL_ABI, provider);
-  const [token0, token1, fee, liquidity, slot0] = await Promise.all([
-    pool.token0(),
-    pool.token1(),
-    pool.fee(),
-    pool.liquidity(),
-    pool.slot0()
-  ]);
-
-  const normalized = {
-    token0: ethers.getAddress(token0),
-    token1: ethers.getAddress(token1),
-    fee: Number(fee),
-    liquidity,
-    sqrtPriceX96: slot0.sqrtPriceX96,
-    tick: Number(slot0.tick),
-    unlocked: slot0.unlocked
-  };
-
-  const hasL1x = [normalized.token0, normalized.token1].some((addr) => addr.toLowerCase() === config.l1xToken.toLowerCase());
-  const hasWeth = [normalized.token0, normalized.token1].some((addr) => addr.toLowerCase() === config.weth.toLowerCase());
-  if (!hasL1x || !hasWeth) {
-    throw new Error(`Pool ${config.poolAddress} is not the configured L1X/WETH pool`);
-  }
-
-  return normalized;
-}
-
-async function getTokenMeta(address, provider) {
-  const token = new ethers.Contract(address, ERC20_ABI, provider);
-  const [name, symbol, decimals] = await Promise.all([token.name(), token.symbol(), token.decimals()]);
-  return { address, name, symbol, decimals: Number(decimals) };
-}
-
-function bpsFromSlippage(value, defaultSlippageBps) {
-  const raw = value == null || value === true ? String(defaultSlippageBps / 100) : String(value);
-  const percent = Number(raw);
-  if (!Number.isFinite(percent) || percent < 0 || percent > 50) {
-    throw new Error('--slippage must be a percent between 0 and 50');
-  }
-  return Math.round(percent * 100);
-}
-
-function minOut(amountOut, slippageBps) {
-  return amountOut * BigInt(10000 - slippageBps) / 10000n;
-}
-
-function formatToken(amount, decimals, symbol) {
-  return `${ethers.formatUnits(amount, decimals)} ${symbol}`;
-}
-
-async function quoteExactInput({ config, provider, tokenIn, tokenOut, amountIn, fee }) {
-  const quoter = new ethers.Contract(config.quoterV2, QUOTER_V2_ABI, provider);
-  const params = {
-    tokenIn,
-    tokenOut,
-    amountIn,
-    fee,
-    sqrtPriceLimitX96: 0
-  };
-  const result = await quoter.quoteExactInputSingle.staticCall(params);
-  return {
-    amountOut: result.amountOut,
-    sqrtPriceX96After: result.sqrtPriceX96After,
-    initializedTicksCrossed: result.initializedTicksCrossed,
-    gasEstimate: result.gasEstimate
-  };
-}
-
 async function printContext(config, provider) {
   const [network, wallet] = await Promise.all([
     provider.getNetwork(),
-    Promise.resolve(getWallet(config, provider, false))
+    Promise.resolve(lib.getWallet(config, provider, false))
   ]);
   console.log(`chainId: ${network.chainId}`);
   console.log(`wallet: ${wallet ? wallet.address : (config.walletAddress || '<not configured>')}`);
@@ -209,14 +61,10 @@ async function printContext(config, provider) {
 }
 
 async function commandCheck() {
-  const config = getConfig();
-  const provider = getProvider(config);
+  const config = lib.getConfig();
+  const provider = lib.getProvider(config);
   await printContext(config, provider);
-  const pool = await getPoolInfo(config, provider);
-  const [l1x, weth] = await Promise.all([
-    getTokenMeta(config.l1xToken, provider),
-    getTokenMeta(config.weth, provider)
-  ]);
+  const { pool, l1x, weth } = await lib.loadMarket(config, provider);
   console.log(`pool token0: ${pool.token0}`);
   console.log(`pool token1: ${pool.token1}`);
   console.log(`pool fee: ${pool.fee}`);
@@ -228,47 +76,148 @@ async function commandCheck() {
 }
 
 async function commandQuote(args, side) {
-  const config = getConfig();
-  const provider = getProvider(config);
-  const pool = await getPoolInfo(config, provider);
-  const [l1x, weth] = await Promise.all([
-    getTokenMeta(config.l1xToken, provider),
-    getTokenMeta(config.weth, provider)
-  ]);
-  const slippageBps = bpsFromSlippage(args.slippage, config.defaultSlippageBps);
+  const config = lib.getConfig();
+  const provider = lib.getProvider(config);
+  const market = await lib.loadMarket(config, provider);
+  const slippageBps = lib.bpsFromSlippage(args.slippage, config.defaultSlippageBps);
 
   const isBuy = side === 'buy';
   const rawAmount = isBuy ? args.eth : args.l1x;
   if (!rawAmount) throw new Error(isBuy ? '--eth is required' : '--l1x is required');
-  const amountIn = ethers.parseUnits(String(rawAmount), isBuy ? weth.decimals : l1x.decimals);
-  const tokenIn = isBuy ? config.weth : config.l1xToken;
-  const tokenOut = isBuy ? config.l1xToken : config.weth;
-  const inMeta = isBuy ? weth : l1x;
-  const outMeta = isBuy ? l1x : weth;
-  const quote = await quoteExactInput({ config, provider, tokenIn, tokenOut, amountIn, fee: pool.fee });
-  const amountOutMin = minOut(quote.amountOut, slippageBps);
+  const details = await lib.buildSwapQuote({ config, provider, market, side, amount: rawAmount, slippageBps });
+  const { amountIn, quote, amountOutMin, inMeta, outMeta, pool } = details;
 
   console.log(`${side.toUpperCase()} quote`);
-  console.log(`input: ${formatToken(amountIn, inMeta.decimals, inMeta.symbol)}`);
-  console.log(`expected output: ${formatToken(quote.amountOut, outMeta.decimals, outMeta.symbol)}`);
-  console.log(`minimum output @ ${slippageBps / 100}% slippage: ${formatToken(amountOutMin, outMeta.decimals, outMeta.symbol)}`);
+  console.log(`input: ${lib.formatToken(amountIn, inMeta.decimals, inMeta.symbol)}`);
+  console.log(`expected output: ${lib.formatToken(quote.amountOut, outMeta.decimals, outMeta.symbol)}`);
+  console.log(`minimum output @ ${slippageBps / 100}% slippage: ${lib.formatToken(amountOutMin, outMeta.decimals, outMeta.symbol)}`);
   console.log(`quoted gas estimate: ${quote.gasEstimate.toString()}`);
   console.log(`pool fee: ${pool.fee}`);
-  return { config, provider, pool, l1x, weth, amountIn, quote, amountOutMin, tokenIn, tokenOut, inMeta, outMeta };
+  return { config, provider, market, ...details };
 }
 
-async function approveIfNeeded({ tokenAddress, owner, spender, amount, wallet, symbol }) {
-  const token = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
-  const allowance = await token.allowance(owner, spender);
-  if (allowance >= amount) {
-    console.log(`${symbol} allowance OK: ${allowance.toString()}`);
+async function commandMaxSellSize(args) {
+  const config = lib.getConfig();
+  const provider = lib.getProvider(config);
+  const market = await lib.loadMarket(config, provider);
+  const { l1x, weth } = market;
+
+  const minPriceUsd = lib.parsePositiveNumber(args['min-price-usd'], '--min-price-usd');
+  const maxL1x = lib.parsePositiveNumber(args['max-l1x'], '--max-l1x');
+  const stepL1x = args['step-l1x'] ? lib.parsePositiveNumber(args['step-l1x'], '--step-l1x') : 0.01;
+  const ethUsd = await lib.resolveEthUsdPrice({ override: args['eth-usd'], config, log: console.log });
+  const ethUsdPrice = ethUsd.price;
+
+  const { best, highResult } = await lib.maxSellSize({
+    config,
+    provider,
+    market,
+    minPriceUsd,
+    maxL1x,
+    stepL1x,
+    ethUsdPrice
+  });
+
+  const currentPriceUsd = lib.poolL1xUsdPrice({
+    sqrtPriceX96: market.pool.sqrtPriceX96,
+    pool: market.pool,
+    l1x,
+    weth,
+    ethUsdPrice
+  });
+
+  console.log('MAX SELL SIZE');
+  console.log(`current pool price: $${currentPriceUsd.toFixed(6)}`);
+  console.log(`min post-trade price: $${minPriceUsd}`);
+  console.log(`ETH/USD: $${ethUsdPrice} (${ethUsd.source})`);
+  if (ethUsd.details?.length) {
+    console.log(`ETH/USD sources: ${ethUsd.details.map((item) => `${item.name}=${item.price}`).join(', ')}`);
+  }
+
+  if (!best) {
+    console.log('No safe sell size found above zero for the requested floor.');
+    if (highResult?.error) console.log(`max-size quote error: ${highResult.error}`);
     return;
   }
-  console.log(`${symbol} allowance too low. Approving ${spender}...`);
-  const tx = await token.approve(spender, amount);
-  console.log(`approve tx: ${tx.hash}`);
-  await tx.wait();
-  console.log('approve confirmed');
+
+  console.log(`max search size: ${maxL1x} ${l1x.symbol}`);
+  console.log(`step: ${stepL1x} ${l1x.symbol}`);
+  console.log(`safe size: ${lib.decimalString(best.sizeL1x)} ${l1x.symbol}`);
+  console.log(`expected output: ${lib.formatToken(best.quote.amountOut, weth.decimals, weth.symbol)}`);
+  console.log(`average sell price: $${best.avgSellPriceUsd.toFixed(6)}`);
+  console.log(`post-trade price: $${best.postPriceUsd.toFixed(6)}`);
+  console.log(`quoted gas estimate: ${best.quote.gasEstimate.toString()}`);
+  console.log('dry-run only. This command never sends a transaction.');
+}
+
+async function commandBalance(args) {
+  const config = lib.getConfig();
+  const provider = lib.getProvider(config);
+  const market = await lib.loadMarket(config, provider);
+  const { l1x, weth } = market;
+
+  let address = typeof args.address === 'string' ? args.address : null;
+  if (!address) {
+    const wallet = lib.getWallet(config, provider, false);
+    address = wallet ? wallet.address : config.walletAddress;
+  }
+  if (!address) throw new Error('No wallet configured. Set UNISWAP_WALLET_ADDRESS/UNISWAP_WALLET_PRIVATE_KEY or pass --address 0x...');
+  address = ethers.getAddress(address);
+
+  const l1xContract = new ethers.Contract(config.l1xToken, lib.ERC20_ABI, provider);
+  const wethContract = new ethers.Contract(config.weth, lib.ERC20_ABI, provider);
+  const [ethBal, wethBal, l1xBal, wethAllowance, l1xAllowance, ethUsd] = await Promise.all([
+    provider.getBalance(address),
+    wethContract.balanceOf(address),
+    l1xContract.balanceOf(address),
+    wethContract.allowance(address, config.swapRouter02),
+    l1xContract.allowance(address, config.swapRouter02),
+    lib.resolveEthUsdPrice({ config, log: console.log }).catch(() => null)
+  ]);
+
+  const fmtUsd = (amount, price) => (price ? ` (= $${(Number(ethers.formatEther(amount)) * price).toFixed(2)})` : '');
+  const l1xUsd = ethUsd
+    ? lib.poolL1xUsdPrice({ sqrtPriceX96: market.pool.sqrtPriceX96, pool: market.pool, l1x, weth, ethUsdPrice: ethUsd.price })
+    : null;
+
+  console.log('WALLET BALANCE');
+  console.log(`address: ${address}`);
+  console.log(`ETH: ${ethers.formatEther(ethBal)}${fmtUsd(ethBal, ethUsd?.price)}`);
+  console.log(`${weth.symbol}: ${ethers.formatEther(wethBal)}${fmtUsd(wethBal, ethUsd?.price)}`);
+  console.log(`${l1x.symbol}: ${ethers.formatUnits(l1xBal, l1x.decimals)}${l1xUsd ? ` (= $${(Number(ethers.formatUnits(l1xBal, l1x.decimals)) * l1xUsd).toFixed(2)} @ pool price $${l1xUsd.toFixed(4)})` : ''}`);
+  console.log(`${weth.symbol} allowance to router: ${ethers.formatEther(wethAllowance)}`);
+  console.log(`${l1x.symbol} allowance to router: ${ethers.formatUnits(l1xAllowance, l1x.decimals)}`);
+}
+
+async function commandImpact(args) {
+  const config = lib.getConfig();
+  const provider = lib.getProvider(config);
+  const market = await lib.loadMarket(config, provider);
+  const { l1x, weth } = market;
+
+  const sizeL1x = lib.parsePositiveNumber(args.l1x, '--l1x');
+  const ethUsd = await lib.resolveEthUsdPrice({ override: args['eth-usd'], config, log: console.log });
+  const ethUsdPrice = ethUsd.price;
+
+  const currentPriceUsd = lib.poolL1xUsdPrice({
+    sqrtPriceX96: market.pool.sqrtPriceX96,
+    pool: market.pool,
+    l1x,
+    weth,
+    ethUsdPrice
+  });
+  const result = await lib.evaluateSell({ config, provider, market, sizeL1x, ethUsdPrice });
+  const impactUsd = currentPriceUsd - result.postPriceUsd;
+
+  console.log('SELL IMPACT');
+  console.log(`ETH/USD: $${ethUsdPrice} (${ethUsd.source})`);
+  console.log(`sell size: ${lib.decimalString(sizeL1x)} ${l1x.symbol}`);
+  console.log(`current pool price: $${currentPriceUsd.toFixed(6)}`);
+  console.log(`expected output: ${lib.formatToken(result.quote.amountOut, weth.decimals, weth.symbol)} (= $${(result.wethOut * ethUsdPrice).toFixed(4)})`);
+  console.log(`average sell price: $${result.avgSellPriceUsd.toFixed(6)}`);
+  console.log(`post-trade price: $${result.postPriceUsd.toFixed(6)}`);
+  console.log(`price impact: -$${impactUsd.toFixed(6)} (-${((impactUsd / currentPriceUsd) * 100).toFixed(4)}%)`);
+  console.log('dry-run only. This command never sends a transaction.');
 }
 
 async function commandBuy(args) {
@@ -280,11 +229,11 @@ async function commandBuy(args) {
     return;
   }
 
-  const wallet = getWallet(config, provider, true);
+  const wallet = lib.getWallet(config, provider, true);
   const ethBalance = await provider.getBalance(wallet.address);
   if (ethBalance < amountIn) throw new Error(`ETH balance too low: ${ethers.formatEther(ethBalance)} ETH`);
 
-  const wethContract = new ethers.Contract(config.weth, WETH_ABI, wallet);
+  const wethContract = new ethers.Contract(config.weth, lib.WETH_ABI, wallet);
   const wethBalance = await wethContract.balanceOf(wallet.address);
   if (wethBalance < amountIn) {
     const toDeposit = amountIn - wethBalance;
@@ -295,16 +244,27 @@ async function commandBuy(args) {
     console.log('deposit confirmed');
   }
 
-  await approveIfNeeded({
+  await lib.approveIfNeeded({
     tokenAddress: config.weth,
     owner: wallet.address,
     spender: config.swapRouter02,
     amount: amountIn,
     wallet,
-    symbol: weth.symbol
+    symbol: weth.symbol,
+    log: console.log
   });
 
-  await executeSwap({ config, wallet, pool, tokenIn: config.weth, tokenOut: config.l1xToken, amountIn, amountOutMin, value: 0n });
+  await lib.executeSwap({
+    config,
+    wallet,
+    pool,
+    tokenIn: config.weth,
+    tokenOut: config.l1xToken,
+    amountIn,
+    amountOutMin,
+    value: 0n,
+    log: console.log
+  });
 }
 
 async function commandSell(args) {
@@ -316,47 +276,36 @@ async function commandSell(args) {
     return;
   }
 
-  const wallet = getWallet(config, provider, true);
-  const l1xToken = new ethers.Contract(config.l1xToken, ERC20_ABI, wallet);
+  const wallet = lib.getWallet(config, provider, true);
+  const l1xToken = new ethers.Contract(config.l1xToken, lib.ERC20_ABI, wallet);
   const l1xBalance = await l1xToken.balanceOf(wallet.address);
-  if (l1xBalance < amountIn) throw new Error(`L1X balance too low: ${formatToken(l1xBalance, l1x.decimals, l1x.symbol)}`);
+  if (l1xBalance < amountIn) throw new Error(`L1X balance too low: ${lib.formatToken(l1xBalance, l1x.decimals, l1x.symbol)}`);
 
-  await approveIfNeeded({
+  await lib.approveIfNeeded({
     tokenAddress: config.l1xToken,
     owner: wallet.address,
     spender: config.swapRouter02,
     amount: amountIn,
     wallet,
-    symbol: l1x.symbol
+    symbol: l1x.symbol,
+    log: console.log
   });
 
-  const receipt = await executeSwap({ config, wallet, pool, tokenIn: config.l1xToken, tokenOut: config.weth, amountIn, amountOutMin, value: 0n });
+  const receipt = await lib.executeSwap({
+    config,
+    wallet,
+    pool,
+    tokenIn: config.l1xToken,
+    tokenOut: config.weth,
+    amountIn,
+    amountOutMin,
+    value: 0n,
+    log: console.log
+  });
   if (args.unwrap) {
     console.log('Swap confirmed. Check WETH received, then unwrap manually if needed.');
     console.log('Automatic unwrap is intentionally not bundled into the same flow to keep execution simple and auditable.');
   }
-  return receipt;
-}
-
-async function executeSwap({ config, wallet, pool, tokenIn, tokenOut, amountIn, amountOutMin, value }) {
-  const router = new ethers.Contract(config.swapRouter02, SWAP_ROUTER_02_ABI, wallet);
-  const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
-  const params = {
-    tokenIn,
-    tokenOut,
-    fee: pool.fee,
-    recipient: wallet.address,
-    deadline,
-    amountIn,
-    amountOutMinimum: amountOutMin,
-    sqrtPriceLimitX96: 0
-  };
-  const gas = await router.exactInputSingle.estimateGas(params, { value });
-  console.log(`estimated gas: ${gas.toString()}`);
-  const tx = await router.exactInputSingle(params, { value });
-  console.log(`swap tx: ${tx.hash}`);
-  const receipt = await tx.wait();
-  console.log(`swap confirmed in block ${receipt.blockNumber}`);
   return receipt;
 }
 
@@ -378,6 +327,18 @@ async function main() {
     }
     if (command === 'quote-sell') {
       await commandQuote(args, 'sell');
+      return;
+    }
+    if (command === 'max-sell-size') {
+      await commandMaxSellSize(args);
+      return;
+    }
+    if (command === 'impact') {
+      await commandImpact(args);
+      return;
+    }
+    if (command === 'balance') {
+      await commandBalance(args);
       return;
     }
     if (command === 'buy') {

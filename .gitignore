@@ -4,6 +4,9 @@ node_modules/
 .DS_Store
 npm-debug.log*
 
+# Arb monitor runtime state (flags, opportunity log)
+arb/state/
+
 # Legacy per-project installs
 Market_Making_Bitmart/node_modules/
 Market_making_Lbank/node_modules/
