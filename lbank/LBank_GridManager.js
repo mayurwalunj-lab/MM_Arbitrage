@@ -147,7 +147,7 @@ async function initDatabase() {
         log(`📊 Database connected (${dbName}).`, 'info');
         try {
             await dbPool.execute(`
-                CREATE TABLE IF NOT EXISTS grid_log (
+                CREATE TABLE IF NOT EXISTS lbank_grid_log (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     action VARCHAR(20) NOT NULL,
@@ -168,22 +168,22 @@ async function initDatabase() {
                 )
             `);
             try {
-                await dbPool.execute(`CREATE INDEX idx_grid_log_created_at ON grid_log(created_at DESC)`);
-                await dbPool.execute(`CREATE INDEX idx_grid_log_action ON grid_log(action)`);
-                await dbPool.execute(`CREATE INDEX idx_grid_log_order_id ON grid_log(order_id)`);
+                await dbPool.execute(`CREATE INDEX idx_grid_log_created_at ON lbank_grid_log(created_at DESC)`);
+                await dbPool.execute(`CREATE INDEX idx_grid_log_action ON lbank_grid_log(action)`);
+                await dbPool.execute(`CREATE INDEX idx_grid_log_order_id ON lbank_grid_log(order_id)`);
             } catch (e) { /* Indexes may exist */ }
-            log("📊 grid_log table ready.", 'info');
+            log("📊 lbank_grid_log table ready.", 'info');
             try {
                 await dbPool.execute(`
-                    INSERT INTO grid_log (action, center_price, buy_budget_used, sell_budget_used, active_buy_orders, active_sell_orders, bot_name)
+                    INSERT INTO lbank_grid_log (action, center_price, buy_budget_used, sell_budget_used, active_buy_orders, active_sell_orders, bot_name)
                     VALUES ('START', 0, 0, 0, 0, 0, 'gridBot')
                 `);
-                log("📊 DB test write OK — check grid_log in database.", 'info');
+                log("📊 DB test write OK — check lbank_grid_log in database.", 'info');
             } catch (testErr) {
                 log(`❌ DB test write failed: ${testErr.message}`, 'warn');
             }
         } catch (tableErr) {
-            log(`❌ grid_log table setup failed: ${tableErr.message}`, 'warn');
+            log(`❌ lbank_grid_log table setup failed: ${tableErr.message}`, 'warn');
             dbPool = null;
         }
     } catch (error) {
@@ -196,7 +196,7 @@ async function logGridActivity(activityData) {
     if (!dbPool) return;
     try {
         await dbPool.execute(`
-            INSERT INTO grid_log (
+            INSERT INTO lbank_grid_log (
                 action, center_price, buy_budget_used, sell_budget_used,
                 active_buy_orders, active_sell_orders, bot_name
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -219,7 +219,7 @@ async function logGridOrderEvent(event) {
     if (GRID_CONFIG.dryRun) return;
     try {
         await dbPool.execute(`
-            INSERT INTO grid_log (
+            INSERT INTO lbank_grid_log (
                 action, order_id, client_order_id, symbol, side, price, amount, value_usdt, price_range, bot_name
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
@@ -249,10 +249,10 @@ async function detectAndLogFilledOrders(openGridOrderIds) {
     try {
         const [rows] = await dbPool.execute(`
             SELECT order_id, client_order_id, side, price, amount, value_usdt, price_range
-            FROM grid_log e1
+            FROM lbank_grid_log e1
             WHERE e1.action = 'PLACED' AND e1.order_id IS NOT NULL
             AND NOT EXISTS (
-                SELECT 1 FROM grid_log e2
+                SELECT 1 FROM lbank_grid_log e2
                 WHERE e2.order_id = e1.order_id AND e2.action IN ('CANCELLED', 'FILLED')
             )
         `);

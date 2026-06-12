@@ -122,11 +122,11 @@ async function flushPendingDbWrites() {
         const item = pendingDbWrites.systemLogs.shift();
         try {
             await dbPool.execute(
-                `INSERT INTO system_logs (log_level, message) VALUES (?, ?)`,
+                `INSERT INTO lbank_system_logs (log_level, message) VALUES (?, ?)`,
                 [item.level?.toUpperCase?.() || String(item.level || 'INFO'), String(item.message || '')]
             );
         } catch (e) {
-            console.error('DB Flush Error (system_logs):', e.message);
+            console.error('DB Flush Error (lbank_system_logs):', e.message);
             break;
         }
     }
@@ -136,7 +136,7 @@ async function flushPendingDbWrites() {
         try {
             await logTradeHistory(item.data, item.update);
         } catch (e) {
-            console.error('DB Flush Error (trade_history):', e.message);
+            console.error('DB Flush Error (lbank_trade_history):', e.message);
             break;
         }
     }
@@ -146,7 +146,7 @@ async function flushPendingDbWrites() {
         try {
             await logInventorySnapshot(item.botABal, item.botBBal, item.netChange);
         } catch (e) {
-            console.error('DB Flush Error (inventory_snapshot):', e.message);
+            console.error('DB Flush Error (lbank_inventory_snapshot):', e.message);
             break;
         }
     }
@@ -160,7 +160,7 @@ async function initDatabase() {
         connection.release();
         
         await dbPool.execute(`
-            CREATE TABLE IF NOT EXISTS trade_history (
+            CREATE TABLE IF NOT EXISTS lbank_trade_history (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 pair VARCHAR(20) NOT NULL,
@@ -183,15 +183,15 @@ async function initDatabase() {
             )
         `);
 
-        try { await dbPool.execute(`ALTER TABLE trade_history ADD COLUMN trend_progress DECIMAL(5, 2) DEFAULT 0 AFTER total_usd`); } catch (_) {}
-        try { await dbPool.execute(`ALTER TABLE trade_history ADD COLUMN taker_price DECIMAL(20, 8) DEFAULT NULL AFTER taker_order_status`); } catch (_) {}
-        try { await dbPool.execute(`ALTER TABLE trade_history ADD COLUMN taker_amount DECIMAL(20, 8) DEFAULT NULL AFTER taker_price`); } catch (_) {}
-        try { await dbPool.execute(`ALTER TABLE trade_history ADD COLUMN taker_total_usd DECIMAL(20, 8) DEFAULT NULL AFTER taker_amount`); } catch (_) {}
-        try { await dbPool.execute(`ALTER TABLE trade_history ADD COLUMN is_dry_run BOOLEAN DEFAULT FALSE`); } catch (_) {}
-        try { await dbPool.execute(`ALTER TABLE trade_history ADD COLUMN execution_time_ms INT`); } catch (_) {}
+        try { await dbPool.execute(`ALTER TABLE lbank_trade_history ADD COLUMN trend_progress DECIMAL(5, 2) DEFAULT 0 AFTER total_usd`); } catch (_) {}
+        try { await dbPool.execute(`ALTER TABLE lbank_trade_history ADD COLUMN taker_price DECIMAL(20, 8) DEFAULT NULL AFTER taker_order_status`); } catch (_) {}
+        try { await dbPool.execute(`ALTER TABLE lbank_trade_history ADD COLUMN taker_amount DECIMAL(20, 8) DEFAULT NULL AFTER taker_price`); } catch (_) {}
+        try { await dbPool.execute(`ALTER TABLE lbank_trade_history ADD COLUMN taker_total_usd DECIMAL(20, 8) DEFAULT NULL AFTER taker_amount`); } catch (_) {}
+        try { await dbPool.execute(`ALTER TABLE lbank_trade_history ADD COLUMN is_dry_run BOOLEAN DEFAULT FALSE`); } catch (_) {}
+        try { await dbPool.execute(`ALTER TABLE lbank_trade_history ADD COLUMN execution_time_ms INT`); } catch (_) {}
 
         await dbPool.execute(`
-            CREATE TABLE IF NOT EXISTS inventory_snapshot (
+            CREATE TABLE IF NOT EXISTS lbank_inventory_snapshot (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 bot_a_usdt DECIMAL(20, 8) DEFAULT 0,
@@ -203,7 +203,7 @@ async function initDatabase() {
         `);
 
         await dbPool.execute(`
-            CREATE TABLE IF NOT EXISTS system_logs (
+            CREATE TABLE IF NOT EXISTS lbank_system_logs (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 log_level VARCHAR(20) NOT NULL,
@@ -232,7 +232,7 @@ async function logTradeHistory(tradeData, updateExisting = false) {
     try {
         if (updateExisting && tradeData.makerOrderId) {
             await dbPool.execute(`
-                UPDATE trade_history SET
+                UPDATE lbank_trade_history SET
                     taker_order_id = ?,
                     taker_order_status = ?,
                     maker_order_status = ?,
@@ -255,7 +255,7 @@ async function logTradeHistory(tradeData, updateExisting = false) {
             ]);
         } else {
             await dbPool.execute(`
-                INSERT INTO trade_history (
+                INSERT INTO lbank_trade_history (
                     pair, side, price, amount, total_usd, trend_progress,
                     maker_bot, taker_bot, maker_order_id, maker_order_status,
                     taker_order_id, taker_order_status, execution_time_ms, is_dry_run
@@ -278,10 +278,10 @@ async function logTradeHistory(tradeData, updateExisting = false) {
             ]);
         }
     } catch (e) {
-        console.error('DB Log Error (trade_history):', e.message);
-        broadcastLog(`❌ DB Log Error (trade_history): ${e.message}`, 'warn');
+        console.error('DB Log Error (lbank_trade_history):', e.message);
+        broadcastLog(`❌ DB Log Error (lbank_trade_history): ${e.message}`, 'warn');
         if (dbPool) {
-             try { await dbPool.execute(`INSERT INTO system_logs (log_level, message) VALUES (?, ?)`, ['ERROR', `DB Log Error: ${e.message}`]); } catch(_) {}
+             try { await dbPool.execute(`INSERT INTO lbank_system_logs (log_level, message) VALUES (?, ?)`, ['ERROR', `DB Log Error: ${e.message}`]); } catch(_) {}
         }
     }
 }
@@ -292,12 +292,12 @@ async function logSystemLog(level, message) {
         return;
     }
     try {
-        await dbPool.execute(`INSERT INTO system_logs (log_level, message) VALUES (?, ?)`, [
+        await dbPool.execute(`INSERT INTO lbank_system_logs (log_level, message) VALUES (?, ?)`, [
             (level && typeof level === 'string') ? level.toUpperCase() : level,
             message
         ]);
     } catch (e) {
-        console.error('DB Log Error (system_logs):', e.message);
+        console.error('DB Log Error (lbank_system_logs):', e.message);
     }
 }
 
@@ -308,11 +308,11 @@ async function logInventorySnapshot(botABal, botBBal, netChange) {
     }
     try {
         await dbPool.execute(
-            `INSERT INTO inventory_snapshot (bot_a_usdt, bot_a_token, bot_b_usdt, bot_b_token, net_token_change) VALUES (?,?,?,?,?)`,
+            `INSERT INTO lbank_inventory_snapshot (bot_a_usdt, bot_a_token, bot_b_usdt, bot_b_token, net_token_change) VALUES (?,?,?,?,?)`,
             [botABal.usdt, botABal.l1x, botBBal.usdt, botBBal.l1x, netChange]
         );
     } catch (e) {
-        console.error('DB Log Error (inventory_snapshot):', e.message);
+        console.error('DB Log Error (lbank_inventory_snapshot):', e.message);
     }
 }
 
@@ -474,7 +474,7 @@ async function syncOrderStatuses(botA, botB) {
     try {
         const [rows] = await dbPool.execute(`
             SELECT id, maker_bot, taker_bot, maker_order_id, taker_order_id, maker_order_status, taker_order_status, amount
-            FROM trade_history
+            FROM lbank_trade_history
             WHERE (maker_order_id IS NOT NULL OR taker_order_id IS NOT NULL)
               AND (maker_order_status IN ('OPEN','PENDING','PARTIAL_FILLED') OR taker_order_status IN ('OPEN','PENDING','PARTIAL_FILLED'))
             ORDER BY id DESC LIMIT 100
@@ -500,7 +500,7 @@ async function syncOrderStatuses(botA, botB) {
                 }
                 if (makerNew !== r.maker_order_status || takerNew !== r.taker_order_status) {
                     await dbPool.execute(
-                        `UPDATE trade_history SET maker_order_status = ?, taker_order_status = ? WHERE id = ?`,
+                        `UPDATE lbank_trade_history SET maker_order_status = ?, taker_order_status = ? WHERE id = ?`,
                         [makerNew, takerNew, r.id]
                     );
                     updated++;

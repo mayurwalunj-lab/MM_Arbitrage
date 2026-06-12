@@ -15,14 +15,14 @@ const dbConfigs = {
         host: process.env.BITMART_DB_HOST || '159.195.76.213',
         user: process.env.BITMART_DB_USER || 'root',
         password: process.env.BITMART_DB_PASSWORD || '',
-        database: process.env.BITMART_DB_NAME || 'market-cap_production',
+        database: process.env.BITMART_DB_NAME || 'mm_production',
         port: parseInt(process.env.BITMART_DB_PORT) || 25060
     },
     lbank: {
         host: process.env.LBANK_DB_HOST || '159.195.76.213',
         user: process.env.LBANK_DB_USER || 'root',
         password: process.env.LBANK_DB_PASSWORD || '',
-        database: process.env.LBANK_DB_NAME || 'marketcap',
+        database: process.env.LBANK_DB_NAME || 'mm_production',
         port: parseInt(process.env.LBANK_DB_PORT) || 25060
     }
 };
@@ -53,6 +53,12 @@ function getPool(dbName) {
     return pools.bitmart;
 }
 
+// Consolidated database: both exchanges share one DB, tables are prefixed.
+function tablePrefix(dbName) {
+    const normalizedName = dbName?.toLowerCase();
+    return (normalizedName === 'lbank' || normalizedName === 'marketcap') ? 'lbank_' : 'bitmart_';
+}
+
 // Test connections on startup
 Object.keys(pools).forEach(dbName => {
     pools[dbName].getConnection((err, connection) => {
@@ -75,6 +81,7 @@ app.get('/api/volume', (req, res) => {
     }
 
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     // Handle "today" - filter by current date
     if (hours === 'today') {
@@ -87,7 +94,7 @@ app.get('/api/volume', (req, res) => {
                 MAX(timestamp) AS end_time,
                 HOUR(NOW()) AS current_hour,
                 MINUTE(NOW()) AS current_minute
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE DATE(timestamp) = CURDATE()
         `;
 
@@ -128,7 +135,7 @@ app.get('/api/volume', (req, res) => {
     // First, get the last entry timestamp to calculate the timeframe
     const getLastTimestamp = `
         SELECT MAX(timestamp) AS last_timestamp 
-        FROM trade_history
+        FROM ${tp}trade_history
     `;
 
     pool.query(getLastTimestamp, (err, timestampResults) => {
@@ -148,7 +155,7 @@ app.get('/api/volume', (req, res) => {
                 SUM(total_usd) AS total_volume,
                 MIN(timestamp) AS start_time,
                 MAX(timestamp) AS end_time
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE timestamp >= ? - INTERVAL ? HOUR
         `;
 
@@ -187,6 +194,7 @@ app.get('/api/price-chart', (req, res) => {
     }
 
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     // Handle "today" - filter by current date
     if (hours === 'today') {
@@ -198,7 +206,7 @@ app.get('/api/price-chart', (req, res) => {
                 price,
                 amount,
                 total_usd
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE DATE(timestamp) = CURDATE()
             ORDER BY timestamp ASC
         `;
@@ -230,7 +238,7 @@ app.get('/api/price-chart', (req, res) => {
     // First, get the last entry timestamp to calculate the timeframe
     const getLastTimestamp = `
         SELECT MAX(timestamp) AS last_timestamp 
-        FROM trade_history
+        FROM ${tp}trade_history
     `;
 
     pool.query(getLastTimestamp, (err, timestampResults) => {
@@ -251,7 +259,7 @@ app.get('/api/price-chart', (req, res) => {
                 price,
                 amount,
                 total_usd
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE timestamp >= ? - INTERVAL ? HOUR
             ORDER BY timestamp ASC
         `;
@@ -284,6 +292,7 @@ app.get('/api/price-chart', (req, res) => {
 app.get('/api/inventory', (req, res) => {
     const database = req.query.database || 'bitmart'; // Default to bitmart
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     console.log(`[${database.toUpperCase()}] Fetching inventory snapshot...`);
 
@@ -296,7 +305,7 @@ app.get('/api/inventory', (req, res) => {
             bot_a_usdt,
             bot_b_usdt,
             timestamp
-        FROM inventory_snapshot
+        FROM ${tp}inventory_snapshot
         ORDER BY timestamp DESC
         LIMIT 1
     `;
@@ -351,6 +360,7 @@ app.get('/api/inventory-analysis', (req, res) => {
     }
 
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     // Handle "today" - filter by current date
     if (hours === 'today') {
@@ -364,7 +374,7 @@ app.get('/api/inventory-analysis', (req, res) => {
                 bot_b_usdt,
                 net_token_change,
                 timestamp
-            FROM inventory_snapshot
+            FROM ${tp}inventory_snapshot
             WHERE DATE(timestamp) = CURDATE()
             ORDER BY timestamp ASC
         `;
@@ -444,7 +454,7 @@ app.get('/api/inventory-analysis', (req, res) => {
     // First, get the last entry timestamp from inventory_snapshot
     const getLastTimestamp = `
         SELECT MAX(timestamp) AS last_timestamp 
-        FROM inventory_snapshot
+        FROM ${tp}inventory_snapshot
     `;
 
     pool.query(getLastTimestamp, (err, timestampResults) => {
@@ -467,7 +477,7 @@ app.get('/api/inventory-analysis', (req, res) => {
                 bot_b_usdt,
                 net_token_change,
                 timestamp
-            FROM inventory_snapshot
+            FROM ${tp}inventory_snapshot
             WHERE timestamp >= ? - INTERVAL ? HOUR
             ORDER BY timestamp ASC
         `;

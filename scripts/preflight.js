@@ -172,7 +172,9 @@ addCheck('ecosystem config has expected PM2 apps', () => {
     ['grid_manager_bitmart', 'bitmart/grid_manager_bitmart.js'],
     ['Lbank_Pattern_Trading', 'lbank/Lbank_Pattern_Trading.js'],
     ['LBank_GridManager', 'lbank/LBank_GridManager.js'],
-    ['Server', 'dashboard/Server.js']
+    ['Server', 'dashboard/Server.js'],
+    ['arb_monitor', 'arb/monitor.js'],
+    ['arb_snapshot', 'arb/accounting.js']
   ]);
   assert(apps.length === expected.size, `Expected ${expected.size} PM2 apps, found ${apps.length}`);
   for (const app of apps) {
@@ -302,17 +304,19 @@ async function checkDb() {
   ];
 
   for (const item of configs) {
+    const prefix = `${item.name}_`;
+    const expected = ['trade_history', 'inventory_snapshot', 'system_logs', 'grid_log'].map((t) => prefix + t);
     const connection = await mysql.createConnection(item.config);
     try {
       await connection.ping();
       const [tables] = await connection.execute(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name IN ('trade_history','inventory_snapshot','system_logs','grid_log')",
-        [item.config.database]
+        `SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name IN (${expected.map(() => '?').join(',')})`,
+        [item.config.database, ...expected]
       );
       const names = tables.map((row) => row.TABLE_NAME || row.table_name);
-      assert(names.includes('trade_history'), `${item.name} DB missing trade_history`);
-      assert(names.includes('inventory_snapshot'), `${item.name} DB missing inventory_snapshot`);
-      assert(names.includes('system_logs'), `${item.name} DB missing system_logs`);
+      assert(names.includes(`${prefix}trade_history`), `${item.name} DB missing ${prefix}trade_history`);
+      assert(names.includes(`${prefix}inventory_snapshot`), `${item.name} DB missing ${prefix}inventory_snapshot`);
+      assert(names.includes(`${prefix}system_logs`), `${item.name} DB missing ${prefix}system_logs`);
     } finally {
       await connection.end();
     }

@@ -155,6 +155,28 @@ while mass-cancelling orders, so the arb monitor ignores those windows.
 
 ---
 
+## 3b. Database consolidation (Option A)
+
+All tables live in ONE database `mm_production` with prefixes:
+`bitmart_*`, `lbank_*` (MM tables) + `arb_*`, `dex_*` (arb tables).
+Old databases `market-cap_production` / `marketcap` are kept untouched as
+rollback. `scripts/db_consolidate.js`:
+
+```bash
+node scripts/db_consolidate.js copy      # full copy (skips existing tables)
+node scripts/db_consolidate.js verify    # row counts source vs target
+node scripts/db_consolidate.js topup     # incremental copy by id (cutover)
+```
+
+### ✅ Server cutover checklist
+- [ ] `git pull` the branch with prefixed-table code
+- [ ] `pm2 stop all` (bots stop writing)
+- [ ] `node scripts/db_consolidate.js topup` then `verify` — counts must match exactly
+- [ ] server `.env`: `BITMART_DB_NAME=mm_production` and `LBANK_DB_NAME=mm_production`
+- [ ] `pm2 start ecosystem.config.js` and watch logs for SQL errors
+- [ ] dashboard pages show history for both exchanges
+- [ ] rollback if needed: revert the two .env values, `pm2 restart all`
+
 ## 4. Health checks
 
 ```bash
