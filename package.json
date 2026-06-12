@@ -19,6 +19,8 @@
     "pm2:start": "pm2 start ecosystem.config.js",
     "pm2:restart": "pm2 restart ecosystem.config.js",
     "check": "node --check bitmart/Bitmart_Pattern_Trading.js && node --check bitmart/grid_manager_bitmart.js && node --check lbank/Lbank_Pattern_Trading.js && node --check lbank/LBank_GridManager.js && node --check dashboard/Server.js && node --check uniswap/lib.js && node --check uniswap/uniswap_l1x_trader.js && node --check arb/orderbook.js && node --check arb/cex.js && node --check arb/edge.js && node --check arb/monitor.js && node --check arb/db.js && node --check arb/accounting.js && node --check arb/executor.js && node --check arb/execute_cli.js",
+    "db:migrate": "node scripts/migrate.js up",
+    "db:migrate:status": "node scripts/migrate.js status",
     "test:preflight": "node scripts/preflight.js",
     "test:db": "node scripts/preflight.js --db",
     "test:exchange": "node scripts/preflight.js --public-exchange",

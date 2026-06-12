@@ -177,6 +177,20 @@ node scripts/db_consolidate.js topup     # incremental copy by id (cutover)
 - [ ] dashboard pages show history for both exchanges
 - [ ] rollback if needed: revert the two .env values, `pm2 restart all`
 
+## 3c. Schema migrations
+
+Versioned migrations in `migrations/NNN_name.sql`, tracked in the
+`schema_migrations` table. `001_baseline.sql` holds the full current schema
+(idempotent — rebuilds a fresh database from zero, no-ops on an existing one).
+
+```bash
+npm run db:migrate:status    # list applied / pending
+npm run db:migrate           # apply pending in order
+```
+
+Rules: never edit an applied migration — add a new numbered file. One concern
+per file. Schema changes go HERE from now on, not into ad-hoc ALTERs.
+
 ## 4. Health checks
 
 ```bash
