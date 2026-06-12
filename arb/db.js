@@ -8,7 +8,7 @@
 const mysql = require('mysql2/promise');
 
 function dbConfig() {
-  const pick = (key) => process.env[`ARB_DB_${key}`] || process.env[`BITMART_DB_${key}`] || '';
+  const pick = (key) => process.env[`ARB_DB_${key}`] || process.env[`DB_${key}`] || process.env[`BITMART_DB_${key}`] || '';
   const config = {
     host: pick('HOST'),
     port: Number(pick('PORT') || 3306),

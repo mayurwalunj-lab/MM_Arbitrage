@@ -86,11 +86,11 @@ let CONFIG = {
     
     // MySQL DATABASE
     database: {
-        host: process.env.BITMART_DB_HOST || '157.173.109.193',
-        port: parseInt(process.env.BITMART_DB_PORT) || 25060,
-        user: process.env.BITMART_DB_USER || 'root',
-        password: process.env.BITMART_DB_PASSWORD || '',
-        database: process.env.BITMART_DB_NAME || 'market-cap_production',
+        host: process.env.DB_HOST || process.env.BITMART_DB_HOST || '157.173.109.193',
+        port: parseInt(process.env.DB_PORT || process.env.BITMART_DB_PORT) || 25060,
+        user: process.env.DB_USER || process.env.BITMART_DB_USER || 'root',
+        password: process.env.DB_PASSWORD || process.env.BITMART_DB_PASSWORD || '',
+        database: process.env.DB_NAME || process.env.BITMART_DB_NAME || 'market-cap_production',
         waitForConnections: true,
         connectionLimit: 10,
         queueLimit: 0

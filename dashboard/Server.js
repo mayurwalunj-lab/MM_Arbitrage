@@ -12,18 +12,18 @@ app.use(express.static(__dirname)); // Serves index.html
 // Database configurations
 const dbConfigs = {
     bitmart: {
-        host: process.env.BITMART_DB_HOST || '159.195.76.213',
-        user: process.env.BITMART_DB_USER || 'root',
-        password: process.env.BITMART_DB_PASSWORD || '',
-        database: process.env.BITMART_DB_NAME || 'mm_production',
-        port: parseInt(process.env.BITMART_DB_PORT) || 25060
+        host: process.env.DB_HOST || process.env.BITMART_DB_HOST || '159.195.76.213',
+        user: process.env.DB_USER || process.env.BITMART_DB_USER || 'root',
+        password: process.env.DB_PASSWORD || process.env.BITMART_DB_PASSWORD || '',
+        database: process.env.DB_NAME || process.env.BITMART_DB_NAME || 'mm_production',
+        port: parseInt(process.env.DB_PORT || process.env.BITMART_DB_PORT) || 25060
     },
     lbank: {
-        host: process.env.LBANK_DB_HOST || '159.195.76.213',
-        user: process.env.LBANK_DB_USER || 'root',
-        password: process.env.LBANK_DB_PASSWORD || '',
-        database: process.env.LBANK_DB_NAME || 'mm_production',
-        port: parseInt(process.env.LBANK_DB_PORT) || 25060
+        host: process.env.DB_HOST || process.env.LBANK_DB_HOST || '159.195.76.213',
+        user: process.env.DB_USER || process.env.LBANK_DB_USER || 'root',
+        password: process.env.DB_PASSWORD || process.env.LBANK_DB_PASSWORD || '',
+        database: process.env.DB_NAME || process.env.LBANK_DB_NAME || 'mm_production',
+        port: parseInt(process.env.DB_PORT || process.env.LBANK_DB_PORT) || 25060
     }
 };
 

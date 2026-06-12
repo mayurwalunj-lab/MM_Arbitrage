@@ -107,7 +107,7 @@ async function getOwnOrders(ex) {
   const age = Date.now() - ex.ownOrdersCache.fetchedAt;
   if (age < CONFIG.ownOrdersTtlMs) return ex.ownOrdersCache;
   const { orders, errors } = await cex.fetchOwnOpenOrders(ex.ownClients, CONFIG.pair);
-  for (const error of errors) log(`WARN ${ex.name} own-orders fetch: ${error}`);
+  for (const error of errors) log(`WARN ${ex.name} own-orders fetch: ${String(error).slice(0, 140)}`);
   // On partial failure keep going with what we got; sanity checks backstop us,
   // and filterOk=false marks recorded opportunities as possibly self-trades.
   ex.ownOrdersCache = { orders, fetchedAt: Date.now(), filterOk: errors.length === 0 };
@@ -257,7 +257,7 @@ async function tick({ uniConfig, provider, market, exchangeStates }) {
       continue;
     }
     if (result.error) {
-      log(`${ex.name}: fetch failed — ${result.error}`);
+      log(`${ex.name}: fetch failed — ${String(result.error).slice(0, 140)}`);
       ex.streak = 0;
       continue;
     }
