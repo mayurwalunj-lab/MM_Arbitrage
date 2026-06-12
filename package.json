@@ -18,7 +18,7 @@
     "dashboard": "node dashboard/Server.js",
     "pm2:start": "pm2 start ecosystem.config.js",
     "pm2:restart": "pm2 restart ecosystem.config.js",
-    "check": "node --check bitmart/Bitmart_Pattern_Trading.js && node --check bitmart/grid_manager_bitmart.js && node --check lbank/Lbank_Pattern_Trading.js && node --check lbank/LBank_GridManager.js && node --check dashboard/Server.js && node --check uniswap/lib.js && node --check uniswap/uniswap_l1x_trader.js && node --check arb/orderbook.js && node --check arb/cex.js && node --check arb/edge.js && node --check arb/monitor.js",
+    "check": "node --check bitmart/Bitmart_Pattern_Trading.js && node --check bitmart/grid_manager_bitmart.js && node --check lbank/Lbank_Pattern_Trading.js && node --check lbank/LBank_GridManager.js && node --check dashboard/Server.js && node --check uniswap/lib.js && node --check uniswap/uniswap_l1x_trader.js && node --check arb/orderbook.js && node --check arb/cex.js && node --check arb/edge.js && node --check arb/monitor.js && node --check arb/db.js && node --check arb/accounting.js && node --check arb/executor.js && node --check arb/execute_cli.js",
     "test:preflight": "node scripts/preflight.js",
     "test:db": "node scripts/preflight.js --db",
     "test:exchange": "node scripts/preflight.js --public-exchange",
@@ -39,7 +39,11 @@
     "uniswap:test:eth-price": "node scripts/uniswap_preflight.js --eth-price-only --eth-price",
     "uniswap:test:all": "node scripts/uniswap_preflight.js --all",
     "arb:monitor": "node arb/monitor.js",
-    "arb:monitor:once": "node arb/monitor.js --once"
+    "arb:monitor:once": "node arb/monitor.js --once",
+    "arb:execute": "node arb/execute_cli.js",
+    "arb:report": "node arb/accounting.js report",
+    "arb:snapshot": "node arb/accounting.js snapshot",
+    "arb:record-trade": "node arb/accounting.js record-trade"
   },
   "dependencies": {
     "ccxt": "^4.5.32",

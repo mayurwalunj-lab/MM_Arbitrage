@@ -31,13 +31,15 @@ const V3_POOL_ABI = [
 ];
 
 const QUOTER_V2_ABI = [
-  'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)'
+  'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)',
+  'function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)'
 ];
 
 // SwapRouter02 struct has NO deadline field (unlike the original SwapRouter);
 // deadline protection is applied via multicall(deadline, calls).
 const SWAP_ROUTER_02_ABI = [
   'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)',
+  'function exactOutputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 amountOut,uint256 amountInMaximum,uint160 sqrtPriceLimitX96)) payable returns (uint256 amountIn)',
   'function multicall(uint256 deadline, bytes[] data) payable returns (bytes[] results)'
 ];
 
@@ -196,6 +198,24 @@ async function quoteExactInput({ config, provider, tokenIn, tokenOut, amountIn, 
   };
 }
 
+async function quoteExactOutput({ config, provider, tokenIn, tokenOut, amountOut, fee }) {
+  const quoter = new ethers.Contract(config.quoterV2, QUOTER_V2_ABI, provider);
+  const params = {
+    tokenIn,
+    tokenOut,
+    amount: amountOut,
+    fee,
+    sqrtPriceLimitX96: 0
+  };
+  const result = await quoter.quoteExactOutputSingle.staticCall(params);
+  return {
+    amountIn: result.amountIn,
+    sqrtPriceX96After: result.sqrtPriceX96After,
+    initializedTicksCrossed: result.initializedTicksCrossed,
+    gasEstimate: result.gasEstimate
+  };
+}
+
 function getTokenDecimals(address, l1x, weth) {
   if (address.toLowerCase() === l1x.address.toLowerCase()) return l1x.decimals;
   if (address.toLowerCase() === weth.address.toLowerCase()) return weth.decimals;
@@ -342,6 +362,75 @@ async function evaluateSell({ config, provider, market, sizeL1x, ethUsdPrice }) 
   return { sizeL1x, amountIn, quote, postPriceUsd, avgSellPriceUsd, wethOut };
 }
 
+// Quote buying exactly sizeL1x (WETH -> L1X) and report USD prices for it.
+async function evaluateBuy({ config, provider, market, sizeL1x, ethUsdPrice }) {
+  const { pool, l1x, weth } = market;
+  const amountOut = ethers.parseUnits(decimalString(sizeL1x), l1x.decimals);
+  const quote = await quoteExactOutput({
+    config,
+    provider,
+    tokenIn: config.weth,
+    tokenOut: config.l1xToken,
+    amountOut,
+    fee: pool.fee
+  });
+  const postPriceUsd = poolL1xUsdPrice({
+    sqrtPriceX96: quote.sqrtPriceX96After,
+    pool,
+    l1x,
+    weth,
+    ethUsdPrice
+  });
+  const wethIn = Number(ethers.formatUnits(quote.amountIn, weth.decimals));
+  const avgBuyPriceUsd = (wethIn * ethUsdPrice) / sizeL1x;
+  return { sizeL1x, amountOut, quote, postPriceUsd, avgBuyPriceUsd, wethIn };
+}
+
+// Largest buy size whose post-trade pool price stays <= maxPriceUsd
+// (buying pushes the pool price UP). Mirror of maxSellSize.
+async function maxBuySize({ config, provider, market, maxPriceUsd, maxL1x, stepL1x, ethUsdPrice }) {
+  if (stepL1x >= maxL1x) throw new Error('step must be smaller than max size');
+
+  const evaluate = (sizeL1x) => evaluateBuy({ config, provider, market, sizeL1x, ethUsdPrice });
+
+  let low = 0;
+  let high = maxL1x;
+  let best = null;
+  let highResult = null;
+
+  try {
+    highResult = await evaluate(high);
+    if (highResult.postPriceUsd <= maxPriceUsd) {
+      best = highResult;
+      low = high;
+    }
+  } catch (error) {
+    highResult = { error: error.message };
+  }
+
+  if (!best) {
+    for (let i = 0; i < 32 && (high - low) > stepL1x; i++) {
+      const mid = (low + high) / 2;
+      let result;
+      try {
+        result = await evaluate(mid);
+      } catch (_) {
+        high = mid;
+        continue;
+      }
+
+      if (result.postPriceUsd <= maxPriceUsd) {
+        best = result;
+        low = mid;
+      } else {
+        high = mid;
+      }
+    }
+  }
+
+  return { best, highResult };
+}
+
 // Largest sell size whose post-trade pool price stays >= minPriceUsd.
 // Returns { best, highResult } where best is null if no size qualifies.
 async function maxSellSize({ config, provider, market, minPriceUsd, maxL1x, stepL1x, ethUsdPrice }) {
@@ -459,6 +548,68 @@ async function sellL1x({ config, provider, market, sizeL1x, slippageBps, log = n
   return { receipt, swapQuote };
 }
 
+// Buy exactly sizeL1x (WETH -> L1X) via exactOutputSingle, wrapping ETH and
+// approving as needed. amountInMaximum caps the WETH spent (slippage guard).
+async function buyExactL1x({ config, provider, market, sizeL1x, slippageBps, log = noop }) {
+  const { pool, l1x, weth } = market;
+  const wallet = getWallet(config, provider, true);
+  const amountOut = ethers.parseUnits(decimalString(sizeL1x), l1x.decimals);
+  const quote = await quoteExactOutput({
+    config,
+    provider,
+    tokenIn: config.weth,
+    tokenOut: config.l1xToken,
+    amountOut,
+    fee: pool.fee
+  });
+  const amountInMax = quote.amountIn * BigInt(10000 + slippageBps) / 10000n;
+
+  const wethContract = new ethers.Contract(config.weth, WETH_ABI, wallet);
+  const wethBalance = await wethContract.balanceOf(wallet.address);
+  if (wethBalance < amountInMax) {
+    const toDeposit = amountInMax - wethBalance;
+    const ethBalance = await provider.getBalance(wallet.address);
+    if (ethBalance < toDeposit) {
+      throw new Error(`Not enough ETH+WETH: need ${ethers.formatEther(amountInMax)} WETH max`);
+    }
+    log(`Depositing ${ethers.formatEther(toDeposit)} ETH to WETH...`);
+    const depositTx = await wethContract.deposit({ value: toDeposit });
+    log(`deposit tx: ${depositTx.hash}`);
+    await depositTx.wait();
+    log('deposit confirmed');
+  }
+
+  await approveIfNeeded({
+    tokenAddress: config.weth,
+    owner: wallet.address,
+    spender: config.swapRouter02,
+    amount: amountInMax,
+    wallet,
+    symbol: weth.symbol,
+    log
+  });
+
+  const router = new ethers.Contract(config.swapRouter02, SWAP_ROUTER_02_ABI, wallet);
+  const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
+  const params = {
+    tokenIn: config.weth,
+    tokenOut: config.l1xToken,
+    fee: pool.fee,
+    recipient: wallet.address,
+    amountOut,
+    amountInMaximum: amountInMax,
+    sqrtPriceLimitX96: 0
+  };
+  const swapData = router.interface.encodeFunctionData('exactOutputSingle', [params]);
+  const gas = await router.multicall.estimateGas(deadline, [swapData], { value: 0n });
+  log(`estimated gas: ${gas.toString()}`);
+  const tx = await router.multicall(deadline, [swapData], { value: 0n });
+  log(`swap tx: ${tx.hash}`);
+  const receipt = await tx.wait();
+  log(`swap confirmed in block ${receipt.blockNumber}`);
+  return { receipt, amountOut, amountInMax, quote };
+}
+
 module.exports = {
   ERC20_ABI,
   WETH_ABI,
@@ -477,6 +628,7 @@ module.exports = {
   parsePositiveNumber,
   decimalString,
   quoteExactInput,
+  quoteExactOutput,
   getTokenDecimals,
   poolL1xUsdPrice,
   quoteAverageUsd,
@@ -485,8 +637,11 @@ module.exports = {
   resolveEthUsdPrice,
   buildSwapQuote,
   evaluateSell,
+  evaluateBuy,
   maxSellSize,
+  maxBuySize,
   approveIfNeeded,
   executeSwap,
-  sellL1x
+  sellL1x,
+  buyExactL1x
 };

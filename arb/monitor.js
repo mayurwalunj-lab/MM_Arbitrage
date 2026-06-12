@@ -25,8 +25,12 @@ const { ethers } = require('ethers');
 
 const lib = require('../uniswap/lib');
 const cex = require('./cex');
+const arbDb = require('./db');
+const executor = require('./executor');
 const { bookSanity } = require('./orderbook');
 const { findOpportunities } = require('./edge');
+
+let dbReady = false;
 
 const STATE_DIR = path.join(__dirname, 'state');
 const HALT_FILE = path.join(STATE_DIR, 'HALT');
@@ -50,8 +54,19 @@ const CONFIG = {
   depthRangePct: envNum('ARB_DEPTH_RANGE_PCT', 2),
   persistTicks: envNum('ARB_PERSIST_TICKS', 3),
   staleMs: envNum('ARB_STALE_MS', 3000),
-  ownOrdersTtlMs: envNum('ARB_OWN_ORDERS_TTL_MS', 10000)
+  ownOrdersTtlMs: envNum('ARB_OWN_ORDERS_TTL_MS', 10000),
+  // Set ARB_SELF_TRADE_FILTER=false to evaluate the raw book WITH our own
+  // orders included. Detection-only use (e.g. off-server testing, measuring
+  // how much of the book is ours) — edges found this way may be wash trades.
+  selfTradeFilter: process.env.ARB_SELF_TRADE_FILTER !== 'false',
+  // Stage B/C: ARB_AUTO_EXECUTE=true lets the monitor fire the executor on
+  // confirmed opportunities. Orders stay simulated unless ARB_DRY_RUN=false
+  // too — both switches must be flipped for live auto-trading.
+  autoExecute: process.env.ARB_AUTO_EXECUTE === 'true',
+  autoMinEdgeUsd: envNum('ARB_AUTO_MIN_EDGE_USD', envNum('ARB_MIN_EDGE_USD', 20) * 2)
 };
+
+const autoState = { cooldownUntil: 0 };
 
 function ts() {
   return new Date().toISOString();
@@ -66,7 +81,11 @@ function gridRefreshFlag(exchangeId) {
 }
 
 function appendOpportunity(record) {
+  // JSONL always (survives DB outages); DB best-effort for querying/reports.
   fs.appendFileSync(OPPORTUNITIES_FILE, JSON.stringify(record) + '\n');
+  if (dbReady) {
+    arbDb.insertOpportunity(record).catch((error) => log(`WARN db insert failed: ${error.message}`));
+  }
 }
 
 // --- per-exchange runtime state ----------------------------------------
@@ -83,6 +102,7 @@ function buildExchangeState(exchangeId) {
 }
 
 async function getOwnOrders(ex) {
+  if (!CONFIG.selfTradeFilter) return { orders: [], filterOk: false, filterMode: 'off' };
   if (!ex.ownClients.length) return { orders: [], filterOk: false };
   const age = Date.now() - ex.ownOrdersCache.fetchedAt;
   if (age < CONFIG.ownOrdersTtlMs) return ex.ownOrdersCache;
@@ -114,6 +134,50 @@ async function resolveEthUsd(exchangeStates, uniConfig) {
   return null;
 }
 
+// --- auto-execution (Stage B/C) -------------------------------------------
+
+async function maybeAutoExecute({ uniConfig, provider, market, exchangeStates, candidates, best, exchangeName }) {
+  if (!CONFIG.autoExecute) return;
+  if (best.netUsd < CONFIG.autoMinEdgeUsd) {
+    log(`auto-exec skip: net $${best.netUsd.toFixed(2)} < auto threshold $${CONFIG.autoMinEdgeUsd}`);
+    return;
+  }
+  if (Date.now() < autoState.cooldownUntil) {
+    log('auto-exec skip: cooldown active');
+    return;
+  }
+  autoState.cooldownUntil = Date.now() + executor.execConfig().cooldownMs;
+
+  const arbClients = Object.fromEntries(exchangeStates.map((ex) => [ex.name, ex.client]));
+  const ownOrdersByExchange = Object.fromEntries(candidates.map((c) => [c.name, c.ownOrders]));
+  try {
+    const result = await executor.executeOpportunity({
+      config: uniConfig,
+      provider,
+      market,
+      arbClients,
+      ownOrdersByExchange,
+      options: {
+        pair: CONFIG.pair,
+        minEdgeUsd: CONFIG.autoMinEdgeUsd,
+        minTradeL1x: CONFIG.minTradeL1x,
+        maxTradeL1x: CONFIG.maxTradeL1x,
+        cexTakerFeeBps: CONFIG.cexTakerFeeBps,
+        gasLimitSwap: CONFIG.gasLimitSwap,
+        maxSpreadPct: CONFIG.maxSpreadPct,
+        minDepthL1x: CONFIG.minDepthL1x,
+        depthRangePct: CONFIG.depthRangePct
+      },
+      opportunity: { direction: best.direction, exchangeName, sizeL1x: best.sizeL1x },
+      log
+    });
+    log(`auto-exec result: ${result.status}${result.realizedPnlUsdt != null ? ` pnl $${result.realizedPnlUsdt.toFixed(2)}` : ''}`);
+  } catch (error) {
+    log(`auto-exec refused/failed: ${error.message}`);
+  }
+  for (const ex of exchangeStates) ex.streak = 0;
+}
+
 // --- main loop -----------------------------------------------------------
 
 async function tick({ uniConfig, provider, market, exchangeStates }) {
@@ -125,15 +189,28 @@ async function tick({ uniConfig, provider, market, exchangeStates }) {
 
   const tickStart = Date.now();
 
-  const [ethUsd, feeData, poolInfo, walletL1x, ...bookResults] = await Promise.all([
+  const [ethUsd, feeData, poolInfo, walletBal, ...bookResults] = await Promise.all([
     resolveEthUsd(exchangeStates, uniConfig),
     provider.getFeeData(),
     lib.getPoolInfo(uniConfig, provider),
     uniConfig.walletAddress
-      ? new ethers.Contract(uniConfig.l1xToken, lib.ERC20_ABI, provider)
-          .balanceOf(uniConfig.walletAddress)
-          .then((bal) => Number(ethers.formatUnits(bal, market.l1x.decimals)))
-          .catch(() => null)
+      ? (async () => {
+          try {
+            const l1xContract = new ethers.Contract(uniConfig.l1xToken, lib.ERC20_ABI, provider);
+            const wethContract = new ethers.Contract(uniConfig.weth, lib.ERC20_ABI, provider);
+            const [l1xBal, wethBal, ethBal] = await Promise.all([
+              l1xContract.balanceOf(uniConfig.walletAddress),
+              wethContract.balanceOf(uniConfig.walletAddress),
+              provider.getBalance(uniConfig.walletAddress)
+            ]);
+            return {
+              l1x: Number(ethers.formatUnits(l1xBal, market.l1x.decimals)),
+              ethTotal: Number(ethers.formatEther(wethBal)) + Number(ethers.formatEther(ethBal))
+            };
+          } catch (_) {
+            return null;
+          }
+        })()
       : Promise.resolve(null),
     ...exchangeStates.map(async (ex) => {
       try {
@@ -199,21 +276,43 @@ async function tick({ uniConfig, provider, market, exchangeStates }) {
 
   if (!candidates.length) return;
 
-  const { perExchange, gasUsd } = await findOpportunities({
+  const walletL1x = walletBal?.l1x ?? null;
+  const walletEthTotal = walletBal?.ethTotal ?? null;
+
+  const result = await findOpportunities({
     config: uniConfig,
     provider,
     market,
     ethUsdPrice: ethUsd.price,
     gasPriceWei,
+    dexSpotUsd,
     exchanges: candidates,
     options: {
       maxTradeL1x: CONFIG.maxTradeL1x,
       minTradeL1x: CONFIG.minTradeL1x,
       cexTakerFeeBps: CONFIG.cexTakerFeeBps,
       gasLimitSwap: CONFIG.gasLimitSwap,
-      walletL1x
+      walletL1x,
+      walletEthTotal
     }
   });
+  const { perExchange, gasUsd, skipped, minAsk, maxBid, forward, reverse } = result;
+
+  if (skipped === 'no-spread') {
+    for (const ex of exchangeStates) ex.streak = 0;
+    log(`tick dexSpot=$${dexSpotUsd.toFixed(4)} eth=$${ethUsd.price.toFixed(0)} | no spread: dex inside bid $${maxBid?.toFixed(4)} .. ask $${minAsk?.toFixed(4)}`);
+    return;
+  }
+
+  const statusNotes = [];
+  for (const [label, dir] of [['sell-dex', forward], ['buy-dex', reverse]]) {
+    if (!dir) continue;
+    if (dir.inventoryBlocked) {
+      statusNotes.push(`${label} blocked: inventory ${dir.maxFeasible?.toFixed(4)} L1X-eq < min trade ${CONFIG.minTradeL1x}`);
+    } else if (dir.tooSmall) {
+      statusNotes.push(`${label} blocked: ceiling ${dir.ceilingL1x?.toFixed(2)} L1X < min trade ${CONFIG.minTradeL1x}`);
+    }
+  }
 
   for (const candidate of candidates) {
     const { ex } = candidate;
@@ -224,7 +323,7 @@ async function tick({ uniConfig, provider, market, exchangeStates }) {
       continue;
     }
 
-    const summary = `${ex.name}: size=${best.sizeL1x.toFixed(2)} dex=$${best.dexAvgSellUsd.toFixed(4)} cex=$${best.cexAvgAskUsd.toFixed(4)} net=$${best.netUsd.toFixed(2)}`;
+    const summary = `${ex.name}[${best.direction}] size=${best.sizeL1x.toFixed(2)} dex=$${best.dexAvgPriceUsd.toFixed(4)} cex=$${best.cexAvgPriceUsd.toFixed(4)} net=$${best.netUsd.toFixed(2)}`;
     if (best.netUsd >= CONFIG.minEdgeUsd) {
       ex.streak++;
       if (ex.streak >= CONFIG.persistTicks) {
@@ -233,9 +332,12 @@ async function tick({ uniConfig, provider, market, exchangeStates }) {
           ts: ts(),
           exchange: ex.name,
           selfTradeFilterOk: candidate.filterOk,
+          filterMode: !CONFIG.selfTradeFilter ? 'off' : (candidate.filterOk ? 'on' : 'degraded'),
           ethUsd: ethUsd.price,
           ethUsdSource: ethUsd.source,
           dexSpotUsd,
+          boundaryUsd: best.direction === 'sell-dex' ? forward?.floorUsd : reverse?.capUsd,
+          ceilingL1x: best.direction === 'sell-dex' ? forward?.ceilingL1x : reverse?.ceilingL1x,
           cexMid: candidate.sanity.mid,
           cexSpreadPct: candidate.sanity.spreadPct,
           externalAskDepth: candidate.sanity.askDepth,
@@ -243,6 +345,7 @@ async function tick({ uniConfig, provider, market, exchangeStates }) {
           streak: ex.streak,
           ...best
         });
+        await maybeAutoExecute({ uniConfig, provider, market, exchangeStates, candidates, best, exchangeName: ex.name });
       } else {
         log(`candidate ${summary} (streak ${ex.streak}/${CONFIG.persistTicks})`);
       }
@@ -252,8 +355,13 @@ async function tick({ uniConfig, provider, market, exchangeStates }) {
     }
   }
 
-  if (summaries.length) {
-    log(`tick dexSpot=$${dexSpotUsd.toFixed(4)} eth=$${ethUsd.price.toFixed(0)} gas=$${gasUsd?.toFixed(2) ?? '?'} | ${summaries.join(' | ')}`);
+  const parts = [...statusNotes, ...summaries];
+  if (parts.length) {
+    const ceilings = [
+      forward?.ceilingL1x != null ? `fwdCeil=${forward.ceilingL1x.toFixed(1)}` : null,
+      reverse?.ceilingL1x != null ? `revCeil=${reverse.ceilingL1x.toFixed(1)}` : null
+    ].filter(Boolean).join(' ');
+    log(`tick dexSpot=$${dexSpotUsd.toFixed(4)} eth=$${ethUsd.price.toFixed(0)} gas=$${gasUsd?.toFixed(2) ?? '?'}${ceilings ? ' ' + ceilings : ''} | ${parts.join(' | ')}`);
   }
 }
 
@@ -277,13 +385,30 @@ async function main() {
     }
   }
 
-  log(`arb monitor starting (dry-run detection only, never trades)`);
+  try {
+    await arbDb.init();
+    dbReady = true;
+    log('accounting DB connected (arb_* tables)');
+  } catch (error) {
+    log(`WARN accounting DB unavailable, JSONL only: ${error.message.slice(0, 100)}`);
+  }
+
+  const liveOrders = process.env.ARB_DRY_RUN === 'false';
+  if (CONFIG.autoExecute) {
+    log(`AUTO-EXECUTE ARMED (threshold $${CONFIG.autoMinEdgeUsd}/trade) — orders are ${liveOrders ? 'LIVE' : 'SIMULATED (ARB_DRY_RUN not false)'}`);
+  } else {
+    log('arb monitor starting (detection only — ARB_AUTO_EXECUTE not set)');
+  }
   log(`pair=${CONFIG.pair} poll=${CONFIG.pollMs}ms minEdge=$${CONFIG.minEdgeUsd} size=${CONFIG.minTradeL1x}-${CONFIG.maxTradeL1x} L1X persist=${CONFIG.persistTicks} ticks`);
-  for (const ex of exchangeStates) {
-    if (ex.ownClients.length) {
-      log(`${ex.name}: self-trade filter active (${ex.ownClients.map((c) => c.label).join(', ')})`);
-    } else {
-      log(`WARN ${ex.name}: no MM/grid API keys found — self-trade filter DISABLED; edges may include your own orders`);
+  if (!CONFIG.selfTradeFilter) {
+    log('WARN self-trade filter DISABLED by config (ARB_SELF_TRADE_FILTER=false) — edges may include your own orders');
+  } else {
+    for (const ex of exchangeStates) {
+      if (ex.ownClients.length) {
+        log(`${ex.name}: self-trade filter active (${ex.ownClients.map((c) => c.label).join(', ')})`);
+      } else {
+        log(`WARN ${ex.name}: no MM/grid API keys found — self-trade filter DISABLED; edges may include your own orders`);
+      }
     }
   }
 
@@ -297,6 +422,9 @@ async function main() {
     if (once) break;
     await new Promise((resolve) => setTimeout(resolve, CONFIG.pollMs));
   }
+
+  // The MySQL pool keeps the event loop alive; release it so --once exits.
+  if (dbReady) await arbDb.end().catch(() => {});
 }
 
 main().catch((error) => {

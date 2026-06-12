@@ -122,15 +122,50 @@ async function placeLimitOrder({ client, exchangeId, symbol, side, amount, price
     // Same raw endpoint the pattern bots use; unified createOrder has been
     // unreliable for BitMart spot.
     const rawSymbol = symbol.replace('/', '_');
-    return client.privatePostSpotV2SubmitOrder({
+    const result = await client.privatePostSpotV2SubmitOrder({
       symbol: rawSymbol,
       side,
       type: 'limit',
       size: String(amount),
       price: String(price)
     });
+    const id = result?.data?.order_id ?? result?.order_id ?? null;
+    if (!id) throw new Error(`bitmart order id missing in response: ${JSON.stringify(result).slice(0, 200)}`);
+    return { id: String(id), raw: result };
   }
-  return client.createOrder(symbol, 'limit', side, Number(amount), Number(price));
+  const order = await client.createOrder(symbol, 'limit', side, Number(amount), Number(price));
+  return { id: order.id, raw: order };
+}
+
+// Poll an order until it is fully filled, cancelled, or the timeout passes.
+// Returns { status: 'filled'|'partial'|'open'|'canceled', filled, average }.
+async function pollOrder({ client, orderId, symbol, timeoutMs = 10000, intervalMs = 1000 }) {
+  const deadline = Date.now() + timeoutMs;
+  let last = { status: 'open', filled: 0, average: null };
+  while (Date.now() < deadline) {
+    try {
+      const order = await client.fetchOrder(orderId, symbol);
+      const filled = Number(order.filled ?? 0);
+      const average = Number(order.average ?? order.price) || null;
+      if (order.status === 'closed') return { status: 'filled', filled, average };
+      if (order.status === 'canceled' || order.status === 'cancelled') {
+        return { status: 'canceled', filled, average };
+      }
+      last = { status: filled > 0 ? 'partial' : 'open', filled, average };
+    } catch (_) { /* transient fetch error: keep polling */ }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return last;
+}
+
+async function cancelOrder({ client, orderId, symbol }) {
+  try {
+    await client.cancelOrder(orderId, symbol);
+    return true;
+  } catch (error) {
+    // Already filled or already gone is fine; the poll afterwards decides.
+    return false;
+  }
 }
 
 module.exports = {
@@ -141,5 +176,7 @@ module.exports = {
   fetchTickerPrice,
   fetchBalances,
   fetchOwnOpenOrders,
-  placeLimitOrder
+  placeLimitOrder,
+  pollOrder,
+  cancelOrder
 };

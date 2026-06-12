@@ -150,6 +150,56 @@ async function commandMaxSellSize(args) {
   console.log('dry-run only. This command never sends a transaction.');
 }
 
+// Record a confirmed swap to the dex_trades accounting table. Best-effort:
+// a DB failure must never make a successful trade look failed.
+async function recordDexTrade({ side, receipt, config, market, walletAddress, amountIn, tokenOut }) {
+  const db = require('../arb/db');
+  try {
+    const transferIface = new ethers.Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
+    let actualOut = 0n;
+    for (const logEntry of receipt.logs) {
+      if (logEntry.address.toLowerCase() !== tokenOut.toLowerCase()) continue;
+      try {
+        const parsed = transferIface.parseLog(logEntry);
+        if (parsed?.name === 'Transfer' && parsed.args.to.toLowerCase() === walletAddress.toLowerCase()) {
+          actualOut += parsed.args.value;
+        }
+      } catch (_) { /* not a Transfer log */ }
+    }
+
+    const isBuy = side === 'buy';
+    const { l1x, weth } = market;
+    const l1xAmount = isBuy
+      ? Number(ethers.formatUnits(actualOut, l1x.decimals))
+      : Number(ethers.formatUnits(amountIn, l1x.decimals));
+    const wethAmount = isBuy
+      ? Number(ethers.formatUnits(amountIn, weth.decimals))
+      : Number(ethers.formatUnits(actualOut, weth.decimals));
+
+    const gasEth = Number(ethers.formatEther(receipt.gasUsed * (receipt.gasPrice ?? 0n)));
+    const ethUsd = await lib.resolveEthUsdPrice({ config, log: () => {} }).catch(() => null);
+
+    await db.init();
+    const id = await db.insertDexTrade({
+      side,
+      txHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      l1xAmount,
+      wethAmount,
+      avgPriceUsd: ethUsd && l1xAmount > 0 ? (wethAmount * ethUsd.price) / l1xAmount : null,
+      ethUsd: ethUsd?.price ?? null,
+      gasEth,
+      gasUsd: ethUsd ? gasEth * ethUsd.price : null,
+      wallet: walletAddress
+    });
+    console.log(`recorded to accounting DB: dex_trades #${id}`);
+  } catch (error) {
+    console.log(`WARN: trade NOT recorded to DB (${error.message.slice(0, 100)}). Tx hash: ${receipt.hash}`);
+  } finally {
+    await db.end().catch(() => {});
+  }
+}
+
 async function commandBalance(args) {
   const config = lib.getConfig();
   const provider = lib.getProvider(config);
@@ -254,7 +304,7 @@ async function commandBuy(args) {
     log: console.log
   });
 
-  await lib.executeSwap({
+  const receipt = await lib.executeSwap({
     config,
     wallet,
     pool,
@@ -264,6 +314,15 @@ async function commandBuy(args) {
     amountOutMin,
     value: 0n,
     log: console.log
+  });
+  await recordDexTrade({
+    side: 'buy',
+    receipt,
+    config,
+    market: details.market,
+    walletAddress: wallet.address,
+    amountIn,
+    tokenOut: config.l1xToken
   });
 }
 
@@ -301,6 +360,15 @@ async function commandSell(args) {
     amountOutMin,
     value: 0n,
     log: console.log
+  });
+  await recordDexTrade({
+    side: 'sell',
+    receipt,
+    config,
+    market: details.market,
+    walletAddress: wallet.address,
+    amountIn,
+    tokenOut: config.weth
   });
   if (args.unwrap) {
     console.log('Swap confirmed. Check WETH received, then unwrap manually if needed.');
