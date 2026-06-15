@@ -164,7 +164,8 @@ async function initDatabase() {
                     sell_budget_used DECIMAL(20, 8) DEFAULT NULL,
                     active_buy_orders INT DEFAULT NULL,
                     active_sell_orders INT DEFAULT NULL,
-                    bot_name VARCHAR(50) DEFAULT 'gridBot'
+                    bot_name VARCHAR(50) DEFAULT 'gridBot',
+                    is_dry_run TINYINT(1) NOT NULL DEFAULT 0
                 )
             `);
             try {
@@ -175,8 +176,7 @@ async function initDatabase() {
             log("📊 lbank_grid_log table ready.", 'info');
             try {
                 await dbPool.execute(`
-                    INSERT INTO lbank_grid_log (action, center_price, buy_budget_used, sell_budget_used, active_buy_orders, active_sell_orders, bot_name)
-                    VALUES ('START', 0, 0, 0, 0, 0, 'gridBot')
+                    INSERT INTO lbank_grid_log (action, center_price, buy_budget_used, sell_budget_used, active_buy_orders, active_sell_orders, bot_name, is_dry_run)                    VALUES ('START', 0, 0, 0, 0, 0, 'gridBot', ${GRID_CONFIG.dryRun ? 1 : 0})
                 `);
                 log("📊 DB test write OK — check lbank_grid_log in database.", 'info');
             } catch (testErr) {
@@ -198,8 +198,8 @@ async function logGridActivity(activityData) {
         await dbPool.execute(`
             INSERT INTO lbank_grid_log (
                 action, center_price, buy_budget_used, sell_budget_used,
-                active_buy_orders, active_sell_orders, bot_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                active_buy_orders, active_sell_orders, bot_name, is_dry_run
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `, [
             activityData.action || 'REFRESH',
             activityData.centerPrice ?? null,
@@ -207,7 +207,8 @@ async function logGridActivity(activityData) {
             activityData.sellBudgetUsed ?? 0,
             activityData.activeBuyOrders ?? 0,
             activityData.activeSellOrders ?? 0,
-            'gridBot'
+            'gridBot',
+            GRID_CONFIG.dryRun ? 1 : 0
         ]);
     } catch (e) {
         log(`❌ DB logGridActivity failed: ${e.message}`, 'warn');
@@ -220,8 +221,8 @@ async function logGridOrderEvent(event) {
     try {
         await dbPool.execute(`
             INSERT INTO lbank_grid_log (
-                action, order_id, client_order_id, symbol, side, price, amount, value_usdt, price_range, bot_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                action, order_id, client_order_id, symbol, side, price, amount, value_usdt, price_range, bot_name, is_dry_run
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
             event.action,
             event.orderId ?? null,
@@ -232,7 +233,8 @@ async function logGridOrderEvent(event) {
             event.amount ?? null,
             event.valueUsdt ?? null,
             event.priceRange ?? null,
-            'gridBot'
+            'gridBot',
+            GRID_CONFIG.dryRun ? 1 : 0
         ]);
     } catch (e) {
         log(`❌ DB logGridOrderEvent failed (${event?.action} ${event?.orderId}): ${e.message}`, 'warn');

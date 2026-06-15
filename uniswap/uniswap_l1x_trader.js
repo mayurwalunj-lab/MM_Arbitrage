@@ -190,7 +190,8 @@ async function recordDexTrade({ side, receipt, config, market, walletAddress, am
       ethUsd: ethUsd?.price ?? null,
       gasEth,
       gasUsd: ethUsd ? gasEth * ethUsd.price : null,
-      wallet: walletAddress
+      wallet: walletAddress,
+      isDryRun: false
     });
     console.log(`recorded to accounting DB: dex_trades #${id}`);
   } catch (error) {

@@ -133,7 +133,9 @@ async function commandSnapshot() {
   const provider = lib.getProvider(config);
   const market = await lib.loadMarket(config, provider);
 
-  const snapshot = { timestamp: new Date() };
+  // Snapshots record real balances; the flag marks whether the machine that
+  // took them runs in dry-run mode (true everywhere except live production).
+  const snapshot = { timestamp: new Date(), isDryRun: process.env.ARB_DRY_RUN !== 'false' };
 
   if (config.walletAddress) {
     const l1xContract = new ethers.Contract(config.l1xToken, lib.ERC20_ABI, provider);

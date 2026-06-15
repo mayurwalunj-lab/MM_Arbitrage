@@ -135,8 +135,8 @@ async function flushPendingDbWrites() {
         const item = pendingDbWrites.systemLogs.shift();
         try {
             await dbPool.execute(
-                `INSERT INTO bitmart_system_logs (log_level, message) VALUES (?, ?)`,
-                [item.level?.toUpperCase?.() || String(item.level || 'INFO'), String(item.message || '')]
+                `INSERT INTO bitmart_system_logs (log_level, message, is_dry_run) VALUES (?, ?, ?)`,
+                [item.level?.toUpperCase?.() || String(item.level || 'INFO'), String(item.message || ''), CONFIG.dryRun ? 1 : 0]
             );
         } catch (e) {
             console.error('DB Flush Error (bitmart_system_logs):', e.message);
@@ -300,7 +300,7 @@ async function logTradeHistory(tradeData, updateExisting = false) {
         console.error('DB Log Error (bitmart_trade_history):', e.message);
         broadcastLog(`❌ DB Log Error (bitmart_trade_history): ${e.message}`, 'warn');
         if (dbPool) {
-             try { await dbPool.execute(`INSERT INTO bitmart_system_logs (log_level, message) VALUES (?, ?)`, ['ERROR', `DB Log Error: ${e.message}`]); } catch(_) {}
+             try { await dbPool.execute(`INSERT INTO bitmart_system_logs (log_level, message, is_dry_run) VALUES (?, ?, ?)`, ['ERROR', `DB Log Error: ${e.message}`, CONFIG.dryRun ? 1 : 0]); } catch(_) {}
         }
     }
 }
@@ -311,9 +311,10 @@ async function logSystemLog(level, message) {
         return;
     }
     try {
-        await dbPool.execute(`INSERT INTO bitmart_system_logs (log_level, message) VALUES (?, ?)`, [
+        await dbPool.execute(`INSERT INTO bitmart_system_logs (log_level, message, is_dry_run) VALUES (?, ?, ?)`, [
             (level && typeof level === 'string') ? level.toUpperCase() : level,
-            message
+            message,
+            CONFIG.dryRun ? 1 : 0
         ]);
     } catch (e) {
         console.error('DB Log Error (bitmart_system_logs):', e.message);
@@ -327,8 +328,8 @@ async function logInventorySnapshot(botABal, botBBal, netChange) {
     }
     try {
         await dbPool.execute(
-            `INSERT INTO bitmart_inventory_snapshot (bot_a_usdt, bot_a_token, bot_b_usdt, bot_b_token, net_token_change) VALUES (?,?,?,?,?)`,
-            [botABal.usdt, botABal.l1x, botBBal.usdt, botBBal.l1x, netChange]
+            `INSERT INTO bitmart_inventory_snapshot (bot_a_usdt, bot_a_token, bot_b_usdt, bot_b_token, net_token_change, is_dry_run) VALUES (?,?,?,?,?,?)`,
+            [botABal.usdt, botABal.l1x, botBBal.usdt, botBBal.l1x, netChange, CONFIG.dryRun ? 1 : 0]
         );
     } catch (e) {
         console.error('DB Log Error (bitmart_inventory_snapshot):', e.message);

@@ -122,8 +122,8 @@ async function flushPendingDbWrites() {
         const item = pendingDbWrites.systemLogs.shift();
         try {
             await dbPool.execute(
-                `INSERT INTO lbank_system_logs (log_level, message) VALUES (?, ?)`,
-                [item.level?.toUpperCase?.() || String(item.level || 'INFO'), String(item.message || '')]
+                `INSERT INTO lbank_system_logs (log_level, message, is_dry_run) VALUES (?, ?, ?)`,
+                [item.level?.toUpperCase?.() || String(item.level || 'INFO'), String(item.message || ''), CONFIG.dryRun ? 1 : 0]
             );
         } catch (e) {
             console.error('DB Flush Error (lbank_system_logs):', e.message);
@@ -198,7 +198,8 @@ async function initDatabase() {
                 bot_a_token DECIMAL(20, 8) DEFAULT 0,
                 bot_b_usdt DECIMAL(20, 8) DEFAULT 0,
                 bot_b_token DECIMAL(20, 8) DEFAULT 0,
-                net_token_change DECIMAL(20, 8) DEFAULT 0
+                net_token_change DECIMAL(20, 8) DEFAULT 0,
+                is_dry_run TINYINT(1) NOT NULL DEFAULT 0
             )
         `);
 
@@ -207,7 +208,8 @@ async function initDatabase() {
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 log_level VARCHAR(20) NOT NULL,
-                message TEXT
+                message TEXT,
+                is_dry_run TINYINT(1) NOT NULL DEFAULT 0
             )
         `);
 
@@ -281,7 +283,7 @@ async function logTradeHistory(tradeData, updateExisting = false) {
         console.error('DB Log Error (lbank_trade_history):', e.message);
         broadcastLog(`❌ DB Log Error (lbank_trade_history): ${e.message}`, 'warn');
         if (dbPool) {
-             try { await dbPool.execute(`INSERT INTO lbank_system_logs (log_level, message) VALUES (?, ?)`, ['ERROR', `DB Log Error: ${e.message}`]); } catch(_) {}
+             try { await dbPool.execute(`INSERT INTO lbank_system_logs (log_level, message, is_dry_run) VALUES (?, ?, ?)`, ['ERROR', `DB Log Error: ${e.message}`, CONFIG.dryRun ? 1 : 0]); } catch(_) {}
         }
     }
 }
@@ -292,9 +294,10 @@ async function logSystemLog(level, message) {
         return;
     }
     try {
-        await dbPool.execute(`INSERT INTO lbank_system_logs (log_level, message) VALUES (?, ?)`, [
+        await dbPool.execute(`INSERT INTO lbank_system_logs (log_level, message, is_dry_run) VALUES (?, ?, ?)`, [
             (level && typeof level === 'string') ? level.toUpperCase() : level,
-            message
+            message,
+            CONFIG.dryRun ? 1 : 0
         ]);
     } catch (e) {
         console.error('DB Log Error (lbank_system_logs):', e.message);
@@ -308,8 +311,8 @@ async function logInventorySnapshot(botABal, botBBal, netChange) {
     }
     try {
         await dbPool.execute(
-            `INSERT INTO lbank_inventory_snapshot (bot_a_usdt, bot_a_token, bot_b_usdt, bot_b_token, net_token_change) VALUES (?,?,?,?,?)`,
-            [botABal.usdt, botABal.l1x, botBBal.usdt, botBBal.l1x, netChange]
+            `INSERT INTO lbank_inventory_snapshot (bot_a_usdt, bot_a_token, bot_b_usdt, bot_b_token, net_token_change, is_dry_run) VALUES (?,?,?,?,?,?)`,
+            [botABal.usdt, botABal.l1x, botBBal.usdt, botBBal.l1x, netChange, CONFIG.dryRun ? 1 : 0]
         );
     } catch (e) {
         console.error('DB Log Error (lbank_inventory_snapshot):', e.message);

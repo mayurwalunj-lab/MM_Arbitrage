@@ -34,6 +34,7 @@ async function init() {
       exchange VARCHAR(20) NOT NULL,
       direction VARCHAR(10) NOT NULL DEFAULT 'sell-dex',
       self_trade_filter_ok TINYINT(1) DEFAULT 0,
+      filter_mode VARCHAR(10) DEFAULT NULL,
       eth_usd DECIMAL(20,8),
       dex_spot_usd DECIMAL(20,8),
       boundary_usd DECIMAL(20,8),
@@ -96,6 +97,7 @@ async function init() {
       gas_eth DECIMAL(30,18),
       gas_usd DECIMAL(20,8),
       wallet VARCHAR(64),
+      is_dry_run TINYINT(1) NOT NULL DEFAULT 0,
       INDEX idx_dex_trades_ts (timestamp)
     )
   `);
@@ -116,6 +118,7 @@ async function init() {
       eth_usd DECIMAL(20,8),
       l1x_usd DECIMAL(20,8),
       total_value_usd DECIMAL(20,8),
+      is_dry_run TINYINT(1) NOT NULL DEFAULT 0,
       INDEX idx_arb_inv_ts (timestamp)
     )
   `);
@@ -132,13 +135,14 @@ function requirePool() {
 async function insertOpportunity(record) {
   await requirePool().query(
     `INSERT INTO arb_opportunities
-      (timestamp, exchange, direction, self_trade_filter_ok, eth_usd, dex_spot_usd, boundary_usd, ceiling_l1x,
+      (timestamp, exchange, direction, self_trade_filter_ok, filter_mode, eth_usd, dex_spot_usd, boundary_usd, ceiling_l1x,
        size_l1x, dex_avg_price_usd, dex_post_price_usd, dex_leg_usd,
        cex_avg_price_usd, cex_worst_price_usd, cex_leg_usd, cex_fee_usd, hedge_fee_usd,
        gas_usd, net_usd, gross_edge_pct, streak, wallet_l1x)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       new Date(record.ts), record.exchange, record.direction || 'sell-dex', record.selfTradeFilterOk ? 1 : 0,
+      record.filterMode ?? null,
       record.ethUsd, record.dexSpotUsd, record.boundaryUsd ?? null, record.ceilingL1x ?? null,
       record.sizeL1x, record.dexAvgPriceUsd, record.dexPostPriceUsd, record.dexLegUsd,
       record.cexAvgPriceUsd, record.cexWorstPriceUsd, record.cexLegUsd, record.cexFeeUsd,
@@ -171,12 +175,13 @@ async function insertDexTrade(trade) {
   const [result] = await requirePool().query(
     `INSERT INTO dex_trades
       (timestamp, side, tx_hash, block_number, l1x_amount, weth_amount,
-       avg_price_usd, eth_usd, gas_eth, gas_usd, wallet)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       avg_price_usd, eth_usd, gas_eth, gas_usd, wallet, is_dry_run)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       trade.timestamp ?? new Date(), trade.side, trade.txHash ?? null, trade.blockNumber ?? null,
       trade.l1xAmount ?? null, trade.wethAmount ?? null, trade.avgPriceUsd ?? null,
-      trade.ethUsd ?? null, trade.gasEth ?? null, trade.gasUsd ?? null, trade.wallet ?? null
+      trade.ethUsd ?? null, trade.gasEth ?? null, trade.gasUsd ?? null, trade.wallet ?? null,
+      trade.isDryRun ? 1 : 0
     ]
   );
   return result.insertId;
@@ -187,14 +192,15 @@ async function insertSnapshot(snapshot) {
     `INSERT INTO arb_inventory_snapshot
       (timestamp, wallet_l1x, wallet_weth, wallet_eth,
        bitmart_l1x, bitmart_usdt, bitmart_eth, lbank_l1x, lbank_usdt, lbank_eth,
-       eth_usd, l1x_usd, total_value_usd)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       eth_usd, l1x_usd, total_value_usd, is_dry_run)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       snapshot.timestamp ?? new Date(),
       snapshot.walletL1x ?? null, snapshot.walletWeth ?? null, snapshot.walletEth ?? null,
       snapshot.bitmartL1x ?? null, snapshot.bitmartUsdt ?? null, snapshot.bitmartEth ?? null,
       snapshot.lbankL1x ?? null, snapshot.lbankUsdt ?? null, snapshot.lbankEth ?? null,
-      snapshot.ethUsd ?? null, snapshot.l1xUsd ?? null, snapshot.totalValueUsd ?? null
+      snapshot.ethUsd ?? null, snapshot.l1xUsd ?? null, snapshot.totalValueUsd ?? null,
+      snapshot.isDryRun ? 1 : 0
     ]
   );
 }
