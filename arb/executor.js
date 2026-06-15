@@ -55,7 +55,15 @@ function execConfig() {
     priceBufferBps: envNum('ARB_EXEC_PRICE_BUFFER_BPS', 10),
     cooldownMs: envNum('ARB_EXEC_COOLDOWN_MS', 60000),
     slippageBps: envNum('ARB_EXEC_SLIPPAGE_BPS', 100),
-    cexTakerFeeBps: envNum('ARB_CEX_TAKER_FEE_BPS', 25)
+    cexTakerFeeBps: envNum('ARB_CEX_TAKER_FEE_BPS', 25),
+    // Hedge mode (leg 3 behavior):
+    //   'cex'  sell/buy ETH on the exchange (instant, USDT lands on exchange)
+    //   'dex'  swap WETH<->USDT on Uniswap each trade (no exchange ETH needed,
+    //          USDT lands in wallet, extra gas)
+    //   'skip' keep WETH, convert later in batches (lowest gas, ETH-exposed)
+    // Back-compat: ARB_SKIP_HEDGE=true → 'skip' when ARB_HEDGE_MODE unset.
+    hedgeMode: (process.env.ARB_HEDGE_MODE
+      || (process.env.ARB_SKIP_HEDGE === 'true' ? 'skip' : 'cex')).toLowerCase()
   };
 }
 
@@ -342,47 +350,94 @@ async function executeOpportunity({ config, provider, market, arbClients, ownOrd
     }
     log(`${tag}leg2 done: ${isForward ? 'sold' : 'bought'} ${filledN.toFixed(4)} L1X <-> ${actualWeth.toFixed(6)} WETH`);
 
-    // ---- leg 3: ETH hedge ----------------------------------------------
-    const hedgeSide = isForward ? 'sell' : 'buy';
-    let hedge = null;
+    // ---- leg 3: hedge — mode cex | dex | skip --------------------------
+    const feeRate = EXEC.cexTakerFeeBps / 10000;
+    const cexAvg = leg1.average ?? leg1Price;
+    let mode = EXEC.hedgeMode;
+    // dex hedge only maps cleanly to forward (WETH in wallet to convert);
+    // for reverse there's no wallet WETH to swap, so fall back to cex.
+    if (mode === 'dex' && !isForward) {
+      log(`${tag}NOTE: dex hedge only supports sell-dex; using cex hedge for this buy-dex trade`);
+      mode = 'cex';
+    }
+
+    let hedge = null;          // cex-mode fill
     let hedgeError = null;
-    for (let attempt = 1; attempt <= 3 && !hedge?.filled; attempt++) {
+    let dexUsdtOut = null;     // dex-mode USDT received
+    let dexHedgeTx = null;
+    let status;
+    let realizedPnlUsdt;
+
+    if (mode === 'skip') {
+      // keep WETH, value mark-to-market at current ETH price (no sale, no fee)
+      realizedPnlUsdt = (actualWeth * ethUsd) - (filledN * cexAvg) * (1 + feeRate) - gasUsd;
+      status = 'hedge_skipped';
+      log(`${tag}leg3 SKIPPED — keeping ${actualWeth.toFixed(6)} WETH; PnL $${realizedPnlUsdt.toFixed(2)} is MARK-TO-MARKET, ETH-exposed until converted (npm run arb:convert)`);
+
+    } else if (mode === 'dex') {
+      // leg 3 = swap the received WETH -> USDT on Uniswap, this trade
       try {
-        const ticker = dryRun ? { bid: ethUsd, ask: ethUsd } : await cex.fetchTickerPrice(client, HEDGE_SYMBOL);
-        const hedgePrice = isForward
-          ? (ticker.bid ?? ethUsd) * (1 - buffer)
-          : (ticker.ask ?? ethUsd) * (1 + buffer);
-        hedge = await placeAndAwait({
-          client, exchangeId, symbol: HEDGE_SYMBOL, side: hedgeSide,
-          amount: Number(actualWeth.toFixed(6)), price: Number(hedgePrice.toFixed(2)),
-          timeoutMs: EXEC.legTimeoutMs, dryRun, log
-        });
-        if (!hedge.filled) hedge = null;
+        if (dryRun) {
+          dexUsdtOut = actualWeth * ethUsd * (1 - EXEC.cexTakerFeeBps / 10000); // rough estimate
+          log(`${tag}[DRY] would swap ${actualWeth.toFixed(6)} WETH -> ~${dexUsdtOut.toFixed(2)} USDT on Uniswap`);
+        } else {
+          const conv = await lib.swapWethToUsdt({ config, provider, amountWeth: actualWeth, slippageBps: EXEC.slippageBps, log });
+          dexHedgeTx = conv.receipt.hash;
+          dexUsdtOut = Number(ethers.formatUnits(transferTotalToWallet(conv.receipt, config.usdtToken, config.walletAddress), conv.usdt.decimals));
+          gasUsd += Number(ethers.formatEther(conv.receipt.gasUsed * (conv.receipt.gasPrice ?? 0n))) * ethUsd;
+          log(`${tag}leg3 dex convert: ${actualWeth.toFixed(6)} WETH -> ${dexUsdtOut.toFixed(2)} USDT`);
+        }
+        realizedPnlUsdt = dexUsdtOut - (filledN * cexAvg) * (1 + feeRate) - gasUsd;
+        status = 'completed';
       } catch (error) {
         hedgeError = error.message;
-        log(`ALERT leg3 attempt ${attempt} failed: ${error.message}`);
+        // swap failed → fall back to holding WETH (mark-to-market), alert
+        realizedPnlUsdt = (actualWeth * ethUsd) - (filledN * cexAvg) * (1 + feeRate) - gasUsd;
+        status = 'hedge_pending';
+        log(`ALERT leg3 dex convert failed: ${error.message} — holding ${actualWeth.toFixed(6)} WETH`);
+      }
+
+    } else {
+      // mode === 'cex' (default): sell/buy ETH on the exchange
+      const hedgeSide = isForward ? 'sell' : 'buy';
+      for (let attempt = 1; attempt <= 3 && !hedge?.filled; attempt++) {
+        try {
+          const ticker = dryRun ? { bid: ethUsd, ask: ethUsd } : await cex.fetchTickerPrice(client, HEDGE_SYMBOL);
+          const hedgePrice = isForward
+            ? (ticker.bid ?? ethUsd) * (1 - buffer)
+            : (ticker.ask ?? ethUsd) * (1 + buffer);
+          hedge = await placeAndAwait({
+            client, exchangeId, symbol: HEDGE_SYMBOL, side: hedgeSide,
+            amount: Number(actualWeth.toFixed(6)), price: Number(hedgePrice.toFixed(2)),
+            timeoutMs: EXEC.legTimeoutMs, dryRun, log
+          });
+          if (!hedge.filled) hedge = null;
+        } catch (error) {
+          hedgeError = error.message;
+          log(`ALERT leg3 attempt ${attempt} failed: ${error.message}`);
+        }
+      }
+      const hedgeAvg = hedge?.average ?? ethUsd;
+      if (isForward) {
+        realizedPnlUsdt = (actualWeth * hedgeAvg) * (1 - feeRate) - (filledN * cexAvg) * (1 + feeRate) - gasUsd;
+      } else {
+        realizedPnlUsdt = (filledN * cexAvg) * (1 - feeRate) - (actualWeth * hedgeAvg) * (1 + feeRate) - gasUsd;
+      }
+      if (hedge?.filled) {
+        status = 'completed';
+      } else {
+        status = 'hedge_pending';
+        log(`ALERT hedge incomplete (${hedgeError ?? 'unfilled'}) — you are ${isForward ? 'long' : 'short'} ${actualWeth.toFixed(6)} ETH until hedged manually`);
       }
     }
 
-    // ---- account the round ----------------------------------------------
-    const feeRate = EXEC.cexTakerFeeBps / 10000;
-    const cexAvg = leg1.average ?? leg1Price;
-    const hedgeAvg = hedge?.average ?? ethUsd;
-    let realizedPnlUsdt;
-    if (isForward) {
-      realizedPnlUsdt = (actualWeth * hedgeAvg) * (1 - feeRate) - (filledN * cexAvg) * (1 + feeRate) - gasUsd;
-    } else {
-      realizedPnlUsdt = (filledN * cexAvg) * (1 - feeRate) - (actualWeth * hedgeAvg) * (1 + feeRate) - gasUsd;
-    }
-
-    const status = hedge?.filled ? 'completed' : 'hedge_pending';
-    if (status === 'hedge_pending') {
-      log(`ALERT hedge incomplete (${hedgeError ?? 'unfilled'}) — you are ${isForward ? 'long' : 'short'} ${actualWeth.toFixed(6)} ETH until hedged manually`);
-    }
+    const cexHedgeAvg = hedge?.average ?? null;          // only set in cex mode
+    const cexHedgeFeeUsd = cexHedgeAvg ? actualWeth * cexHedgeAvg * feeRate : 0;
 
     const entry = {
       ...journalBase,
       status,
+      hedgeMode: mode,
       direction: best.direction,
       exchange: exchangeId,
       sizeL1x: filledN,
@@ -391,7 +446,9 @@ async function executeOpportunity({ config, provider, market, arbClients, ownOrd
       dexTxHash: dexReceipt?.hash ?? null,
       wethAmount: actualWeth,
       hedgeOrderId: hedge?.orderId ?? null,
-      hedgeAvgPrice: hedge?.average ?? null,
+      hedgeAvgPrice: cexHedgeAvg,
+      dexHedgeTx,
+      dexUsdtOut,
       gasUsd,
       ethUsd,
       expectedNetUsd: best.netUsd,
@@ -403,6 +460,7 @@ async function executeOpportunity({ config, provider, market, arbClients, ownOrd
       await arbDb.init();
       await arbDb.insertTrade({
         exchange: exchangeId,
+        hedgeMode: mode,
         sizeL1x: filledN,
         dexTxHash: entry.dexTxHash,
         dexWethOut: actualWeth,
@@ -413,13 +471,23 @@ async function executeOpportunity({ config, provider, market, arbClients, ownOrd
         cexFeeUsd: filledN * cexAvg * feeRate,
         hedgeOrderId: entry.hedgeOrderId,
         hedgeEthAmount: actualWeth,
-        hedgeAvgPrice: entry.hedgeAvgPrice,
-        hedgeFeeUsd: actualWeth * hedgeAvg * feeRate,
+        hedgeAvgPrice: cexHedgeAvg,
+        hedgeFeeUsd: cexHedgeFeeUsd,
+        dexHedgeTx,
+        dexUsdtOut,
         ethUsd,
         realizedPnlUsdt,
         isDryRun: dryRun,
-        notes: `${best.direction} | status=${status} | expected $${best.netUsd.toFixed(2)}`
+        notes: `${best.direction} | mode=${mode} | status=${status} | expected $${best.netUsd.toFixed(2)}`
       });
+      // dex-mode leg 3 is an on-chain swap → also log it in the dex_trades ledger
+      if (mode === 'dex' && dexHedgeTx) {
+        await arbDb.insertDexTrade({
+          side: 'convert', txHash: dexHedgeTx, l1xAmount: 0,
+          wethAmount: actualWeth, avgPriceUsd: actualWeth > 0 ? dexUsdtOut / actualWeth : null,
+          ethUsd, wallet: config.walletAddress, isDryRun: dryRun
+        }).catch(() => {});
+      }
     } catch (error) {
       log(`WARN trade not recorded to DB: ${error.message.slice(0, 100)} (journal has it)`);
     }

@@ -15,6 +15,7 @@ Usage:
   node uniswap/uniswap_l1x_trader.js max-sell-size --min-price-usd 8.5 --max-l1x 1000 [--eth-usd 3500] [--step-l1x 0.01]
   node uniswap/uniswap_l1x_trader.js impact --l1x 10 [--eth-usd 3500]
   node uniswap/uniswap_l1x_trader.js balance [--address 0x...]
+  node uniswap/uniswap_l1x_trader.js convert [--weth 0.1] [--slippage 1] [--execute]
   node uniswap/uniswap_l1x_trader.js buy --eth 0.01 [--slippage 1] [--execute]
   node uniswap/uniswap_l1x_trader.js sell --l1x 100 [--slippage 1] [--execute] [--unwrap]
 
@@ -199,6 +200,80 @@ async function recordDexTrade({ side, receipt, config, market, walletAddress, am
   } finally {
     await db.end().catch(() => {});
   }
+}
+
+async function commandConvert(args) {
+  const config = lib.getConfig();
+  if (!config.usdtToken) throw new Error('USDT_ADDRESS not set in .env (needed for convert)');
+  const provider = lib.getProvider(config);
+  const weth = await lib.getTokenMeta(config.weth, provider);
+  const usdt = await lib.getTokenMeta(config.usdtToken, provider);
+  const slippageBps = lib.bpsFromSlippage(args.slippage, config.defaultSlippageBps);
+
+  // Determine amount (explicit --weth, else full wallet balance)
+  const owner = config.walletAddress || (lib.getWallet(config, provider, false)?.address);
+  if (!owner) throw new Error('No wallet configured');
+  const wethContract = new ethers.Contract(config.weth, lib.ERC20_ABI, provider);
+  const balance = await wethContract.balanceOf(owner);
+  const amountIn = args.weth ? ethers.parseUnits(String(args.weth), weth.decimals) : balance;
+
+  const quote = await lib.quoteExactInput({
+    config, provider, tokenIn: config.weth, tokenOut: config.usdtToken, amountIn, fee: config.usdtPoolFee
+  });
+  const amountOutMin = lib.minOut(quote.amountOut, slippageBps);
+
+  console.log('CONVERT WETH -> USDT');
+  console.log(`wallet WETH balance: ${lib.formatToken(balance, weth.decimals, weth.symbol)}`);
+  console.log(`converting: ${lib.formatToken(amountIn, weth.decimals, weth.symbol)}`);
+  console.log(`pool fee tier: ${config.usdtPoolFee}`);
+  console.log(`expected output: ${lib.formatToken(quote.amountOut, usdt.decimals, usdt.symbol)}`);
+  console.log(`minimum output @ ${slippageBps / 100}% slippage: ${lib.formatToken(amountOutMin, usdt.decimals, usdt.symbol)}`);
+  console.log(`quoted gas estimate: ${quote.gasEstimate.toString()}`);
+
+  if (!args.execute) {
+    console.log('dry-run only. Add --execute to swap WETH to USDT.');
+    return;
+  }
+
+  const { receipt } = await lib.swapWethToUsdt({
+    config, provider, amountWeth: args.weth || null, slippageBps, log: console.log
+  });
+
+  // Record to dex_trades (side = 'convert')
+  const db = require('../arb/db');
+  try {
+    const usdtOut = Number(ethers.formatUnits(
+      transferTotalToWalletGeneric(receipt, config.usdtToken, owner), usdt.decimals));
+    const wethSpent = Number(ethers.formatUnits(amountIn, weth.decimals));
+    const gasEth = Number(ethers.formatEther(receipt.gasUsed * (receipt.gasPrice ?? 0n)));
+    await db.init();
+    const id = await db.insertDexTrade({
+      side: 'convert', txHash: receipt.hash, blockNumber: receipt.blockNumber,
+      l1xAmount: 0, wethAmount: wethSpent, avgPriceUsd: wethSpent > 0 ? usdtOut / wethSpent : null,
+      ethUsd: null, gasEth, gasUsd: null, wallet: owner, isDryRun: false
+    });
+    console.log(`recorded to accounting DB: dex_trades #${id} (${usdtOut} USDT received)`);
+  } catch (error) {
+    console.log(`WARN: convert NOT recorded to DB (${error.message.slice(0, 100)}). Tx: ${receipt.hash}`);
+  } finally {
+    await db.end().catch(() => {});
+  }
+}
+
+// Sum Transfer(to=wallet) of a token from a receipt (generic helper).
+function transferTotalToWalletGeneric(receipt, tokenAddress, walletAddress) {
+  const iface = new ethers.Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
+  let total = 0n;
+  for (const logEntry of receipt.logs) {
+    if (logEntry.address.toLowerCase() !== tokenAddress.toLowerCase()) continue;
+    try {
+      const parsed = iface.parseLog(logEntry);
+      if (parsed?.name === 'Transfer' && parsed.args.to.toLowerCase() === walletAddress.toLowerCase()) {
+        total += parsed.args.value;
+      }
+    } catch (_) { /* not a Transfer */ }
+  }
+  return total;
 }
 
 async function commandBalance(args) {
@@ -408,6 +483,10 @@ async function main() {
     }
     if (command === 'balance') {
       await commandBalance(args);
+      return;
+    }
+    if (command === 'convert') {
+      await commandConvert(args);
       return;
     }
     if (command === 'buy') {

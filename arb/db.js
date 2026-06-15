@@ -63,6 +63,7 @@ async function init() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       timestamp DATETIME NOT NULL,
       exchange VARCHAR(20) NOT NULL,
+      hedge_mode VARCHAR(10),
       size_l1x DECIMAL(20,8) NOT NULL,
       dex_tx_hash VARCHAR(80),
       dex_weth_out DECIMAL(30,18),
@@ -75,6 +76,8 @@ async function init() {
       hedge_eth_amount DECIMAL(30,18),
       hedge_avg_price DECIMAL(20,8),
       hedge_fee_usd DECIMAL(20,8),
+      dex_hedge_tx VARCHAR(80),
+      dex_usdt_out DECIMAL(20,8),
       eth_usd DECIMAL(20,8),
       realized_pnl_usdt DECIMAL(20,8),
       is_dry_run TINYINT(1) DEFAULT 0,
@@ -155,16 +158,18 @@ async function insertOpportunity(record) {
 async function insertTrade(trade) {
   const [result] = await requirePool().query(
     `INSERT INTO arb_trades
-      (timestamp, exchange, size_l1x, dex_tx_hash, dex_weth_out, dex_avg_sell_usd, dex_gas_usd,
+      (timestamp, exchange, hedge_mode, size_l1x, dex_tx_hash, dex_weth_out, dex_avg_sell_usd, dex_gas_usd,
        cex_order_id, cex_avg_price, cex_fee_usd,
        hedge_order_id, hedge_eth_amount, hedge_avg_price, hedge_fee_usd,
+       dex_hedge_tx, dex_usdt_out,
        eth_usd, realized_pnl_usdt, is_dry_run, notes)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
-      trade.timestamp ?? new Date(), trade.exchange, trade.sizeL1x,
+      trade.timestamp ?? new Date(), trade.exchange, trade.hedgeMode ?? null, trade.sizeL1x,
       trade.dexTxHash ?? null, trade.dexWethOut ?? null, trade.dexAvgSellUsd ?? null, trade.dexGasUsd ?? null,
       trade.cexOrderId ?? null, trade.cexAvgPrice ?? null, trade.cexFeeUsd ?? null,
       trade.hedgeOrderId ?? null, trade.hedgeEthAmount ?? null, trade.hedgeAvgPrice ?? null, trade.hedgeFeeUsd ?? null,
+      trade.dexHedgeTx ?? null, trade.dexUsdtOut ?? null,
       trade.ethUsd ?? null, trade.realizedPnlUsdt ?? null, trade.isDryRun ? 1 : 0, trade.notes ?? null
     ]
   );

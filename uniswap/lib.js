@@ -86,7 +86,11 @@ function getConfig() {
     swapRouter02: envAddress('UNISWAP_SWAP_ROUTER_02_ADDRESS'),
     defaultSlippageBps: envNumber('UNISWAP_DEFAULT_SLIPPAGE_BPS', 0, 5000),
     deadlineSeconds: envNumber('UNISWAP_DEADLINE_SECONDS', 1, 86400),
-    ethUsdPrice: optionalNumber('ETH_USD_PRICE')
+    ethUsdPrice: optionalNumber('ETH_USD_PRICE'),
+    // USDT conversion (for `convert`: WETH -> USDT on Uniswap). Optional —
+    // only the convert path needs these.
+    usdtToken: process.env.USDT_ADDRESS ? ethers.getAddress(process.env.USDT_ADDRESS) : null,
+    usdtPoolFee: process.env.UNISWAP_USDT_POOL_FEE ? Number(process.env.UNISWAP_USDT_POOL_FEE) : 500
   };
 }
 
@@ -610,6 +614,55 @@ async function buyExactL1x({ config, provider, market, sizeL1x, slippageBps, log
   return { receipt, amountOut, amountInMax, quote };
 }
 
+// Swap WETH -> USDT on Uniswap (the "batch hedge" / convert step). Quotes
+// first for slippage protection, approves if needed, swaps via SwapRouter02.
+// amountWeth is a decimal string/number in WETH; null = use full balance.
+async function swapWethToUsdt({ config, provider, amountWeth = null, slippageBps, log = noop }) {
+  if (!config.usdtToken) throw new Error('USDT_ADDRESS not configured');
+  const wallet = getWallet(config, provider, true);
+  const weth = await getTokenMeta(config.weth, provider);
+  const usdt = await getTokenMeta(config.usdtToken, provider);
+
+  const wethContract = new ethers.Contract(config.weth, ERC20_ABI, wallet);
+  const balance = await wethContract.balanceOf(wallet.address);
+  const amountIn = amountWeth == null ? balance : ethers.parseUnits(String(amountWeth), weth.decimals);
+  if (amountIn <= 0n) throw new Error('no WETH to convert');
+  if (amountIn > balance) throw new Error(`WETH balance too low: have ${ethers.formatUnits(balance, weth.decimals)}`);
+
+  const quote = await quoteExactInput({
+    config,
+    provider,
+    tokenIn: config.weth,
+    tokenOut: config.usdtToken,
+    amountIn,
+    fee: config.usdtPoolFee
+  });
+  const amountOutMin = minOut(quote.amountOut, slippageBps);
+
+  await approveIfNeeded({
+    tokenAddress: config.weth,
+    owner: wallet.address,
+    spender: config.swapRouter02,
+    amount: amountIn,
+    wallet,
+    symbol: weth.symbol,
+    log
+  });
+
+  const receipt = await executeSwap({
+    config,
+    wallet,
+    pool: { fee: config.usdtPoolFee },
+    tokenIn: config.weth,
+    tokenOut: config.usdtToken,
+    amountIn,
+    amountOutMin,
+    value: 0n,
+    log
+  });
+  return { receipt, amountIn, quote, weth, usdt, amountOutMin };
+}
+
 module.exports = {
   ERC20_ABI,
   WETH_ABI,
@@ -643,5 +696,6 @@ module.exports = {
   approveIfNeeded,
   executeSwap,
   sellL1x,
-  buyExactL1x
+  buyExactL1x,
+  swapWethToUsdt
 };
