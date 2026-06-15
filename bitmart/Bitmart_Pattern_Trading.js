@@ -82,7 +82,7 @@ let CONFIG = {
         uid: process.env.BITMART_BOT_B_UID || ''
     },
 
-    dryRun: true, // Set to true for testing without real money
+    dryRun: process.env.BOT_DRY_RUN !== 'false', // env-driven: dry-run unless BOT_DRY_RUN=false
     
     // MySQL DATABASE
     database: {

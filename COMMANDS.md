@@ -172,10 +172,15 @@ node scripts/db_consolidate.js topup     # incremental copy by id (cutover)
 - [ ] `git pull` the branch with prefixed-table code
 - [ ] `pm2 stop all` (bots stop writing)
 - [ ] `node scripts/db_consolidate.js topup` then `verify` — counts must match exactly
-- [ ] server `.env`: `BITMART_DB_NAME=mm_production` and `LBANK_DB_NAME=mm_production`
+- [ ] server `.env`: single `DB_*` block → `mm_production` (or set both
+      `BITMART_DB_NAME`/`LBANK_DB_NAME=mm_production`)
+- [ ] **server `.env`: `BOT_DRY_RUN=false`** — REQUIRED, else all bots run
+      in dry-run and trading silently stops (dry-run is the safe default)
+- [ ] `npm run db:migrate` — apply any pending schema migrations
 - [ ] `pm2 start ecosystem.config.js` and watch logs for SQL errors
-- [ ] dashboard pages show history for both exchanges
-- [ ] rollback if needed: revert the two .env values, `pm2 restart all`
+- [ ] confirm bots log real trades (not `[DRY]`) and dashboard shows history
+- [ ] rollback if needed: revert `.env` DB names + restart (BOT_DRY_RUN
+      stays false); old databases remain intact
 
 ## 3c. Schema migrations
 

@@ -280,12 +280,13 @@ addCheck('ports are expected', () => {
 });
 
 addCheck('startup behavior is understood', () => {
-  // dryRun values are machine-specific (flipped locally for safe testing);
-  // assert the knob exists rather than pinning a value.
-  assert(read('bitmart/Bitmart_Pattern_Trading.js').includes('dryRun:'), 'Bitmart pattern has no dryRun setting');
-  assert(read('lbank/Lbank_Pattern_Trading.js').includes('dryRun:'), 'LBank pattern has no dryRun setting');
-  assert(read('bitmart/grid_manager_bitmart.js').includes('dryRun:'), 'Bitmart grid has no dryRun setting');
-  assert(read('lbank/LBank_GridManager.js').includes('dryRun:'), 'LBank grid has no dryRun setting');
+  // dryRun is env-driven (BOT_DRY_RUN). Assert no bot hardcodes it back to a
+  // literal — that would reintroduce per-machine drift and pull-time risk.
+  for (const f of ['bitmart/Bitmart_Pattern_Trading.js', 'lbank/Lbank_Pattern_Trading.js',
+                   'bitmart/grid_manager_bitmart.js', 'lbank/LBank_GridManager.js']) {
+    assert(read(f).includes("dryRun: process.env.BOT_DRY_RUN"), `${f} must use env-driven dryRun (BOT_DRY_RUN)`);
+    assert(!/dryRun:\s*(true|false)/.test(read(f)), `${f} hardcodes dryRun — must be env-driven`);
+  }
   assert(read('bitmart/grid_manager_bitmart.js').includes('startGridManager();'), 'Bitmart grid does not auto-start');
   assert(read('lbank/LBank_GridManager.js').includes('startGridManager();'), 'LBank grid does not auto-start');
 });

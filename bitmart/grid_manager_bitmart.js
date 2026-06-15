@@ -38,7 +38,7 @@ const GRID_CONFIG = {
     pair: 'L1X/USDT',
     
     // Dry run mode
-    dryRun: false,
+    dryRun: process.env.BOT_DRY_RUN !== 'false', // env-driven: dry-run unless BOT_DRY_RUN=false
     
     // Minimum balances required
     minUsdtBalance: 10,
