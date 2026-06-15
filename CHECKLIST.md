@@ -62,10 +62,15 @@ MUST differ — getting them wrong silently breaks trading or pollutes data.
 
 ## Phase 4 — Trading prerequisites (parallel, no rush)
 
-- [ ] Create dedicated ARB API keys on LBank (trading permission)
-- [ ] Whitelist the server IP on those keys
-- [ ] Add `ARB_LBANK_API_KEY` / `ARB_LBANK_SECRET` to server `.env` (and Bitmart later)
-- [ ] One unfillable test order: buy 5 L1X @ $7 via the code path → see it on the exchange → cancel
+- [ ] CEX order test (leg 1): `npm run arb:test-cex-order -- --exchange lbank`
+      (unfillable, zero risk) then `--fill --l1x 1` (real ~$8 buy).
+      OK to run against the grid account for the test (the grid bot won't
+      cancel non-grid orders), but use a DEDICATED account for production:
+- [ ] **Create a dedicated ARB account/sub-account** (NOT a shared MM bot key)
+      — its own balance, own API key, trading permission, server IP whitelisted
+- [ ] Set `ARB_LBANK_API_KEY` / `ARB_LBANK_SECRET` to the dedicated account
+      (currently they alias LBANK_BOT_A — must change before go-live, or arb
+      and the pattern bot fight over the same balance/orders)
 - [ ] Position inventory: L1X + ETH in the wallet, L1X + ETH + USDT on the exchange
 
 ## Phase 5 — Collect data (days — the decision gate)
