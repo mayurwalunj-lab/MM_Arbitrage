@@ -46,6 +46,7 @@
     "arb:monitor:once": "node arb/monitor.js --once",
     "arb:execute": "node arb/execute_cli.js",
     "arb:test-cex-order": "node arb/test_cex_order.js",
+    "arb:book": "node arb/show_book.js",
     "arb:report": "node arb/accounting.js report",
     "arb:snapshot": "node arb/accounting.js snapshot",
     "arb:record-trade": "node arb/accounting.js record-trade"
