@@ -90,7 +90,7 @@ async function init() {
     CREATE TABLE IF NOT EXISTS dex_trades (
       id INT AUTO_INCREMENT PRIMARY KEY,
       timestamp DATETIME NOT NULL,
-      side VARCHAR(4) NOT NULL,
+      side VARCHAR(16) NOT NULL,
       tx_hash VARCHAR(80),
       block_number INT,
       l1x_amount DECIMAL(30,18),

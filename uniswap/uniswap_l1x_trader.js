@@ -15,7 +15,8 @@ Usage:
   node uniswap/uniswap_l1x_trader.js max-sell-size --min-price-usd 8.5 --max-l1x 1000 [--eth-usd 3500] [--step-l1x 0.01]
   node uniswap/uniswap_l1x_trader.js impact --l1x 10 [--eth-usd 3500]
   node uniswap/uniswap_l1x_trader.js balance [--address 0x...]
-  node uniswap/uniswap_l1x_trader.js convert [--weth 0.1] [--slippage 1] [--execute]
+  node uniswap/uniswap_l1x_trader.js convert [--weth 0.1] [--slippage 1] [--execute]            (WETH -> USDT)
+  node uniswap/uniswap_l1x_trader.js convert --reverse [--usdt 100] [--slippage 1] [--execute]  (USDT -> WETH)
   node uniswap/uniswap_l1x_trader.js buy --eth 0.01 [--slippage 1] [--execute]
   node uniswap/uniswap_l1x_trader.js sell --l1x 100 [--slippage 1] [--execute] [--unwrap]
 
@@ -210,49 +211,75 @@ async function commandConvert(args) {
   const usdt = await lib.getTokenMeta(config.usdtToken, provider);
   const slippageBps = lib.bpsFromSlippage(args.slippage, config.defaultSlippageBps);
 
-  // Determine amount (explicit --weth, else full wallet balance)
   const owner = config.walletAddress || (lib.getWallet(config, provider, false)?.address);
   if (!owner) throw new Error('No wallet configured');
-  const wethContract = new ethers.Contract(config.weth, lib.ERC20_ABI, provider);
-  const balance = await wethContract.balanceOf(owner);
-  const amountIn = args.weth ? ethers.parseUnits(String(args.weth), weth.decimals) : balance;
+  const reverse = Boolean(args.reverse);   // --reverse = USDT -> WETH
+
+  // Direction-specific token setup
+  const inMeta = reverse ? usdt : weth;
+  const outMeta = reverse ? weth : usdt;
+  const inAddr = reverse ? config.usdtToken : config.weth;
+  const outAddr = reverse ? config.weth : config.usdtToken;
+  const amtArg = reverse ? args.usdt : args.weth;
+
+  const inContract = new ethers.Contract(inAddr, lib.ERC20_ABI, provider);
+  const balance = await inContract.balanceOf(owner);
+  const amountIn = amtArg ? ethers.parseUnits(String(amtArg), inMeta.decimals) : balance;
 
   const quote = await lib.quoteExactInput({
-    config, provider, tokenIn: config.weth, tokenOut: config.usdtToken, amountIn, fee: config.usdtPoolFee
+    config, provider, tokenIn: inAddr, tokenOut: outAddr, amountIn, fee: config.usdtPoolFee
   });
   const amountOutMin = lib.minOut(quote.amountOut, slippageBps);
 
-  console.log('CONVERT WETH -> USDT');
-  console.log(`wallet WETH balance: ${lib.formatToken(balance, weth.decimals, weth.symbol)}`);
-  console.log(`converting: ${lib.formatToken(amountIn, weth.decimals, weth.symbol)}`);
-  console.log(`pool fee tier: ${config.usdtPoolFee}`);
-  console.log(`expected output: ${lib.formatToken(quote.amountOut, usdt.decimals, usdt.symbol)}`);
-  console.log(`minimum output @ ${slippageBps / 100}% slippage: ${lib.formatToken(amountOutMin, usdt.decimals, usdt.symbol)}`);
-  console.log(`quoted gas estimate: ${quote.gasEstimate.toString()}`);
+  console.log(`CONVERT ${inMeta.symbol} -> ${outMeta.symbol}`);
+  console.log(`wallet ${inMeta.symbol} balance: ${lib.formatToken(balance, inMeta.decimals, inMeta.symbol)}`);
+  const amtIn = Number(ethers.formatUnits(amountIn, inMeta.decimals));
+  const amtOut = Number(ethers.formatUnits(quote.amountOut, outMeta.decimals));
+  const ethUsd = await lib.resolveEthUsdPrice({ config, log: () => {} }).then((r) => r.price).catch(() => null);
+  const feeData = await provider.getFeeData();
+  const gasPriceWei = feeData.gasPrice ?? feeData.maxFeePerGas ?? 0n;
+  const gasEth = Number(ethers.formatUnits(quote.gasEstimate * gasPriceWei, 18));
+  const gasUsd = ethUsd ? gasEth * ethUsd : null;
+  const poolFeePct = config.usdtPoolFee / 10000;
+  // value of the input leg in USD (WETH side uses ETH price; USDT side is ~$1)
+  const inValueUsd = reverse ? amtIn : (ethUsd ? amtIn * ethUsd : null);
+  const poolFeeUsd = inValueUsd != null ? inValueUsd * (poolFeePct / 100) : null;
+
+  console.log(`converting: ${amtIn} ${inMeta.symbol}${inValueUsd != null ? ` (~$${inValueUsd.toFixed(2)})` : ''}`);
+  console.log(`pool fee tier: ${config.usdtPoolFee} (${poolFeePct}%)`);
+  console.log(`expected output: ${amtOut.toFixed(6)} ${outMeta.symbol}`);
+  console.log(`minimum output @ ${slippageBps / 100}% slippage: ${Number(ethers.formatUnits(amountOutMin, outMeta.decimals)).toFixed(6)} ${outMeta.symbol}`);
+  console.log('--- cost breakdown ---');
+  console.log(`  pool fee (${poolFeePct}%): ${poolFeeUsd != null ? '~$' + poolFeeUsd.toFixed(4) : 'n/a'} (already in expected output)`);
+  console.log(`  gas: ${quote.gasEstimate.toString()} units${gasUsd != null ? ` × $${ethUsd.toFixed(0)}/ETH ≈ $${gasUsd.toFixed(4)}` : ''}`);
+  console.log(`  slippage allowance: up to ${slippageBps / 100}%${inValueUsd != null ? ' ($' + (inValueUsd * slippageBps / 10000).toFixed(4) + ')' : ''}`);
 
   if (!args.execute) {
-    console.log('dry-run only. Add --execute to swap WETH to USDT.');
+    console.log(`dry-run only. Add --execute to swap ${inMeta.symbol} to ${outMeta.symbol}.`);
     return;
   }
 
-  const { receipt } = await lib.swapWethToUsdt({
-    config, provider, amountWeth: args.weth || null, slippageBps, log: console.log
-  });
+  const swapFn = reverse ? lib.swapUsdtToWeth : lib.swapWethToUsdt;
+  const swapArg = reverse ? { amountUsdt: args.usdt || null } : { amountWeth: args.weth || null };
+  const { receipt } = await swapFn({ config, provider, ...swapArg, slippageBps, log: console.log });
 
-  // Record to dex_trades (side = 'convert')
+  // Record to dex_trades
   const db = require('../arb/db');
   try {
-    const usdtOut = Number(ethers.formatUnits(
-      transferTotalToWalletGeneric(receipt, config.usdtToken, owner), usdt.decimals));
-    const wethSpent = Number(ethers.formatUnits(amountIn, weth.decimals));
-    const gasEth = Number(ethers.formatEther(receipt.gasUsed * (receipt.gasPrice ?? 0n)));
+    const outReceived = Number(ethers.formatUnits(
+      transferTotalToWalletGeneric(receipt, outAddr, owner), outMeta.decimals));
+    const spent = Number(ethers.formatUnits(amountIn, inMeta.decimals));
+    const gasEthActual = Number(ethers.formatEther(receipt.gasUsed * (receipt.gasPrice ?? 0n)));
+    // dex_trades is WETH-centric: record the WETH leg amount + implied price
+    const wethAmt = reverse ? outReceived : spent;
+    const usdtAmt = reverse ? spent : outReceived;
     await db.init();
     const id = await db.insertDexTrade({
-      side: 'convert', txHash: receipt.hash, blockNumber: receipt.blockNumber,
-      l1xAmount: 0, wethAmount: wethSpent, avgPriceUsd: wethSpent > 0 ? usdtOut / wethSpent : null,
-      ethUsd: null, gasEth, gasUsd: null, wallet: owner, isDryRun: false
+      side: reverse ? 'convert-back' : 'convert', txHash: receipt.hash, blockNumber: receipt.blockNumber,
+      l1xAmount: 0, wethAmount: wethAmt, avgPriceUsd: wethAmt > 0 ? usdtAmt / wethAmt : null,
+      ethUsd, gasEth: gasEthActual, gasUsd: ethUsd ? gasEthActual * ethUsd : null, wallet: owner, isDryRun: false
     });
-    console.log(`recorded to accounting DB: dex_trades #${id} (${usdtOut} USDT received)`);
+    console.log(`recorded to accounting DB: dex_trades #${id} (${outReceived} ${outMeta.symbol} received)`);
   } catch (error) {
     console.log(`WARN: convert NOT recorded to DB (${error.message.slice(0, 100)}). Tx: ${receipt.hash}`);
   } finally {
@@ -306,11 +333,25 @@ async function commandBalance(args) {
     ? lib.poolL1xUsdPrice({ sqrtPriceX96: market.pool.sqrtPriceX96, pool: market.pool, l1x, weth, ethUsdPrice: ethUsd.price })
     : null;
 
+  // USDT (if configured)
+  let usdtBal = null;
+  let usdtMeta = null;
+  if (config.usdtToken) {
+    try {
+      usdtMeta = await lib.getTokenMeta(config.usdtToken, provider);
+      usdtBal = await new ethers.Contract(config.usdtToken, lib.ERC20_ABI, provider).balanceOf(address);
+    } catch (_) { /* skip if unreadable */ }
+  }
+
   console.log('WALLET BALANCE');
   console.log(`address: ${address}`);
   console.log(`ETH: ${ethers.formatEther(ethBal)}${fmtUsd(ethBal, ethUsd?.price)}`);
   console.log(`${weth.symbol}: ${ethers.formatEther(wethBal)}${fmtUsd(wethBal, ethUsd?.price)}`);
   console.log(`${l1x.symbol}: ${ethers.formatUnits(l1xBal, l1x.decimals)}${l1xUsd ? ` (= $${(Number(ethers.formatUnits(l1xBal, l1x.decimals)) * l1xUsd).toFixed(2)} @ pool price $${l1xUsd.toFixed(4)})` : ''}`);
+  if (usdtBal != null) {
+    const usdtNum = Number(ethers.formatUnits(usdtBal, usdtMeta.decimals));
+    console.log(`${usdtMeta.symbol}: ${usdtNum.toFixed(6)} (= $${usdtNum.toFixed(2)})`);
+  }
   console.log(`${weth.symbol} allowance to router: ${ethers.formatEther(wethAllowance)}`);
   console.log(`${l1x.symbol} allowance to router: ${ethers.formatUnits(l1xAllowance, l1x.decimals)}`);
 }

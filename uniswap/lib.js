@@ -663,6 +663,55 @@ async function swapWethToUsdt({ config, provider, amountWeth = null, slippageBps
   return { receipt, amountIn, quote, weth, usdt, amountOutMin };
 }
 
+// Swap USDT -> WETH on Uniswap (reverse of swapWethToUsdt — replenish wallet
+// WETH for buy-dex trades). amountUsdt is a decimal string/number; null = full
+// USDT balance.
+async function swapUsdtToWeth({ config, provider, amountUsdt = null, slippageBps, log = noop }) {
+  if (!config.usdtToken) throw new Error('USDT_ADDRESS not configured');
+  const wallet = getWallet(config, provider, true);
+  const weth = await getTokenMeta(config.weth, provider);
+  const usdt = await getTokenMeta(config.usdtToken, provider);
+
+  const usdtContract = new ethers.Contract(config.usdtToken, ERC20_ABI, wallet);
+  const balance = await usdtContract.balanceOf(wallet.address);
+  const amountIn = amountUsdt == null ? balance : ethers.parseUnits(String(amountUsdt), usdt.decimals);
+  if (amountIn <= 0n) throw new Error('no USDT to convert');
+  if (amountIn > balance) throw new Error(`USDT balance too low: have ${ethers.formatUnits(balance, usdt.decimals)}`);
+
+  const quote = await quoteExactInput({
+    config,
+    provider,
+    tokenIn: config.usdtToken,
+    tokenOut: config.weth,
+    amountIn,
+    fee: config.usdtPoolFee
+  });
+  const amountOutMin = minOut(quote.amountOut, slippageBps);
+
+  await approveIfNeeded({
+    tokenAddress: config.usdtToken,
+    owner: wallet.address,
+    spender: config.swapRouter02,
+    amount: amountIn,
+    wallet,
+    symbol: usdt.symbol,
+    log
+  });
+
+  const receipt = await executeSwap({
+    config,
+    wallet,
+    pool: { fee: config.usdtPoolFee },
+    tokenIn: config.usdtToken,
+    tokenOut: config.weth,
+    amountIn,
+    amountOutMin,
+    value: 0n,
+    log
+  });
+  return { receipt, amountIn, quote, weth, usdt, amountOutMin };
+}
+
 module.exports = {
   ERC20_ABI,
   WETH_ABI,
@@ -697,5 +746,6 @@ module.exports = {
   executeSwap,
   sellL1x,
   buyExactL1x,
-  swapWethToUsdt
+  swapWethToUsdt,
+  swapUsdtToWeth
 };
