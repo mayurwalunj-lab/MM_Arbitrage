@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arb Dashboard — DEX swaps & inventory</title>
+<style>
+  :root { --bg:#0e1116; --card:#171c24; --line:#262d39; --txt:#e6e9ef; --mut:#8a93a3; --grn:#3fb950; --red:#f85149; --amb:#d29922; --acc:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:-apple-system,Segoe UI,Roboto,sans-serif; padding:24px; }
+  h1 { font-size:20px; font-weight:600; margin:0 0 4px; }
+  .sub { color:var(--mut); font-size:13px; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .card .label { color:var(--mut); font-size:12px; }
+  .card .val { font-size:22px; font-weight:600; margin-top:4px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; }
+  section h2 { font-size:15px; margin:0 0 12px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--mut); font-weight:500; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .pill { font-size:11px; padding:2px 7px; border-radius:10px; }
+  .buy { background:#1f3326; color:var(--grn); } .sell { background:#33211f; color:var(--red); }
+  .conv { background:#1f2a33; color:var(--acc); } .dry { background:#33301f; color:var(--amb); }
+  a { color:var(--acc); text-decoration:none; }
+  .refresh { color:var(--mut); font-size:12px; }
+  .topbar { display:flex; justify-content:space-between; align-items:flex-start; }
+  .filter { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .filter button { background:var(--card); color:var(--mut); border:0; padding:8px 14px; font-size:13px; cursor:pointer; }
+  .filter button.active { background:var(--acc); color:#0e1116; font-weight:600; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <h1>Arb Dashboard</h1>
+      <div class="sub">DEX swaps &amp; inventory · <span class="refresh" id="updated">loading…</span></div>
+    </div>
+    <div class="filter" id="filter">
+      <button data-mode="all" class="active">All</button>
+      <button data-mode="live">Live</button>
+      <button data-mode="dry">Dry-run</button>
+    </div>
+  </div>
+
+  <div class="grid" id="cards"></div>
+
+  <section>
+    <h2>Treasury statement <span class="sub" id="stmtMode" style="font-weight:400"></span></h2>
+    <table id="stmtTable"><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>Treasury — DEX premium over CEX (%)</h2>
+    <canvas id="premChart" height="90"></canvas>
+    <div class="sub" style="margin-top:8px" id="premNow">—</div>
+  </section>
+
+  <section>
+    <h2>Treasury sells</h2>
+    <table id="treasTable">
+      <thead><tr><th>Time</th><th>Status</th><th class="num">Premium %</th><th class="num">CEX floor</th><th class="num">DEX spot</th><th class="num">L1X sold</th><th class="num">USDT</th><th class="num">Gas $</th><th>Tx</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Inventory value over time</h2>
+    <canvas id="valChart" height="90"></canvas>
+  </section>
+
+  <section>
+    <h2>Latest inventory snapshot</h2>
+    <table id="invTable"><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>DEX swaps (last 50)</h2>
+    <table id="dexTable">
+      <thead><tr><th>Time</th><th>Side</th><th class="num">L1X</th><th class="num">WETH</th><th class="num">Price $</th><th class="num">Gas $</th><th>Tx</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const fmt = (n, d=2) => n == null ? '—' : Number(n).toLocaleString(undefined,{maximumFractionDigits:d});
+const sidePill = s => `<span class="pill ${s==='buy'?'buy':s==='sell'?'sell':'conv'}">${s}</span>`;
+
+let MODE = 'all';
+
+async function load() {
+  try {
+    const m = `mode=${MODE}`;
+    const [dex, inv, tre] = await Promise.all([
+      fetch(`/api/arb/dex-trades?${m}`).then(r=>r.json()),
+      fetch(`/api/arb/inventory?hours=168&${m}`).then(r=>r.json()),
+      fetch(`/api/arb/treasury?hours=336&${m}`).then(r=>r.json())
+    ]);
+    renderCards(dex, inv, tre);
+    renderInv(inv);
+    renderDex(dex);
+    renderChart(inv);
+    renderStatement(tre);
+    renderTreasury(tre);
+    document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('updated').textContent = 'error: ' + e.message;
+  }
+}
+
+function renderCards(dex, inv, tre) {
+  const totalGas = (dex.totalsBySide||[]).reduce((s,t)=>s+Number(t.gas||0),0);
+  const swaps = (dex.totalsBySide||[]).reduce((s,t)=>s+Number(t.n||0),0);
+  const val = inv.latest ? inv.latest.total_value_usd : null;
+  const s = tre.statement || {};
+  const useReal = MODE === 'live' ? true : MODE === 'dry' ? false : (s.real?.sells || 0) > 0;
+  const a = useReal ? (s.real || {}) : (s.simulated || {});
+  const tag = useReal ? '' : ' (sim)';
+  const usdtInTreasury = s.position && s.position.cur_usdt != null ? s.position.cur_usdt
+    : (inv.latest && inv.latest.wallet_usdt != null ? inv.latest.wallet_usdt : null);
+  const cards = [
+    ['Total value', val!=null?('$'+fmt(val)):'—'],
+    ['USDT in treasury', usdtInTreasury!=null?('$'+fmt(usdtInTreasury)):'—'],
+    ['Treasury L1X sold'+tag, fmt(a.l1xSold,2)],
+    ['Treasury USDT gained'+tag, '$'+fmt(a.usdt)],
+    ['Gas spent', '$'+fmt(totalGas,4)],
+    ['DEX swaps', fmt(swaps,0)],
+  ];
+  document.getElementById('cards').innerHTML = cards.map(([l,v])=>
+    `<div class="card"><div class="label">${l}</div><div class="val">${v}</div></div>`).join('');
+}
+
+function renderStatement(tre) {
+  const s = tre.statement || {};
+  // Pick figures by the active filter; 'all' uses real if any, else simulated.
+  const useReal = MODE === 'live' ? true : MODE === 'dry' ? false : (s.real?.sells || 0) > 0;
+  const a = useReal ? (s.real || {}) : (s.simulated || {});
+  const pos = s.position || {};
+  document.getElementById('stmtMode').textContent = useReal ? '(realized)' : '(simulated — dry-run)';
+  const net = (a.usdt || 0) - (a.gas || 0);
+  const rows = [
+    ['Opening treasury L1X', pos.open_l1x != null ? fmt(pos.open_l1x, 4) : '—'],
+    ['Current treasury L1X', pos.cur_l1x != null ? fmt(pos.cur_l1x, 4) : '—'],
+    ['— L1X sold', fmt(a.l1xSold, 4) + (useReal ? '' : ' (sim)')],
+    ['Avg sell price', a.avgPrice != null ? '$' + fmt(a.avgPrice, 4) : '—'],
+    ['USDT received', '$' + fmt(a.usdt)],
+    ['Premium captured vs CEX', '$' + fmt(a.premium)],
+    ['Gas cost (total)', '$' + fmt(a.gas, 4)],
+    ['Net USDT (received − gas)', '$' + fmt(net)],
+    ['Current USDT in treasury', pos.cur_usdt != null ? '$' + fmt(pos.cur_usdt) : '—'],
+    ['Sells count', fmt(a.sells, 0)],
+  ];
+  document.querySelector('#stmtTable tbody').innerHTML = rows.map(([k, v]) =>
+    `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
+}
+
+let premChart;
+function renderTreasury(tre) {
+  const rows = (tre.rows||[]).slice().reverse();
+  const ctx = document.getElementById('premChart');
+  const data = { labels: rows.map(r=>new Date(r.timestamp).toLocaleString()),
+    datasets:[{ label:'Premium %', data:rows.map(r=>Number(r.premium_pct)), borderColor:'#d29922', backgroundColor:'rgba(210,153,34,.1)', fill:true, tension:.2, pointRadius:0 }] };
+  const opts = { responsive:true, plugins:{legend:{display:false}}, scales:{ x:{ticks:{color:'#8a93a3',maxTicksLimit:6},grid:{display:false}}, y:{ticks:{color:'#8a93a3'},grid:{color:'#262d39'}} } };
+  if (premChart) { premChart.data=data; premChart.update(); } else { premChart = new Chart(ctx, {type:'line', data, options:opts}); }
+
+  const L = tre.latest;
+  document.getElementById('premNow').textContent = L
+    ? `latest: ${Number(L.premium_pct).toFixed(2)}% premium  ·  CEX $${Number(L.cex_floor_usd).toFixed(4)} → DEX $${Number(L.dex_spot_usd).toFixed(4)}  ·  could sell ${fmt(L.ceiling_l1x,2)} L1X to floor`
+    : 'no treasury runs yet';
+
+  const tb = document.querySelector('#treasTable tbody');
+  if (!tre.rows || !tre.rows.length) { tb.innerHTML = '<tr><td colspan="8">No treasury runs yet</td></tr>'; return; }
+  const sp = s => `<span class="pill ${s==='executed'?'buy':s==='skipped'?'sell':'conv'}">${s}</span>`;
+  tb.innerHTML = tre.rows.map(r=>`<tr>
+    <td>${new Date(r.timestamp).toLocaleString()}</td>
+    <td>${sp(r.status)} ${r.is_dry_run?'<span class="pill dry">dry</span>':''}</td>
+    <td class="num">${fmt(r.premium_pct,3)}</td>
+    <td class="num">${fmt(r.cex_floor_usd,4)}</td>
+    <td class="num">${fmt(r.dex_spot_usd,4)}</td>
+    <td class="num">${r.status==='executed'?fmt(r.sold_l1x,4):'—'}</td>
+    <td class="num">${r.status==='executed'&&r.usdt_received!=null?('$'+fmt(r.usdt_received)):'—'}</td>
+    <td class="num">${r.status==='executed'?('$'+fmt((Number(r.sell_gas_usd)||0)+(Number(r.convert_gas_usd)||0),4)):'—'}</td>
+    <td>${r.sell_tx&&!r.sell_tx.startsWith('0xDRY')?`<a href="https://etherscan.io/tx/${r.sell_tx}" target="_blank">${r.sell_tx.slice(0,10)}…</a>`:(r.sell_tx?'dry':'—')}</td>
+  </tr>`).join('');
+}
+
+function renderInv(inv) {
+  const s = inv.latest;
+  const tb = document.querySelector('#invTable tbody');
+  if (!s) { tb.innerHTML = '<tr><td>No snapshots yet</td></tr>'; return; }
+  const rows = [
+    ['Wallet L1X', fmt(s.wallet_l1x,4)],
+    ['Wallet WETH', fmt(s.wallet_weth,6)],
+    ['Wallet ETH', fmt(s.wallet_eth,6)],
+    ['Wallet USDT', s.wallet_usdt!=null?('$'+fmt(s.wallet_usdt)):'—'],
+    ['Bitmart L1X / USDT', fmt(s.bitmart_l1x,2)+' / '+fmt(s.bitmart_usdt,2)],
+    ['LBank L1X / USDT', fmt(s.lbank_l1x,2)+' / '+fmt(s.lbank_usdt,2)],
+    ['Total value', '$'+fmt(s.total_value_usd)],
+    ['Snapshot', new Date(s.timestamp).toLocaleString() + (s.is_dry_run?' (dry)':'')],
+  ];
+  tb.innerHTML = rows.map(([k,v])=>`<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
+}
+
+function renderDex(dex) {
+  const tb = document.querySelector('#dexTable tbody');
+  if (!dex.trades || !dex.trades.length) { tb.innerHTML = '<tr><td colspan="7">No DEX swaps yet</td></tr>'; return; }
+  tb.innerHTML = dex.trades.map(t=>`<tr>
+    <td>${new Date(t.timestamp).toLocaleString()}</td>
+    <td>${sidePill(t.side)} ${t.is_dry_run?'<span class="pill dry">dry</span>':''}</td>
+    <td class="num">${fmt(t.l1x_amount,4)}</td>
+    <td class="num">${fmt(t.weth_amount,6)}</td>
+    <td class="num">${fmt(t.avg_price_usd,4)}</td>
+    <td class="num">${fmt(t.gas_usd,4)}</td>
+    <td>${t.tx_hash?`<a href="https://etherscan.io/tx/${t.tx_hash}" target="_blank">${t.tx_hash.slice(0,10)}…</a>`:'—'}</td>
+  </tr>`).join('');
+}
+
+let chart;
+function renderChart(inv) {
+  const h = inv.history || [];
+  const ctx = document.getElementById('valChart');
+  const data = { labels: h.map(r=>new Date(r.timestamp).toLocaleString()),
+    datasets:[{ label:'Total value $', data:h.map(r=>r.total_value_usd), borderColor:'#58a6ff', backgroundColor:'rgba(88,166,255,.1)', fill:true, tension:.25, pointRadius:0 }] };
+  const opts = { responsive:true, plugins:{legend:{display:false}}, scales:{ x:{ticks:{color:'#8a93a3',maxTicksLimit:6},grid:{display:false}}, y:{ticks:{color:'#8a93a3'},grid:{color:'#262d39'}} } };
+  if (chart) { chart.data = data; chart.update(); } else { chart = new Chart(ctx, {type:'line', data, options:opts}); }
+}
+
+document.getElementById('filter').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-mode]');
+  if (!btn) return;
+  MODE = btn.dataset.mode;
+  document.querySelectorAll('#filter button').forEach(b => b.classList.toggle('active', b === btn));
+  load();
+});
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

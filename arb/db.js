@@ -112,6 +112,7 @@ async function init() {
       wallet_l1x DECIMAL(30,18),
       wallet_weth DECIMAL(30,18),
       wallet_eth DECIMAL(30,18),
+      wallet_usdt DECIMAL(20,8),
       bitmart_l1x DECIMAL(20,8),
       bitmart_usdt DECIMAL(20,8),
       bitmart_eth DECIMAL(20,8),
@@ -123,6 +124,34 @@ async function init() {
       total_value_usd DECIMAL(20,8),
       is_dry_run TINYINT(1) NOT NULL DEFAULT 0,
       INDEX idx_arb_inv_ts (timestamp)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS treasury_sells (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      timestamp DATETIME NOT NULL,
+      status VARCHAR(16) NOT NULL,
+      direction VARCHAR(8) NOT NULL DEFAULT 'sell',
+      cex_floor_usd DECIMAL(20,8),
+      cex_source VARCHAR(20),
+      dex_spot_usd DECIMAL(20,8),
+      premium_pct DECIMAL(10,4),
+      ceiling_l1x DECIMAL(30,18),
+      wallet_l1x DECIMAL(30,18),
+      sold_l1x DECIMAL(30,18),
+      avg_sell_usd DECIMAL(20,8),
+      weth_received DECIMAL(30,18),
+      usdt_received DECIMAL(20,8),
+      premium_captured_usd DECIMAL(20,8),
+      sell_gas_usd DECIMAL(20,8),
+      convert_gas_usd DECIMAL(20,8),
+      sell_tx VARCHAR(80),
+      convert_tx VARCHAR(80),
+      eth_usd DECIMAL(20,8),
+      is_dry_run TINYINT(1) NOT NULL DEFAULT 0,
+      INDEX idx_treasury_ts (timestamp),
+      INDEX idx_treasury_status (status)
     )
   `);
 
@@ -192,16 +221,35 @@ async function insertDexTrade(trade) {
   return result.insertId;
 }
 
+async function insertTreasurySell(t) {
+  const [result] = await requirePool().query(
+    `INSERT INTO treasury_sells
+      (timestamp, status, direction, cex_floor_usd, cex_source, dex_spot_usd, premium_pct,
+       ceiling_l1x, wallet_l1x, sold_l1x, avg_sell_usd, weth_received, usdt_received,
+       premium_captured_usd, sell_gas_usd, convert_gas_usd, sell_tx, convert_tx,
+       eth_usd, is_dry_run)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      t.timestamp ?? new Date(), t.status, t.direction ?? 'sell', t.cexFloorUsd ?? null, t.cexSource ?? null,
+      t.dexSpotUsd ?? null, t.premiumPct ?? null, t.ceilingL1x ?? null, t.walletL1x ?? null,
+      t.soldL1x ?? null, t.avgSellUsd ?? null, t.wethReceived ?? null, t.usdtReceived ?? null,
+      t.premiumCapturedUsd ?? null, t.sellGasUsd ?? null, t.convertGasUsd ?? null,
+      t.sellTx ?? null, t.convertTx ?? null, t.ethUsd ?? null, t.isDryRun ? 1 : 0
+    ]
+  );
+  return result.insertId;
+}
+
 async function insertSnapshot(snapshot) {
   await requirePool().query(
     `INSERT INTO arb_inventory_snapshot
-      (timestamp, wallet_l1x, wallet_weth, wallet_eth,
+      (timestamp, wallet_l1x, wallet_weth, wallet_eth, wallet_usdt,
        bitmart_l1x, bitmart_usdt, bitmart_eth, lbank_l1x, lbank_usdt, lbank_eth,
        eth_usd, l1x_usd, total_value_usd, is_dry_run)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       snapshot.timestamp ?? new Date(),
-      snapshot.walletL1x ?? null, snapshot.walletWeth ?? null, snapshot.walletEth ?? null,
+      snapshot.walletL1x ?? null, snapshot.walletWeth ?? null, snapshot.walletEth ?? null, snapshot.walletUsdt ?? null,
       snapshot.bitmartL1x ?? null, snapshot.bitmartUsdt ?? null, snapshot.bitmartEth ?? null,
       snapshot.lbankL1x ?? null, snapshot.lbankUsdt ?? null, snapshot.lbankEth ?? null,
       snapshot.ethUsd ?? null, snapshot.l1xUsd ?? null, snapshot.totalValueUsd ?? null,
@@ -248,4 +296,4 @@ async function end() {
   pool = null;
 }
 
-module.exports = { init, insertOpportunity, insertTrade, insertDexTrade, insertSnapshot, report, end, dbConfig };
+module.exports = { init, insertOpportunity, insertTrade, insertDexTrade, insertTreasurySell, insertSnapshot, report, end, dbConfig };

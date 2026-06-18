@@ -148,6 +148,14 @@ async function commandSnapshot() {
     snapshot.walletL1x = Number(ethers.formatUnits(l1xBal, market.l1x.decimals));
     snapshot.walletWeth = Number(ethers.formatEther(wethBal));
     snapshot.walletEth = Number(ethers.formatEther(ethBal));
+    if (config.usdtToken) {
+      try {
+        const usdtC = new ethers.Contract(config.usdtToken, lib.ERC20_ABI, provider);
+        const usdtMeta = await lib.getTokenMeta(config.usdtToken, provider);
+        const usdtBal = await usdtC.balanceOf(config.walletAddress);
+        snapshot.walletUsdt = Number(ethers.formatUnits(usdtBal, usdtMeta.decimals));
+      } catch (_) { /* skip */ }
+    }
   }
 
   for (const name of cex.EXCHANGES) {
@@ -175,7 +183,7 @@ async function commandSnapshot() {
     });
     const l1xTotal = (snapshot.walletL1x ?? 0) + (snapshot.bitmartL1x ?? 0) + (snapshot.lbankL1x ?? 0);
     const ethTotal = (snapshot.walletEth ?? 0) + (snapshot.walletWeth ?? 0) + (snapshot.bitmartEth ?? 0) + (snapshot.lbankEth ?? 0);
-    const usdtTotal = (snapshot.bitmartUsdt ?? 0) + (snapshot.lbankUsdt ?? 0);
+    const usdtTotal = (snapshot.walletUsdt ?? 0) + (snapshot.bitmartUsdt ?? 0) + (snapshot.lbankUsdt ?? 0);
     snapshot.totalValueUsd = l1xTotal * snapshot.l1xUsd + ethTotal * snapshot.ethUsd + usdtTotal;
   } catch (error) {
     console.log(`WARN pricing unavailable: ${error.message.slice(0, 80)}`);

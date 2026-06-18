@@ -552,6 +552,109 @@ app.get('/api/inventory-analysis', (req, res) => {
     });
 });
 
+// --- 5b. ARB DASHBOARD ENDPOINTS (read arb_* / dex_trades from mm_production) ---
+// Arb tables live in the consolidated DB; either pool points there post-cutover.
+function arbPool() { return pools.bitmart; }
+
+// Dry/live filter shared by all arb endpoints: ?mode=all|live|dry
+function modeFilter(mode) {
+    if (mode === 'live') return 'is_dry_run = 0';
+    if (mode === 'dry') return 'is_dry_run = 1';
+    return '1=1';
+}
+
+app.get('/arb', (req, res) => res.sendFile(path.join(__dirname, 'arb.html')));
+
+app.get('/api/arb/dex-trades', (req, res) => {
+    const pool = arbPool();
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT id, timestamp, side, l1x_amount, weth_amount, avg_price_usd,
+                gas_usd, is_dry_run, tx_hash
+         FROM dex_trades WHERE ${flt} ORDER BY id DESC LIMIT 50`,
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            pool.query(
+                `SELECT side, COUNT(*) n, COALESCE(SUM(gas_usd),0) gas
+                 FROM dex_trades WHERE ${flt} GROUP BY side`,
+                (e2, totals) => {
+                    if (e2) return res.status(500).json({ error: e2.message });
+                    res.json({ trades: rows, totalsBySide: totals });
+                }
+            );
+        }
+    );
+});
+
+app.get('/api/arb/treasury', (req, res) => {
+    const pool = arbPool();
+    const hours = Number(req.query.hours) || 168;
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT timestamp, status, cex_floor_usd, dex_spot_usd, premium_pct,
+                ceiling_l1x, sold_l1x, usdt_received, premium_captured_usd,
+                sell_gas_usd, convert_gas_usd, sell_tx, is_dry_run
+         FROM treasury_sells
+         WHERE timestamp > NOW() - INTERVAL ? HOUR AND ${flt}
+         ORDER BY id DESC LIMIT 500`,
+        [hours],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            // Statement aggregates split by real vs simulated (dry).
+            const agg = (dry) => `
+                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN sold_l1x END),0),
+                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN usdt_received END),0),
+                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN sell_gas_usd + COALESCE(convert_gas_usd,0) END),0),
+                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN premium_captured_usd END),0),
+                SUM(status='executed' AND is_dry_run=${dry})`;
+            pool.query(
+                `SELECT ${agg(0)} , ${agg(1)}, COALESCE(MAX(premium_pct),0) FROM treasury_sells`,
+                (e2, t) => {
+                    if (e2) return res.status(500).json({ error: e2.message });
+                    const r0 = Object.values(t[0]);
+                    const stmt = {
+                        real:      { l1xSold:+r0[0], usdt:+r0[1], gas:+r0[2], premium:+r0[3], sells:+r0[4] },
+                        simulated: { l1xSold:+r0[5], usdt:+r0[6], gas:+r0[7], premium:+r0[8], sells:+r0[9] },
+                        maxPremium:+r0[10]
+                    };
+                    stmt.real.avgPrice = stmt.real.l1xSold > 0 ? stmt.real.usdt / stmt.real.l1xSold : null;
+                    stmt.simulated.avgPrice = stmt.simulated.l1xSold > 0 ? stmt.simulated.usdt / stmt.simulated.l1xSold : null;
+                    // current + opening treasury L1X/USDT from inventory snapshots
+                    pool.query(
+                        `SELECT
+                           (SELECT wallet_l1x FROM arb_inventory_snapshot ORDER BY id DESC LIMIT 1) cur_l1x,
+                           (SELECT wallet_usdt FROM arb_inventory_snapshot ORDER BY id DESC LIMIT 1) cur_usdt,
+                           (SELECT wallet_l1x FROM arb_inventory_snapshot ORDER BY id ASC LIMIT 1) open_l1x`,
+                        (e3, inv) => {
+                            stmt.position = e3 ? {} : (inv[0] || {});
+                            res.json({ rows, statement: stmt, latest: rows[0] || null });
+                        }
+                    );
+                }
+            );
+        }
+    );
+});
+
+app.get('/api/arb/inventory', (req, res) => {
+    const pool = arbPool();
+    const hours = Number(req.query.hours) || 24;
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT timestamp, wallet_l1x, wallet_weth, wallet_eth, wallet_usdt,
+                bitmart_l1x, bitmart_usdt, lbank_l1x, lbank_usdt,
+                eth_usd, l1x_usd, total_value_usd, is_dry_run
+         FROM arb_inventory_snapshot
+         WHERE timestamp > NOW() - INTERVAL ? HOUR AND ${flt}
+         ORDER BY id DESC LIMIT 500`,
+        [hours],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ latest: rows[0] || null, history: rows.reverse() });
+        }
+    );
+});
+
 // --- 6. START SERVER ---
 const PORT = parseInt(process.env.DASHBOARD_PORT) || 5002;
 app.listen(PORT, () => {
