@@ -291,9 +291,31 @@ async function report() {
   return { opps, oppsByDay, trades, tradesByDay, latestSnapshot: latestSnapshot[0] ?? null, dexTrades, recentDexTrades };
 }
 
+// Total L1X traded LIVE today for a treasury direction ('sell' | 'buy') — used
+// to enforce the per-day L1X volume cap. Self-contained connection so it never
+// holds the pool open across on-chain waits. Returns 0 if no DB / on error.
+async function treasuryL1xToday(direction) {
+  const cfg = dbConfig();
+  if (!cfg) return 0;
+  let conn;
+  try {
+    conn = await mysql.createConnection({ ...cfg, connectTimeout: 8000 });
+    const [[r]] = await conn.query(
+      "SELECT COALESCE(SUM(sold_l1x),0) AS total FROM treasury_sells " +
+      "WHERE status='executed' AND is_dry_run=0 AND direction=? AND DATE(timestamp)=CURDATE()",
+      [direction]
+    );
+    return Number(r.total) || 0;
+  } catch (_) {
+    return 0;
+  } finally {
+    if (conn) await conn.end().catch(() => {});
+  }
+}
+
 async function end() {
   if (pool) await pool.end();
   pool = null;
 }
 
-module.exports = { init, insertOpportunity, insertTrade, insertDexTrade, insertTreasurySell, insertSnapshot, report, end, dbConfig };
+module.exports = { init, insertOpportunity, insertTrade, insertDexTrade, insertTreasurySell, insertSnapshot, report, end, dbConfig, treasuryL1xToday };

@@ -591,7 +591,7 @@ app.get('/api/arb/treasury', (req, res) => {
     const hours = Number(req.query.hours) || 168;
     const flt = modeFilter(req.query.mode);
     pool.query(
-        `SELECT timestamp, status, cex_floor_usd, dex_spot_usd, premium_pct,
+        `SELECT timestamp, status, direction, cex_floor_usd, dex_spot_usd, premium_pct,
                 ceiling_l1x, sold_l1x, usdt_received, premium_captured_usd,
                 sell_gas_usd, convert_gas_usd, sell_tx, is_dry_run
          FROM treasury_sells
@@ -600,33 +600,45 @@ app.get('/api/arb/treasury', (req, res) => {
         [hours],
         (err, rows) => {
             if (err) return res.status(500).json({ error: err.message });
-            // Statement aggregates split by real vs simulated (dry).
-            const agg = (dry) => `
-                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN sold_l1x END),0),
-                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN usdt_received END),0),
-                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN sell_gas_usd + COALESCE(convert_gas_usd,0) END),0),
-                COALESCE(SUM(CASE WHEN status='executed' AND is_dry_run=${dry} THEN premium_captured_usd END),0),
-                SUM(status='executed' AND is_dry_run=${dry})`;
+            // Statement aggregates split by direction (sell/buy) AND real vs simulated (dry).
+            // For a buy, sold_l1x = L1X bought and usdt_received = USDT spent.
             pool.query(
-                `SELECT ${agg(0)} , ${agg(1)}, COALESCE(MAX(premium_pct),0) FROM treasury_sells`,
-                (e2, t) => {
+                `SELECT direction, is_dry_run,
+                        COALESCE(SUM(sold_l1x),0) l1x,
+                        COALESCE(SUM(usdt_received),0) usdt,
+                        COALESCE(SUM(sell_gas_usd + COALESCE(convert_gas_usd,0)),0) gas,
+                        COALESCE(SUM(premium_captured_usd),0) premium,
+                        COUNT(*) cnt
+                 FROM treasury_sells
+                 WHERE status='executed'
+                 GROUP BY direction, is_dry_run`,
+                (e2, aggRows) => {
                     if (e2) return res.status(500).json({ error: e2.message });
-                    const r0 = Object.values(t[0]);
+                    const blank = () => ({ l1x: 0, usdt: 0, gas: 0, premium: 0, count: 0, avgPrice: null });
                     const stmt = {
-                        real:      { l1xSold:+r0[0], usdt:+r0[1], gas:+r0[2], premium:+r0[3], sells:+r0[4] },
-                        simulated: { l1xSold:+r0[5], usdt:+r0[6], gas:+r0[7], premium:+r0[8], sells:+r0[9] },
-                        maxPremium:+r0[10]
+                        real:      { sell: blank(), buy: blank() },
+                        simulated: { sell: blank(), buy: blank() }
                     };
-                    stmt.real.avgPrice = stmt.real.l1xSold > 0 ? stmt.real.usdt / stmt.real.l1xSold : null;
-                    stmt.simulated.avgPrice = stmt.simulated.l1xSold > 0 ? stmt.simulated.usdt / stmt.simulated.l1xSold : null;
-                    // current + opening treasury L1X/USDT from inventory snapshots
+                    for (const row of (aggRows || [])) {
+                        const bucket = Number(row.is_dry_run) ? stmt.simulated : stmt.real;
+                        const dir = row.direction === 'buy' ? 'buy' : 'sell';
+                        const l1x = Number(row.l1x), usdt = Number(row.usdt);
+                        bucket[dir] = {
+                            l1x, usdt,
+                            gas: Number(row.gas), premium: Number(row.premium), count: Number(row.cnt),
+                            avgPrice: l1x > 0 ? usdt / l1x : null
+                        };
+                    }
+                    // current + opening treasury L1X/USDT from inventory snapshots, plus max premium seen
                     pool.query(
                         `SELECT
                            (SELECT wallet_l1x FROM arb_inventory_snapshot ORDER BY id DESC LIMIT 1) cur_l1x,
                            (SELECT wallet_usdt FROM arb_inventory_snapshot ORDER BY id DESC LIMIT 1) cur_usdt,
-                           (SELECT wallet_l1x FROM arb_inventory_snapshot ORDER BY id ASC LIMIT 1) open_l1x`,
+                           (SELECT wallet_l1x FROM arb_inventory_snapshot ORDER BY id ASC LIMIT 1) open_l1x,
+                           (SELECT COALESCE(MAX(premium_pct),0) FROM treasury_sells) max_premium`,
                         (e3, inv) => {
                             stmt.position = e3 ? {} : (inv[0] || {});
+                            stmt.maxPremium = e3 ? 0 : Number((inv[0] || {}).max_premium || 0);
                             res.json({ rows, statement: stmt, latest: rows[0] || null });
                         }
                     );

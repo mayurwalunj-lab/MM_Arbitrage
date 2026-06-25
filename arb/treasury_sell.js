@@ -14,7 +14,8 @@
 // Guardrails:
 //   - floor = live CEX price (never sell below market value)
 //   - TREASURY_MIN_PREMIUM_PCT: only sell if DEX is this % above CEX
-//   - TREASURY_MAX_SELL_L1X: cap L1X sold per run
+//   - TREASURY_MAX_SELL_L1X / TREASURY_MAX_BUY_L1X: cap L1X per sell / buy run
+//   - TREASURY_MAX_L1X_PER_DAY: cap total LIVE L1X sold/bought per day (per dir)
 //   - slippage protection on the swap (TREASURY_SLIPPAGE_BPS)
 //   - dry-run unless --execute
 
@@ -67,7 +68,7 @@ async function fetchCexPrice(side = 'bid') {
 async function runBuy(args, config, provider, market, execute) {
   const CONFIG = {
     minDiscountPct: args['min-premium'] != null ? Number(args['min-premium']) : envNum('TREASURY_MIN_PREMIUM_PCT', 0.5),
-    maxBuyL1x: args['max-l1x'] != null ? Number(args['max-l1x']) : envNum('TREASURY_MAX_SELL_L1X', 50),
+    maxBuyL1x: args['max-l1x'] != null ? Number(args['max-l1x']) : envNum('TREASURY_MAX_BUY_L1X', 50),
     slippageBps: envNum('TREASURY_SLIPPAGE_BPS', 100)
   };
   const cexRef = await fetchCexPrice('ask');
@@ -102,8 +103,16 @@ async function runBuy(args, config, provider, market, execute) {
   const affordableL1x = (walletUsdt != null && dexSpot > 0) ? walletUsdt / dexSpot : CONFIG.maxBuyL1x;
   let buyEval;
   if (execute) {
-    const maxL1x = Math.min(CONFIG.maxBuyL1x, affordableL1x);
-    log(`treasury USDT: ${walletUsdt != null ? '$' + walletUsdt.toFixed(2) : 'n/a'} | cap: ${CONFIG.maxBuyL1x} | will buy up to: ${maxL1x.toFixed(4)} L1X`);
+    // Daily L1X volume cap (live only): never buy more than TREASURY_MAX_L1X_PER_DAY across all buys today.
+    const dailyCap = envNum('TREASURY_MAX_L1X_PER_DAY', 50);
+    const doneToday = await db.treasuryL1xToday('buy');
+    const remainingDaily = dailyCap - doneToday;
+    if (remainingDaily <= 0) {
+      log(`daily L1X cap reached (${doneToday.toFixed(2)}/${dailyCap} bought today) — not buying.`);
+      rec.status = 'skipped'; await record(); return;
+    }
+    const maxL1x = Math.min(CONFIG.maxBuyL1x, affordableL1x, remainingDaily);
+    log(`treasury USDT: ${walletUsdt != null ? '$' + walletUsdt.toFixed(2) : 'n/a'} | cap: ${CONFIG.maxBuyL1x} | daily left: ${remainingDaily.toFixed(2)}/${dailyCap} | will buy up to: ${maxL1x.toFixed(4)} L1X`);
     if (maxL1x <= 0) { log('no USDT to buy with.'); rec.status = 'skipped'; await record(); return; }
     buyEval = (await lib.maxBuySize({ config, provider, market, maxPriceUsd: cexRef.price, maxL1x, stepL1x: Math.max(0.01, maxL1x / 128), ethUsdPrice: ethUsd })).best;
   } else if (ceiling.best && ceiling.best.sizeL1x <= CONFIG.maxBuyL1x) {
@@ -263,8 +272,16 @@ async function main() {
 
   let sellEval;
   if (execute) {
-    const maxL1x = Math.min(CONFIG.maxSellL1x, walletL1x ?? CONFIG.maxSellL1x);
-    log(`treasury wallet L1X: ${walletL1x != null ? walletL1x.toFixed(4) : 'n/a'} | cap: ${CONFIG.maxSellL1x} | will sell up to: ${maxL1x.toFixed(4)}`);
+    // Daily L1X volume cap (live only): never sell more than TREASURY_MAX_L1X_PER_DAY across all sells today.
+    const dailyCap = envNum('TREASURY_MAX_L1X_PER_DAY', 50);
+    const doneToday = await db.treasuryL1xToday('sell');
+    const remainingDaily = dailyCap - doneToday;
+    if (remainingDaily <= 0) {
+      log(`daily L1X cap reached (${doneToday.toFixed(2)}/${dailyCap} sold today) — not selling.`);
+      rec.status = 'skipped'; await record(); return;
+    }
+    const maxL1x = Math.min(CONFIG.maxSellL1x, walletL1x ?? CONFIG.maxSellL1x, remainingDaily);
+    log(`treasury wallet L1X: ${walletL1x != null ? walletL1x.toFixed(4) : 'n/a'} | cap: ${CONFIG.maxSellL1x} | daily left: ${remainingDaily.toFixed(2)}/${dailyCap} | will sell up to: ${maxL1x.toFixed(4)}`);
     if (maxL1x <= 0) { log('no L1X in treasury wallet to sell.'); rec.status = 'skipped'; await record(); return; }
     sellEval = (await lib.maxSellSize({ config, provider, market, minPriceUsd: cexRef.price, maxL1x, stepL1x: Math.max(0.01, maxL1x / 128), ethUsdPrice: ethUsd })).best;
   } else if (ceiling.best && ceiling.best.sizeL1x <= CONFIG.maxSellL1x) {

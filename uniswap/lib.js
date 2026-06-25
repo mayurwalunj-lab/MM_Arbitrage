@@ -326,7 +326,8 @@ async function resolveEthUsdPrice({ override = null, config, log = noop }) {
 async function buildSwapQuote({ config, provider, market, side, amount, slippageBps }) {
   const { pool, l1x, weth } = market;
   const isBuy = side === 'buy';
-  const amountIn = ethers.parseUnits(String(amount), isBuy ? weth.decimals : l1x.decimals);
+  const inDecimals = isBuy ? weth.decimals : l1x.decimals;
+  const amountIn = ethers.parseUnits(decimalString(amount, inDecimals), inDecimals);
   const tokenIn = isBuy ? config.weth : config.l1xToken;
   const tokenOut = isBuy ? config.l1xToken : config.weth;
   const inMeta = isBuy ? weth : l1x;
@@ -625,7 +626,7 @@ async function swapWethToUsdt({ config, provider, amountWeth = null, slippageBps
 
   const wethContract = new ethers.Contract(config.weth, ERC20_ABI, wallet);
   const balance = await wethContract.balanceOf(wallet.address);
-  const amountIn = amountWeth == null ? balance : ethers.parseUnits(String(amountWeth), weth.decimals);
+  const amountIn = amountWeth == null ? balance : ethers.parseUnits(decimalString(amountWeth, weth.decimals), weth.decimals);
   if (amountIn <= 0n) throw new Error('no WETH to convert');
   if (amountIn > balance) throw new Error(`WETH balance too low: have ${ethers.formatUnits(balance, weth.decimals)}`);
 
@@ -674,7 +675,7 @@ async function swapUsdtToWeth({ config, provider, amountUsdt = null, slippageBps
 
   const usdtContract = new ethers.Contract(config.usdtToken, ERC20_ABI, wallet);
   const balance = await usdtContract.balanceOf(wallet.address);
-  const amountIn = amountUsdt == null ? balance : ethers.parseUnits(String(amountUsdt), usdt.decimals);
+  const amountIn = amountUsdt == null ? balance : ethers.parseUnits(decimalString(amountUsdt, usdt.decimals), usdt.decimals);
   if (amountIn <= 0n) throw new Error('no USDT to convert');
   if (amountIn > balance) throw new Error(`USDT balance too low: have ${ethers.formatUnits(balance, usdt.decimals)}`);
 

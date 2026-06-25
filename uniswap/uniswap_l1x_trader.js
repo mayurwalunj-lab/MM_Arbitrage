@@ -13,7 +13,8 @@ Usage:
   node uniswap/uniswap_l1x_trader.js quote-buy --eth 0.01 [--slippage 1]
   node uniswap/uniswap_l1x_trader.js quote-sell --l1x 100 [--slippage 1]
   node uniswap/uniswap_l1x_trader.js max-sell-size --min-price-usd 8.5 --max-l1x 1000 [--eth-usd 3500] [--step-l1x 0.01]
-  node uniswap/uniswap_l1x_trader.js impact --l1x 10 [--eth-usd 3500]
+  node uniswap/uniswap_l1x_trader.js impact --l1x 10 [--eth-usd 3500]        (sell impact)
+  node uniswap/uniswap_l1x_trader.js impact --buy --usd 100                  (buy impact for $100)
   node uniswap/uniswap_l1x_trader.js balance [--address 0x...]
   node uniswap/uniswap_l1x_trader.js convert [--weth 0.1] [--slippage 1] [--execute]            (WETH -> USDT)
   node uniswap/uniswap_l1x_trader.js convert --reverse [--usdt 100] [--slippage 1] [--execute]  (USDT -> WETH)
@@ -362,28 +363,41 @@ async function commandImpact(args) {
   const market = await lib.loadMarket(config, provider);
   const { l1x, weth } = market;
 
-  const sizeL1x = lib.parsePositiveNumber(args.l1x, '--l1x');
+  const isBuy = Boolean(args.buy);
   const ethUsd = await lib.resolveEthUsdPrice({ override: args['eth-usd'], config, log: console.log });
   const ethUsdPrice = ethUsd.price;
-
   const currentPriceUsd = lib.poolL1xUsdPrice({
-    sqrtPriceX96: market.pool.sqrtPriceX96,
-    pool: market.pool,
-    l1x,
-    weth,
-    ethUsdPrice
+    sqrtPriceX96: market.pool.sqrtPriceX96, pool: market.pool, l1x, weth, ethUsdPrice
   });
-  const result = await lib.evaluateSell({ config, provider, market, sizeL1x, ethUsdPrice });
-  const impactUsd = currentPriceUsd - result.postPriceUsd;
 
-  console.log('SELL IMPACT');
-  console.log(`ETH/USD: $${ethUsdPrice} (${ethUsd.source})`);
-  console.log(`sell size: ${lib.decimalString(sizeL1x)} ${l1x.symbol}`);
-  console.log(`current pool price: $${currentPriceUsd.toFixed(6)}`);
-  console.log(`expected output: ${lib.formatToken(result.quote.amountOut, weth.decimals, weth.symbol)} (= $${(result.wethOut * ethUsdPrice).toFixed(4)})`);
-  console.log(`average sell price: $${result.avgSellPriceUsd.toFixed(6)}`);
-  console.log(`post-trade price: $${result.postPriceUsd.toFixed(6)}`);
-  console.log(`price impact: -$${impactUsd.toFixed(6)} (-${((impactUsd / currentPriceUsd) * 100).toFixed(4)}%)`);
+  // size: --l1x N, or --usd N (converted to L1X at the current price)
+  let sizeL1x;
+  if (args.usd != null) sizeL1x = lib.parsePositiveNumber(args.usd, '--usd') / currentPriceUsd;
+  else sizeL1x = lib.parsePositiveNumber(args.l1x, '--l1x');
+
+  if (isBuy) {
+    const r = await lib.evaluateBuy({ config, provider, market, sizeL1x, ethUsdPrice });
+    const incUsd = r.postPriceUsd - currentPriceUsd;
+    console.log('BUY IMPACT');
+    console.log(`ETH/USD: $${ethUsdPrice} (${ethUsd.source})`);
+    console.log(`buy size: ${lib.decimalString(sizeL1x)} ${l1x.symbol}`);
+    console.log(`current pool price: $${currentPriceUsd.toFixed(6)}`);
+    console.log(`cost: ${r.wethIn.toFixed(6)} ${weth.symbol} (= $${(r.wethIn * ethUsdPrice).toFixed(2)})`);
+    console.log(`average buy price: $${r.avgBuyPriceUsd.toFixed(6)}`);
+    console.log(`post-trade price: $${r.postPriceUsd.toFixed(6)}`);
+    console.log(`price impact: +$${incUsd.toFixed(6)} (+${((incUsd / currentPriceUsd) * 100).toFixed(4)}%)`);
+  } else {
+    const result = await lib.evaluateSell({ config, provider, market, sizeL1x, ethUsdPrice });
+    const impactUsd = currentPriceUsd - result.postPriceUsd;
+    console.log('SELL IMPACT');
+    console.log(`ETH/USD: $${ethUsdPrice} (${ethUsd.source})`);
+    console.log(`sell size: ${lib.decimalString(sizeL1x)} ${l1x.symbol}`);
+    console.log(`current pool price: $${currentPriceUsd.toFixed(6)}`);
+    console.log(`expected output: ${lib.formatToken(result.quote.amountOut, weth.decimals, weth.symbol)} (= $${(result.wethOut * ethUsdPrice).toFixed(4)})`);
+    console.log(`average sell price: $${result.avgSellPriceUsd.toFixed(6)}`);
+    console.log(`post-trade price: $${result.postPriceUsd.toFixed(6)}`);
+    console.log(`price impact: -$${impactUsd.toFixed(6)} (-${((impactUsd / currentPriceUsd) * 100).toFixed(4)}%)`);
+  }
   console.log('dry-run only. This command never sends a transaction.');
 }
 

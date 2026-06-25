@@ -60,7 +60,7 @@
   <section>
     <h2>Treasury sells</h2>
     <table id="treasTable">
-      <thead><tr><th>Time</th><th>Status</th><th class="num">Premium %</th><th class="num">CEX floor</th><th class="num">DEX spot</th><th class="num">L1X sold</th><th class="num">USDT</th><th class="num">Gas $</th><th>Tx</th></tr></thead>
+      <thead><tr><th>Time</th><th>Dir</th><th>Status</th><th class="num">Premium %</th><th class="num">CEX ref</th><th class="num">DEX spot</th><th class="num">L1X</th><th class="num">USDT</th><th class="num">Gas $</th><th>Tx</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -115,16 +115,17 @@ function renderCards(dex, inv, tre) {
   const swaps = (dex.totalsBySide||[]).reduce((s,t)=>s+Number(t.n||0),0);
   const val = inv.latest ? inv.latest.total_value_usd : null;
   const s = tre.statement || {};
-  const useReal = MODE === 'live' ? true : MODE === 'dry' ? false : (s.real?.sells || 0) > 0;
-  const a = useReal ? (s.real || {}) : (s.simulated || {});
+  const useReal = pickReal(s);
+  const b = useReal ? (s.real || {}) : (s.simulated || {});
+  const sell = b.sell || {}, buy = b.buy || {};
   const tag = useReal ? '' : ' (sim)';
   const usdtInTreasury = s.position && s.position.cur_usdt != null ? s.position.cur_usdt
     : (inv.latest && inv.latest.wallet_usdt != null ? inv.latest.wallet_usdt : null);
   const cards = [
     ['Total value', val!=null?('$'+fmt(val)):'—'],
     ['USDT in treasury', usdtInTreasury!=null?('$'+fmt(usdtInTreasury)):'—'],
-    ['Treasury L1X sold'+tag, fmt(a.l1xSold,2)],
-    ['Treasury USDT gained'+tag, '$'+fmt(a.usdt)],
+    ['L1X sold'+tag, fmt(sell.l1x,2)],
+    ['L1X bought'+tag, fmt(buy.l1x,2)],
     ['Gas spent', '$'+fmt(totalGas,4)],
     ['DEX swaps', fmt(swaps,0)],
   ];
@@ -132,28 +133,48 @@ function renderCards(dex, inv, tre) {
     `<div class="card"><div class="label">${l}</div><div class="val">${v}</div></div>`).join('');
 }
 
+// Pick figures by the active filter; 'all' uses real if anything was executed live, else simulated.
+function pickReal(s) {
+  if (MODE === 'live') return true;
+  if (MODE === 'dry') return false;
+  const r = s.real || {};
+  return (((r.sell && r.sell.count) || 0) + ((r.buy && r.buy.count) || 0)) > 0;
+}
+
 function renderStatement(tre) {
   const s = tre.statement || {};
-  // Pick figures by the active filter; 'all' uses real if any, else simulated.
-  const useReal = MODE === 'live' ? true : MODE === 'dry' ? false : (s.real?.sells || 0) > 0;
-  const a = useReal ? (s.real || {}) : (s.simulated || {});
+  const useReal = pickReal(s);
+  const b = useReal ? (s.real || {}) : (s.simulated || {});
+  const sell = b.sell || {}, buy = b.buy || {};
   const pos = s.position || {};
   document.getElementById('stmtMode').textContent = useReal ? '(realized)' : '(simulated — dry-run)';
-  const net = (a.usdt || 0) - (a.gas || 0);
+  const sellNet = (sell.usdt || 0) - (sell.gas || 0);          // net USDT in from sells
+  const buyOut = (buy.usdt || 0) + (buy.gas || 0);             // total USDT out for buys (cost + gas)
   const rows = [
     ['Opening treasury L1X', pos.open_l1x != null ? fmt(pos.open_l1x, 4) : '—'],
     ['Current treasury L1X', pos.cur_l1x != null ? fmt(pos.cur_l1x, 4) : '—'],
-    ['— L1X sold', fmt(a.l1xSold, 4) + (useReal ? '' : ' (sim)')],
-    ['Avg sell price', a.avgPrice != null ? '$' + fmt(a.avgPrice, 4) : '—'],
-    ['USDT received', '$' + fmt(a.usdt)],
-    ['Premium captured vs CEX', '$' + fmt(a.premium)],
-    ['Gas cost (total)', '$' + fmt(a.gas, 4)],
-    ['Net USDT (received − gas)', '$' + fmt(net)],
     ['Current USDT in treasury', pos.cur_usdt != null ? '$' + fmt(pos.cur_usdt) : '—'],
-    ['Sells count', fmt(a.sells, 0)],
+    ['__sec', 'SELL  →  USDT in'],
+    ['— L1X sold', fmt(sell.l1x, 4)],
+    ['— Avg sell price', sell.avgPrice != null ? '$' + fmt(sell.avgPrice, 4) : '—'],
+    ['— USDT received', '$' + fmt(sell.usdt)],
+    ['— Premium captured vs CEX', '$' + fmt(sell.premium)],
+    ['— Gas cost', '$' + fmt(sell.gas, 4)],
+    ['— Net USDT (received − gas)', '$' + fmt(sellNet)],
+    ['— Sells count', fmt(sell.count, 0)],
+    ['__sec', 'BUY  →  USDT out'],
+    ['— L1X bought', fmt(buy.l1x, 4)],
+    ['— Avg buy price', buy.avgPrice != null ? '$' + fmt(buy.avgPrice, 4) : '—'],
+    ['— USDT spent', '$' + fmt(buy.usdt)],
+    ['— Discount captured vs CEX', '$' + fmt(buy.premium)],
+    ['— Gas cost', '$' + fmt(buy.gas, 4)],
+    ['— Total USDT out (spent + gas)', '$' + fmt(buyOut)],
+    ['— Buys count', fmt(buy.count, 0)],
   ];
   document.querySelector('#stmtTable tbody').innerHTML = rows.map(([k, v]) =>
-    `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
+    k === '__sec'
+      ? `<tr><td colspan="2" style="padding-top:14px;font-weight:600;color:#8a93a3;letter-spacing:.04em">${v}</td></tr>`
+      : `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join('');
 }
 
 let premChart;
@@ -166,15 +187,19 @@ function renderTreasury(tre) {
   if (premChart) { premChart.data=data; premChart.update(); } else { premChart = new Chart(ctx, {type:'line', data, options:opts}); }
 
   const L = tre.latest;
+  const verb = L && L.direction === 'buy' ? 'buy' : 'sell';
+  const gapLabel = L && L.direction === 'buy' ? 'discount' : 'premium';
   document.getElementById('premNow').textContent = L
-    ? `latest: ${Number(L.premium_pct).toFixed(2)}% premium  ·  CEX $${Number(L.cex_floor_usd).toFixed(4)} → DEX $${Number(L.dex_spot_usd).toFixed(4)}  ·  could sell ${fmt(L.ceiling_l1x,2)} L1X to floor`
+    ? `latest: ${Number(L.premium_pct).toFixed(2)}% ${gapLabel}  ·  CEX $${Number(L.cex_floor_usd).toFixed(4)} → DEX $${Number(L.dex_spot_usd).toFixed(4)}  ·  could ${verb} ${fmt(L.ceiling_l1x,2)} L1X to ${verb==='buy'?'cap':'floor'}`
     : 'no treasury runs yet';
 
   const tb = document.querySelector('#treasTable tbody');
-  if (!tre.rows || !tre.rows.length) { tb.innerHTML = '<tr><td colspan="8">No treasury runs yet</td></tr>'; return; }
+  if (!tre.rows || !tre.rows.length) { tb.innerHTML = '<tr><td colspan="10">No treasury runs yet</td></tr>'; return; }
   const sp = s => `<span class="pill ${s==='executed'?'buy':s==='skipped'?'sell':'conv'}">${s}</span>`;
+  const dir = d => `<span class="pill ${d==='buy'?'buy':'sell'}">${d||'sell'}</span>`;
   tb.innerHTML = tre.rows.map(r=>`<tr>
     <td>${new Date(r.timestamp).toLocaleString()}</td>
+    <td>${dir(r.direction)}</td>
     <td>${sp(r.status)} ${r.is_dry_run?'<span class="pill dry">dry</span>':''}</td>
     <td class="num">${fmt(r.premium_pct,3)}</td>
     <td class="num">${fmt(r.cex_floor_usd,4)}</td>
