@@ -23,6 +23,7 @@ const activeFiles = [
   'lbank/public/index.html',
   'dashboard/Server.js',
   'dashboard/index.html',
+  'uniswap/uniswap_l1x_trader.js',
   'package.json',
   'package-lock.json',
   'ecosystem.config.js',
@@ -47,18 +48,41 @@ const requiredEnvKeys = [
   'LBANK_BOT_B_SECRET',
   'LBANK_GRID_API_KEY',
   'LBANK_GRID_SECRET',
-  'BITMART_DB_HOST',
-  'BITMART_DB_PORT',
-  'BITMART_DB_USER',
-  'BITMART_DB_PASSWORD',
-  'BITMART_DB_NAME',
-  'LBANK_DB_HOST',
-  'LBANK_DB_PORT',
-  'LBANK_DB_USER',
-  'LBANK_DB_PASSWORD',
-  'LBANK_DB_NAME',
-  'DASHBOARD_PORT'
+  'DASHBOARD_PORT',
+  'UNISWAP_CHAIN_ID',
+  'L1X_TOKEN_ADDRESS',
+  'L1X_WETH_POOL_ADDRESS',
+  'WETH_ADDRESS',
+  'UNISWAP_QUOTER_V2_ADDRESS',
+  'UNISWAP_SWAP_ROUTER_02_ADDRESS',
+  'UNISWAP_DEFAULT_SLIPPAGE_BPS',
+  'UNISWAP_DEADLINE_SECONDS'
 ];
+
+const optionalEnvKeys = [
+  'ETH_RPC_URL',
+  'ETH_USD_PRICE',
+  'UNISWAP_WALLET_PRIVATE_KEY',
+  'UNISWAP_WALLET_ADDRESS',
+  'ARB_BITMART_API_KEY',
+  'ARB_BITMART_SECRET',
+  'ARB_BITMART_UID',
+  'ARB_LBANK_API_KEY',
+  'ARB_LBANK_SECRET'
+];
+
+// Database config: either the unified DB_* set or the legacy per-exchange
+// sets must be fully present. Code resolves DB_* first, legacy as fallback.
+const unifiedDbKeys = ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
+const legacyDbKeys = [
+  'BITMART_DB_HOST', 'BITMART_DB_PORT', 'BITMART_DB_USER', 'BITMART_DB_PASSWORD', 'BITMART_DB_NAME',
+  'LBANK_DB_HOST', 'LBANK_DB_PORT', 'LBANK_DB_USER', 'LBANK_DB_PASSWORD', 'LBANK_DB_NAME'
+];
+const arbDbKeys = ['ARB_DB_HOST', 'ARB_DB_PORT', 'ARB_DB_USER', 'ARB_DB_PASSWORD', 'ARB_DB_NAME'];
+
+function dbEnv(key, legacyPrefix) {
+  return envValue(`DB_${key}`) || envValue(`${legacyPrefix}_DB_${key}`);
+}
 
 const requiredPackages = ['ccxt', 'cors', 'dotenv', 'express', 'mysql2', 'socket.io'];
 
@@ -151,7 +175,9 @@ addCheck('ecosystem config has expected PM2 apps', () => {
     ['grid_manager_bitmart', 'bitmart/grid_manager_bitmart.js'],
     ['Lbank_Pattern_Trading', 'lbank/Lbank_Pattern_Trading.js'],
     ['LBank_GridManager', 'lbank/LBank_GridManager.js'],
-    ['Server', 'dashboard/Server.js']
+    ['Server', 'dashboard/Server.js'],
+    ['arb_monitor', 'arb/monitor.js'],
+    ['arb_snapshot', 'arb/accounting.js']
   ]);
   assert(apps.length === expected.size, `Expected ${expected.size} PM2 apps, found ${apps.length}`);
   for (const app of apps) {
@@ -166,8 +192,14 @@ addCheck('env keys are complete and non-empty', () => {
   assert(duplicate.length === 0, `Duplicate env keys: ${duplicate.join(', ')}`);
   const missing = requiredEnvKeys.filter((key) => !found.has(key));
   const empty = requiredEnvKeys.filter((key) => !envValue(key));
+  const optionalMissing = optionalEnvKeys.filter((key) => !found.has(key));
   assert(missing.length === 0, `Missing env keys: ${missing.join(', ')}`);
   assert(empty.length === 0, `Empty env keys: ${empty.join(', ')}`);
+  assert(optionalMissing.length === 0, `Missing optional env keys: ${optionalMissing.join(', ')}`);
+
+  const unifiedOk = unifiedDbKeys.every((key) => envValue(key));
+  const legacyOk = legacyDbKeys.every((key) => envValue(key));
+  assert(unifiedOk || legacyOk, 'Database env incomplete: set DB_HOST/PORT/USER/PASSWORD/NAME (or the legacy BITMART_DB_* + LBANK_DB_* sets)');
 });
 
 addCheck('active process.env keys match .env', () => {
@@ -176,7 +208,8 @@ addCheck('active process.env keys match .env', () => {
     'bitmart/grid_manager_bitmart.js',
     'lbank/Lbank_Pattern_Trading.js',
     'lbank/LBank_GridManager.js',
-    'dashboard/Server.js'
+    'dashboard/Server.js',
+    'uniswap/uniswap_l1x_trader.js'
   ];
   const used = new Set();
   for (const f of jsFiles) {
@@ -186,8 +219,14 @@ addCheck('active process.env keys match .env', () => {
     }
   }
   const { found } = parseEnvFile();
-  const missing = [...used].filter((key) => !found.has(key)).sort();
-  const unused = [...found.keys()].filter((key) => !used.has(key)).sort();
+  // DB keys are a fallback chain (DB_* -> legacy); code referencing a tier
+  // that this machine's .env doesn't use is expected, not an error.
+  const dbKeyExempt = new Set([...unifiedDbKeys, ...legacyDbKeys, ...arbDbKeys]);
+  const missing = [...used].filter((key) => !found.has(key) && !dbKeyExempt.has(key)).sort();
+  const allowed = new Set([...requiredEnvKeys, ...optionalEnvKeys, ...dbKeyExempt]);
+  // ARB_* keys are consumed by the arb module, which is not in the scanned
+  // file list above — exempt them from the unused check.
+  const unused = [...found.keys()].filter((key) => !used.has(key) && !allowed.has(key) && !key.startsWith('ARB_')).sort();
   assert(missing.length === 0, `Used env keys missing from .env: ${missing.join(', ')}`);
   assert(unused.length === 0, `Unused env keys in .env: ${unused.join(', ')}`);
 });
@@ -241,10 +280,13 @@ addCheck('ports are expected', () => {
 });
 
 addCheck('startup behavior is understood', () => {
-  assert(read('bitmart/Bitmart_Pattern_Trading.js').includes('dryRun: true'), 'Bitmart pattern dryRun is not true');
-  assert(read('lbank/Lbank_Pattern_Trading.js').includes('dryRun: true'), 'LBank pattern dryRun is not true');
-  assert(read('bitmart/grid_manager_bitmart.js').includes('dryRun: false'), 'Bitmart grid dryRun is not false');
-  assert(read('lbank/LBank_GridManager.js').includes('dryRun: false'), 'LBank grid dryRun is not false');
+  // dryRun is env-driven (BOT_DRY_RUN). Assert no bot hardcodes it back to a
+  // literal — that would reintroduce per-machine drift and pull-time risk.
+  for (const f of ['bitmart/Bitmart_Pattern_Trading.js', 'lbank/Lbank_Pattern_Trading.js',
+                   'bitmart/grid_manager_bitmart.js', 'lbank/LBank_GridManager.js']) {
+    assert(read(f).includes("dryRun: process.env.BOT_DRY_RUN"), `${f} must use env-driven dryRun (BOT_DRY_RUN)`);
+    assert(!/dryRun:\s*(true|false)/.test(read(f)), `${f} hardcodes dryRun — must be env-driven`);
+  }
   assert(read('bitmart/grid_manager_bitmart.js').includes('startGridManager();'), 'Bitmart grid does not auto-start');
   assert(read('lbank/LBank_GridManager.js').includes('startGridManager();'), 'LBank grid does not auto-start');
 });
@@ -255,39 +297,41 @@ async function checkDb() {
     {
       name: 'bitmart',
       config: {
-        host: envValue('BITMART_DB_HOST'),
-        port: Number(envValue('BITMART_DB_PORT')),
-        user: envValue('BITMART_DB_USER'),
-        password: envValue('BITMART_DB_PASSWORD'),
-        database: envValue('BITMART_DB_NAME'),
+        host: dbEnv('HOST', 'BITMART'),
+        port: Number(dbEnv('PORT', 'BITMART')),
+        user: dbEnv('USER', 'BITMART'),
+        password: dbEnv('PASSWORD', 'BITMART'),
+        database: dbEnv('NAME', 'BITMART'),
         connectTimeout: 10000
       }
     },
     {
       name: 'lbank',
       config: {
-        host: envValue('LBANK_DB_HOST'),
-        port: Number(envValue('LBANK_DB_PORT')),
-        user: envValue('LBANK_DB_USER'),
-        password: envValue('LBANK_DB_PASSWORD'),
-        database: envValue('LBANK_DB_NAME'),
+        host: dbEnv('HOST', 'LBANK'),
+        port: Number(dbEnv('PORT', 'LBANK')),
+        user: dbEnv('USER', 'LBANK'),
+        password: dbEnv('PASSWORD', 'LBANK'),
+        database: dbEnv('NAME', 'LBANK'),
         connectTimeout: 10000
       }
     }
   ];
 
   for (const item of configs) {
+    const prefix = `${item.name}_`;
+    const expected = ['trade_history', 'inventory_snapshot', 'system_logs', 'grid_log'].map((t) => prefix + t);
     const connection = await mysql.createConnection(item.config);
     try {
       await connection.ping();
       const [tables] = await connection.execute(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name IN ('trade_history','inventory_snapshot','system_logs','grid_log')",
-        [item.config.database]
+        `SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name IN (${expected.map(() => '?').join(',')})`,
+        [item.config.database, ...expected]
       );
       const names = tables.map((row) => row.TABLE_NAME || row.table_name);
-      assert(names.includes('trade_history'), `${item.name} DB missing trade_history`);
-      assert(names.includes('inventory_snapshot'), `${item.name} DB missing inventory_snapshot`);
-      assert(names.includes('system_logs'), `${item.name} DB missing system_logs`);
+      assert(names.includes(`${prefix}trade_history`), `${item.name} DB missing ${prefix}trade_history`);
+      assert(names.includes(`${prefix}inventory_snapshot`), `${item.name} DB missing ${prefix}inventory_snapshot`);
+      assert(names.includes(`${prefix}system_logs`), `${item.name} DB missing ${prefix}system_logs`);
     } finally {
       await connection.end();
     }

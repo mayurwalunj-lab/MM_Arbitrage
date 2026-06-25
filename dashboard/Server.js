@@ -12,18 +12,18 @@ app.use(express.static(__dirname)); // Serves index.html
 // Database configurations
 const dbConfigs = {
     bitmart: {
-        host: process.env.BITMART_DB_HOST || '159.195.76.213',
-        user: process.env.BITMART_DB_USER || 'root',
-        password: process.env.BITMART_DB_PASSWORD || '',
-        database: process.env.BITMART_DB_NAME || 'market-cap_production',
-        port: parseInt(process.env.BITMART_DB_PORT) || 25060
+        host: process.env.DB_HOST || process.env.BITMART_DB_HOST || '159.195.76.213',
+        user: process.env.DB_USER || process.env.BITMART_DB_USER || 'root',
+        password: process.env.DB_PASSWORD || process.env.BITMART_DB_PASSWORD || '',
+        database: process.env.DB_NAME || process.env.BITMART_DB_NAME || 'mm_production',
+        port: parseInt(process.env.DB_PORT || process.env.BITMART_DB_PORT) || 25060
     },
     lbank: {
-        host: process.env.LBANK_DB_HOST || '159.195.76.213',
-        user: process.env.LBANK_DB_USER || 'root',
-        password: process.env.LBANK_DB_PASSWORD || '',
-        database: process.env.LBANK_DB_NAME || 'marketcap',
-        port: parseInt(process.env.LBANK_DB_PORT) || 25060
+        host: process.env.DB_HOST || process.env.LBANK_DB_HOST || '159.195.76.213',
+        user: process.env.DB_USER || process.env.LBANK_DB_USER || 'root',
+        password: process.env.DB_PASSWORD || process.env.LBANK_DB_PASSWORD || '',
+        database: process.env.DB_NAME || process.env.LBANK_DB_NAME || 'mm_production',
+        port: parseInt(process.env.DB_PORT || process.env.LBANK_DB_PORT) || 25060
     }
 };
 
@@ -53,6 +53,12 @@ function getPool(dbName) {
     return pools.bitmart;
 }
 
+// Consolidated database: both exchanges share one DB, tables are prefixed.
+function tablePrefix(dbName) {
+    const normalizedName = dbName?.toLowerCase();
+    return (normalizedName === 'lbank' || normalizedName === 'marketcap') ? 'lbank_' : 'bitmart_';
+}
+
 // Test connections on startup
 Object.keys(pools).forEach(dbName => {
     pools[dbName].getConnection((err, connection) => {
@@ -75,6 +81,7 @@ app.get('/api/volume', (req, res) => {
     }
 
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     // Handle "today" - filter by current date
     if (hours === 'today') {
@@ -87,7 +94,7 @@ app.get('/api/volume', (req, res) => {
                 MAX(timestamp) AS end_time,
                 HOUR(NOW()) AS current_hour,
                 MINUTE(NOW()) AS current_minute
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE DATE(timestamp) = CURDATE()
         `;
 
@@ -128,7 +135,7 @@ app.get('/api/volume', (req, res) => {
     // First, get the last entry timestamp to calculate the timeframe
     const getLastTimestamp = `
         SELECT MAX(timestamp) AS last_timestamp 
-        FROM trade_history
+        FROM ${tp}trade_history
     `;
 
     pool.query(getLastTimestamp, (err, timestampResults) => {
@@ -148,7 +155,7 @@ app.get('/api/volume', (req, res) => {
                 SUM(total_usd) AS total_volume,
                 MIN(timestamp) AS start_time,
                 MAX(timestamp) AS end_time
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE timestamp >= ? - INTERVAL ? HOUR
         `;
 
@@ -187,6 +194,7 @@ app.get('/api/price-chart', (req, res) => {
     }
 
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     // Handle "today" - filter by current date
     if (hours === 'today') {
@@ -198,7 +206,7 @@ app.get('/api/price-chart', (req, res) => {
                 price,
                 amount,
                 total_usd
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE DATE(timestamp) = CURDATE()
             ORDER BY timestamp ASC
         `;
@@ -230,7 +238,7 @@ app.get('/api/price-chart', (req, res) => {
     // First, get the last entry timestamp to calculate the timeframe
     const getLastTimestamp = `
         SELECT MAX(timestamp) AS last_timestamp 
-        FROM trade_history
+        FROM ${tp}trade_history
     `;
 
     pool.query(getLastTimestamp, (err, timestampResults) => {
@@ -251,7 +259,7 @@ app.get('/api/price-chart', (req, res) => {
                 price,
                 amount,
                 total_usd
-            FROM trade_history 
+            FROM ${tp}trade_history 
             WHERE timestamp >= ? - INTERVAL ? HOUR
             ORDER BY timestamp ASC
         `;
@@ -284,6 +292,7 @@ app.get('/api/price-chart', (req, res) => {
 app.get('/api/inventory', (req, res) => {
     const database = req.query.database || 'bitmart'; // Default to bitmart
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     console.log(`[${database.toUpperCase()}] Fetching inventory snapshot...`);
 
@@ -296,7 +305,7 @@ app.get('/api/inventory', (req, res) => {
             bot_a_usdt,
             bot_b_usdt,
             timestamp
-        FROM inventory_snapshot
+        FROM ${tp}inventory_snapshot
         ORDER BY timestamp DESC
         LIMIT 1
     `;
@@ -351,6 +360,7 @@ app.get('/api/inventory-analysis', (req, res) => {
     }
 
     const pool = getPool(database);
+    const tp = tablePrefix(database);
     
     // Handle "today" - filter by current date
     if (hours === 'today') {
@@ -364,7 +374,7 @@ app.get('/api/inventory-analysis', (req, res) => {
                 bot_b_usdt,
                 net_token_change,
                 timestamp
-            FROM inventory_snapshot
+            FROM ${tp}inventory_snapshot
             WHERE DATE(timestamp) = CURDATE()
             ORDER BY timestamp ASC
         `;
@@ -444,7 +454,7 @@ app.get('/api/inventory-analysis', (req, res) => {
     // First, get the last entry timestamp from inventory_snapshot
     const getLastTimestamp = `
         SELECT MAX(timestamp) AS last_timestamp 
-        FROM inventory_snapshot
+        FROM ${tp}inventory_snapshot
     `;
 
     pool.query(getLastTimestamp, (err, timestampResults) => {
@@ -467,7 +477,7 @@ app.get('/api/inventory-analysis', (req, res) => {
                 bot_b_usdt,
                 net_token_change,
                 timestamp
-            FROM inventory_snapshot
+            FROM ${tp}inventory_snapshot
             WHERE timestamp >= ? - INTERVAL ? HOUR
             ORDER BY timestamp ASC
         `;
@@ -540,6 +550,121 @@ app.get('/api/inventory-analysis', (req, res) => {
             });
         });
     });
+});
+
+// --- 5b. ARB DASHBOARD ENDPOINTS (read arb_* / dex_trades from mm_production) ---
+// Arb tables live in the consolidated DB; either pool points there post-cutover.
+function arbPool() { return pools.bitmart; }
+
+// Dry/live filter shared by all arb endpoints: ?mode=all|live|dry
+function modeFilter(mode) {
+    if (mode === 'live') return 'is_dry_run = 0';
+    if (mode === 'dry') return 'is_dry_run = 1';
+    return '1=1';
+}
+
+app.get('/arb', (req, res) => res.sendFile(path.join(__dirname, 'arb.html')));
+
+app.get('/api/arb/dex-trades', (req, res) => {
+    const pool = arbPool();
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT id, timestamp, side, l1x_amount, weth_amount, avg_price_usd,
+                gas_usd, is_dry_run, tx_hash
+         FROM dex_trades WHERE ${flt} ORDER BY id DESC LIMIT 50`,
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            pool.query(
+                `SELECT side, COUNT(*) n, COALESCE(SUM(gas_usd),0) gas
+                 FROM dex_trades WHERE ${flt} GROUP BY side`,
+                (e2, totals) => {
+                    if (e2) return res.status(500).json({ error: e2.message });
+                    res.json({ trades: rows, totalsBySide: totals });
+                }
+            );
+        }
+    );
+});
+
+app.get('/api/arb/treasury', (req, res) => {
+    const pool = arbPool();
+    const hours = Number(req.query.hours) || 168;
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT timestamp, status, direction, cex_floor_usd, dex_spot_usd, premium_pct,
+                ceiling_l1x, sold_l1x, usdt_received, premium_captured_usd,
+                sell_gas_usd, convert_gas_usd, sell_tx, is_dry_run
+         FROM treasury_sells
+         WHERE timestamp > NOW() - INTERVAL ? HOUR AND ${flt}
+         ORDER BY id DESC LIMIT 500`,
+        [hours],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            // Statement aggregates split by direction (sell/buy) AND real vs simulated (dry).
+            // For a buy, sold_l1x = L1X bought and usdt_received = USDT spent.
+            pool.query(
+                `SELECT direction, is_dry_run,
+                        COALESCE(SUM(sold_l1x),0) l1x,
+                        COALESCE(SUM(usdt_received),0) usdt,
+                        COALESCE(SUM(sell_gas_usd + COALESCE(convert_gas_usd,0)),0) gas,
+                        COALESCE(SUM(premium_captured_usd),0) premium,
+                        COUNT(*) cnt
+                 FROM treasury_sells
+                 WHERE status='executed'
+                 GROUP BY direction, is_dry_run`,
+                (e2, aggRows) => {
+                    if (e2) return res.status(500).json({ error: e2.message });
+                    const blank = () => ({ l1x: 0, usdt: 0, gas: 0, premium: 0, count: 0, avgPrice: null });
+                    const stmt = {
+                        real:      { sell: blank(), buy: blank() },
+                        simulated: { sell: blank(), buy: blank() }
+                    };
+                    for (const row of (aggRows || [])) {
+                        const bucket = Number(row.is_dry_run) ? stmt.simulated : stmt.real;
+                        const dir = row.direction === 'buy' ? 'buy' : 'sell';
+                        const l1x = Number(row.l1x), usdt = Number(row.usdt);
+                        bucket[dir] = {
+                            l1x, usdt,
+                            gas: Number(row.gas), premium: Number(row.premium), count: Number(row.cnt),
+                            avgPrice: l1x > 0 ? usdt / l1x : null
+                        };
+                    }
+                    // current + opening treasury L1X/USDT from inventory snapshots, plus max premium seen
+                    pool.query(
+                        `SELECT
+                           (SELECT wallet_l1x FROM arb_inventory_snapshot ORDER BY id DESC LIMIT 1) cur_l1x,
+                           (SELECT wallet_usdt FROM arb_inventory_snapshot ORDER BY id DESC LIMIT 1) cur_usdt,
+                           (SELECT wallet_l1x FROM arb_inventory_snapshot ORDER BY id ASC LIMIT 1) open_l1x,
+                           (SELECT COALESCE(MAX(premium_pct),0) FROM treasury_sells) max_premium`,
+                        (e3, inv) => {
+                            stmt.position = e3 ? {} : (inv[0] || {});
+                            stmt.maxPremium = e3 ? 0 : Number((inv[0] || {}).max_premium || 0);
+                            res.json({ rows, statement: stmt, latest: rows[0] || null });
+                        }
+                    );
+                }
+            );
+        }
+    );
+});
+
+app.get('/api/arb/inventory', (req, res) => {
+    const pool = arbPool();
+    const hours = Number(req.query.hours) || 24;
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT timestamp, wallet_l1x, wallet_weth, wallet_eth, wallet_usdt,
+                bitmart_l1x, bitmart_usdt, lbank_l1x, lbank_usdt,
+                eth_usd, l1x_usd, total_value_usd, is_dry_run
+         FROM arb_inventory_snapshot
+         WHERE timestamp > NOW() - INTERVAL ? HOUR AND ${flt}
+         ORDER BY id DESC LIMIT 500`,
+        [hours],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ latest: rows[0] || null, history: rows.reverse() });
+        }
+    );
 });
 
 // --- 6. START SERVER ---
