@@ -1,8 +1,14 @@
 node_modules/
 .env
+.env.*
+!.env.example
 *.log
+logs/
 .DS_Store
 npm-debug.log*
+
+# Arb monitor runtime state (flags, opportunity log)
+arb/state/
 
 # Legacy per-project installs
 Market_Making_Bitmart/node_modules/

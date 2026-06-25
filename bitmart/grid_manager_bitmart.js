@@ -7,7 +7,21 @@
 const ccxt = require('ccxt');
 const mysql = require('mysql2/promise');
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+// Signals the arb monitor (arb/monitor.js) that our orders are being
+// mass-cancelled, so it must not trust the L1X orderbook during this window.
+const GRID_REFRESH_FLAG = path.join(__dirname, '..', 'arb', 'state', 'grid_refreshing_bitmart.flag');
+function setGridRefreshFlag() {
+    try {
+        fs.mkdirSync(path.dirname(GRID_REFRESH_FLAG), { recursive: true });
+        fs.writeFileSync(GRID_REFRESH_FLAG, String(Date.now()));
+    } catch (e) { /* flag I/O must never break trading */ }
+}
+function clearGridRefreshFlag() {
+    try { fs.unlinkSync(GRID_REFRESH_FLAG); } catch (e) { /* already gone */ }
+}
 
 // ============================================================
 // GRID MANAGER CONFIGURATION
@@ -24,7 +38,7 @@ const GRID_CONFIG = {
     pair: 'L1X/USDT',
     
     // Dry run mode
-    dryRun: false,
+    dryRun: process.env.BOT_DRY_RUN !== 'false', // env-driven: dry-run unless BOT_DRY_RUN=false
     
     // Minimum balances required
     minUsdtBalance: 10,
@@ -66,11 +80,11 @@ const GRID_CONFIG = {
     
     // Database configuration (optional, for logging)
     database: {
-        host: process.env.BITMART_DB_HOST || '157.173.109.193',
-        port: parseInt(process.env.BITMART_DB_PORT) || 25060,
-        user: process.env.BITMART_DB_USER || 'root',
-        password: process.env.BITMART_DB_PASSWORD || '',
-        database: process.env.BITMART_DB_NAME || 'market-cap_production',
+        host: process.env.DB_HOST || process.env.BITMART_DB_HOST || '157.173.109.193',
+        port: parseInt(process.env.DB_PORT || process.env.BITMART_DB_PORT) || 25060,
+        user: process.env.DB_USER || process.env.BITMART_DB_USER || 'root',
+        password: process.env.DB_PASSWORD || process.env.BITMART_DB_PASSWORD || '',
+        database: process.env.DB_NAME || process.env.BITMART_DB_NAME || 'market-cap_production',
         waitForConnections: true,
         connectionLimit: 10,
         queueLimit: 0
@@ -147,7 +161,7 @@ async function initDatabase() {
         log(`📊 Database connected (${dbName}).`, 'info');
         try {
             await dbPool.execute(`
-                CREATE TABLE IF NOT EXISTS grid_log (
+                CREATE TABLE IF NOT EXISTS bitmart_grid_log (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     action VARCHAR(20) NOT NULL,
@@ -164,26 +178,26 @@ async function initDatabase() {
                     sell_budget_used DECIMAL(20, 8) DEFAULT NULL,
                     active_buy_orders INT DEFAULT NULL,
                     active_sell_orders INT DEFAULT NULL,
-                    bot_name VARCHAR(50) DEFAULT 'gridBot'
+                    bot_name VARCHAR(50) DEFAULT 'gridBot',
+                    is_dry_run TINYINT(1) NOT NULL DEFAULT 0
                 )
             `);
             try {
-                await dbPool.execute(`CREATE INDEX idx_grid_log_created_at ON grid_log(created_at DESC)`);
-                await dbPool.execute(`CREATE INDEX idx_grid_log_action ON grid_log(action)`);
-                await dbPool.execute(`CREATE INDEX idx_grid_log_order_id ON grid_log(order_id)`);
+                await dbPool.execute(`CREATE INDEX idx_grid_log_created_at ON bitmart_grid_log(created_at DESC)`);
+                await dbPool.execute(`CREATE INDEX idx_grid_log_action ON bitmart_grid_log(action)`);
+                await dbPool.execute(`CREATE INDEX idx_grid_log_order_id ON bitmart_grid_log(order_id)`);
             } catch (e) { /* Indexes may exist */ }
-            log("📊 grid_log table ready.", 'info');
+            log("📊 bitmart_grid_log table ready.", 'info');
             try {
                 await dbPool.execute(`
-                    INSERT INTO grid_log (action, center_price, buy_budget_used, sell_budget_used, active_buy_orders, active_sell_orders, bot_name)
-                    VALUES ('START', 0, 0, 0, 0, 0, 'gridBot')
+                    INSERT INTO bitmart_grid_log (action, center_price, buy_budget_used, sell_budget_used, active_buy_orders, active_sell_orders, bot_name, is_dry_run)                    VALUES ('START', 0, 0, 0, 0, 0, 'gridBot', ${GRID_CONFIG.dryRun ? 1 : 0})
                 `);
-                log("📊 DB test write OK — check grid_log in database.", 'info');
+                log("📊 DB test write OK — check bitmart_grid_log in database.", 'info');
             } catch (testErr) {
                 log(`❌ DB test write failed: ${testErr.message}`, 'warn');
             }
         } catch (tableErr) {
-            log(`❌ grid_log table setup failed: ${tableErr.message}`, 'warn');
+            log(`❌ bitmart_grid_log table setup failed: ${tableErr.message}`, 'warn');
             dbPool = null;
         }
     } catch (error) {
@@ -196,10 +210,10 @@ async function logGridActivity(activityData) {
     if (!dbPool) return;
     try {
         await dbPool.execute(`
-            INSERT INTO grid_log (
+            INSERT INTO bitmart_grid_log (
                 action, center_price, buy_budget_used, sell_budget_used,
-                active_buy_orders, active_sell_orders, bot_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                active_buy_orders, active_sell_orders, bot_name, is_dry_run
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `, [
             activityData.action || 'REFRESH',
             activityData.centerPrice ?? null,
@@ -207,7 +221,8 @@ async function logGridActivity(activityData) {
             activityData.sellBudgetUsed ?? 0,
             activityData.activeBuyOrders ?? 0,
             activityData.activeSellOrders ?? 0,
-            'gridBot'
+            'gridBot',
+            GRID_CONFIG.dryRun ? 1 : 0
         ]);
     } catch (e) {
         log(`❌ DB logGridActivity failed: ${e.message}`, 'warn');
@@ -219,9 +234,9 @@ async function logGridOrderEvent(event) {
     if (GRID_CONFIG.dryRun) return;
     try {
         await dbPool.execute(`
-            INSERT INTO grid_log (
-                action, order_id, client_order_id, symbol, side, price, amount, value_usdt, price_range, bot_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO bitmart_grid_log (
+                action, order_id, client_order_id, symbol, side, price, amount, value_usdt, price_range, bot_name, is_dry_run
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
             event.action,
             event.orderId ?? null,
@@ -232,7 +247,8 @@ async function logGridOrderEvent(event) {
             event.amount ?? null,
             event.valueUsdt ?? null,
             event.priceRange ?? null,
-            'gridBot'
+            'gridBot',
+            GRID_CONFIG.dryRun ? 1 : 0
         ]);
     } catch (e) {
         log(`❌ DB logGridOrderEvent failed (${event?.action} ${event?.orderId}): ${e.message}`, 'warn');
@@ -249,10 +265,10 @@ async function detectAndLogFilledOrders(openGridOrderIds) {
     try {
         const [rows] = await dbPool.execute(`
             SELECT order_id, client_order_id, side, price, amount, value_usdt, price_range
-            FROM grid_log e1
+            FROM bitmart_grid_log e1
             WHERE e1.action = 'PLACED' AND e1.order_id IS NOT NULL
             AND NOT EXISTS (
-                SELECT 1 FROM grid_log e2
+                SELECT 1 FROM bitmart_grid_log e2
                 WHERE e2.order_id = e1.order_id AND e2.action IN ('CANCELLED', 'FILLED')
             )
         `);
@@ -974,10 +990,11 @@ async function cancelAllOrders(bot, symbol) {
         return;
     }
     
+    setGridRefreshFlag();
     try {
         const openOrders = await fetchOpenOrdersCached(bot, GRID_CONFIG.pair);
         const gridOrders = openOrders.filter(o => isGridOrder(o));
-        
+
         if (gridOrders.length === 0) {
             log("ℹ️ No grid orders to cancel" + (openOrders.length > 0 ? ` (${openOrders.length} manual order(s) left untouched)` : ''), 'info');
             return;
@@ -1027,6 +1044,8 @@ async function cancelAllOrders(bot, symbol) {
         log(`✅ Grid cancellation complete: ${cancelledCount} cancelled, ${failedCount} failed`, 'info');
     } catch (e) {
         log(`❌ Error cancelling orders: ${e.message}`, 'warn');
+    } finally {
+        clearGridRefreshFlag();
     }
 }
 

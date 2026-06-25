@@ -24,6 +24,22 @@ module.exports = {
       name: 'Server',
       script: 'dashboard/Server.js',
       cwd: __dirname
+    },
+    {
+      name: 'arb_monitor',
+      script: 'arb/monitor.js',
+      cwd: __dirname,
+      restart_delay: 10000,
+      max_restarts: 50
+    },
+    {
+      // Runs one inventory snapshot and exits; PM2 re-runs it on the cron.
+      name: 'arb_snapshot',
+      script: 'arb/accounting.js',
+      args: 'snapshot',
+      cwd: __dirname,
+      autorestart: false,
+      cron_restart: '*/30 * * * *'
     }
   ]
 };
