@@ -38,7 +38,11 @@ const CONFIG = {
   maxTradesPerDay: envNum('TREASURY_MAX_TRADES_PER_DAY', 20),
   mode: (process.env.TREASURY_MODE || 'both').toLowerCase()
 };
-const execute = process.argv.includes('--execute');
+// Live trading is enabled by the --execute flag OR TREASURY_EXECUTE=true in the
+// env (so PM2 can toggle live/dry from .env without editing args). Dry-run is
+// the default/fail-safe — anything other than 'true' simulates only.
+const execute = process.argv.includes('--execute') ||
+  (process.env.TREASURY_EXECUTE || '').toLowerCase() === 'true';
 
 // Count today's real (non-dry) executed treasury trades, for the daily cap.
 async function executedToday() {
@@ -92,7 +96,8 @@ async function tick() {
 
 async function main() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  log(`treasury monitor starting — mode=${CONFIG.mode} poll=${CONFIG.pollMs}ms ${execute ? 'LIVE (real trades)' : 'DRY-RUN (simulate only)'}`);
+  const liveSrc = process.argv.includes('--execute') ? '--execute flag' : ((process.env.TREASURY_EXECUTE || '').toLowerCase() === 'true' ? 'TREASURY_EXECUTE=true' : 'TREASURY_EXECUTE not set');
+  log(`treasury monitor starting — mode=${CONFIG.mode} poll=${CONFIG.pollMs}ms ${execute ? `LIVE (real trades) [${liveSrc}]` : `DRY-RUN (simulate only) [${liveSrc}]`}`);
   log(`safety: HALT file pauses; max ${CONFIG.maxTradesPerDay} live trades/day; ${CONFIG.cooldownMs}ms cooldown after action`);
   const once = process.argv.includes('--once');
 
