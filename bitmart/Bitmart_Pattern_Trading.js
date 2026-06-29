@@ -842,6 +842,40 @@ async function validateAndPlaceTradeWithFallback(botA, botB, side, usdSize, pric
 // ============================================================
 // 6. MAIN ENGINE (STRICT)
 // ============================================================
+// --- PERSISTENT DAILY VOLUME (restart-proof) ---------------------------------
+// "Today's volume" is the sum of trades already recorded in bitmart_trade_history
+// for the current calendar day. Loading it on startup means a restart RESUMES the
+// day's budget instead of granting a fresh 60k. The filter mirrors exactly what
+// increments stats.volume: live counts only fully-matched (maker+taker FILLED)
+// trades; dry-run counts its simulated rows. NOTE: "today" uses the DB's CURDATE()
+// and the process's local clock — assumes the bot and MySQL share a timezone.
+function dayKey(d = new Date()) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function startOfDayMs() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+}
+async function loadTodayVolume() {
+    if (!dbPool) return { volume: 0, count: 0 };
+    const filledFilter = CONFIG.dryRun
+        ? `is_dry_run = 1`
+        : `is_dry_run = 0 AND maker_order_status = 'FILLED' AND taker_order_status = 'FILLED'`;
+    try {
+        const [rows] = await dbPool.query(
+            `SELECT COALESCE(SUM(total_usd), 0) AS vol, COUNT(*) AS cnt
+             FROM bitmart_trade_history
+             WHERE DATE(timestamp) = CURDATE() AND (${filledFilter})`
+        );
+        const r = rows[0] || {};
+        return { volume: Number(r.vol) || 0, count: Number(r.cnt) || 0 };
+    } catch (e) {
+        broadcastLog(`⚠️ loadTodayVolume failed (${e.message}) — starting day at 0`, 'warn');
+        return { volume: 0, count: 0 };
+    }
+}
+
 async function runLiveEngine() {
     broadcastLog("🚀 STARTING STRICT PURE VOLUME ENGINE...", 'req');
     await initDatabase();
@@ -857,9 +891,15 @@ async function runLiveEngine() {
     } catch(e) { isRunning = false; return broadcastLog("❌ Init Failed: " + e.message, 'warn'); }
 
     const rawSymbol = CONFIG.pair.replace('/', '_');
-    let startTime = Date.now();
+    // Restart-proof daily volume: resume today's total from the DB so any number
+    // of restarts within a calendar day shares ONE 60k budget (not 60k each).
+    let currentDayKey = dayKey();
+    const resumed = await loadTodayVolume();
+    stats.volume = resumed.volume;
+    stats.count = resumed.count;
+    let startTime = startOfDayMs();            // pace across the calendar day, not from process start
     const volumeTarget = CONFIG.timeTargetVolume;
-    const timeLimit = startTime + (CONFIG.timeTargetHours * 3600000);
+    broadcastLog(`📊 Day ${currentDayKey}: resuming at $${stats.volume.toFixed(2)} / $${Number(volumeTarget).toLocaleString()} already done today (${stats.count} trades)`, 'info');
 
     if (CONFIG.timeTargetEnabled) {
         broadcastLog(`⏱️ Time target enabled: $${Number(volumeTarget).toLocaleString()} in ${CONFIG.timeTargetHours} hour(s)`, 'info');
@@ -873,9 +913,27 @@ async function runLiveEngine() {
     initialInventorySnapshot = { botA: await checkBalances(botA,'botA'), botB: await checkBalances(botB,'botB') };
     await takeAndLogInventorySnapshot(botA, botB, 'initial');
 
-    while (isRunning && stats.volume < volumeTarget && Date.now() < timeLimit) {
+    while (isRunning) {
         try {
             if(!isRunning) break;
+
+            // --- CALENDAR-DAY VOLUME CAP (restart-proof) ---
+            // New day -> reload (≈0) and reset the pacing anchor to midnight.
+            if (dayKey() !== currentDayKey) {
+                currentDayKey = dayKey();
+                const fresh = await loadTodayVolume();
+                stats.volume = fresh.volume;
+                stats.count = fresh.count;
+                startTime = startOfDayMs();
+                broadcastLog(`🔄 New day ${currentDayKey} — volume budget reset (resuming at $${stats.volume.toFixed(2)}).`, 'info');
+            }
+            // Today's budget spent -> idle until the date rolls over (do NOT exit;
+            // exiting + restart used to grant a fresh budget — that's the bug).
+            if (stats.volume >= volumeTarget) {
+                broadcastLog(`✅ Daily target $${Number(volumeTarget).toLocaleString()} reached ($${stats.volume.toFixed(0)}). Idling until next day.`, 'info');
+                await delay(60000);
+                continue;
+            }
 
             // 1. GET MARKET DATA
             let bestBid, bestAsk;
