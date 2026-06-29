@@ -87,6 +87,13 @@ function getConfig() {
     defaultSlippageBps: envNumber('UNISWAP_DEFAULT_SLIPPAGE_BPS', 0, 5000),
     deadlineSeconds: envNumber('UNISWAP_DEADLINE_SECONDS', 1, 86400),
     ethUsdPrice: optionalNumber('ETH_USD_PRICE'),
+    // Chainlink ETH/USD price feed (mainnet default) — on-chain fallback when
+    // the live CEX fetch fails. CHAINLINK_MAX_STALE_SECONDS rejects a feed
+    // answer older than this (0 = no staleness check).
+    chainlinkEthUsdFeed: process.env.CHAINLINK_ETH_USD_FEED
+      ? ethers.getAddress(process.env.CHAINLINK_ETH_USD_FEED)
+      : '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419',
+    chainlinkMaxStaleSeconds: optionalNumber('CHAINLINK_MAX_STALE_SECONDS') ?? 3600,
     // USDT conversion (for `convert`: WETH -> USDT on Uniswap). Optional —
     // only the convert path needs these.
     usdtToken: process.env.USDT_ADDRESS ? ethers.getAddress(process.env.USDT_ADDRESS) : null,
@@ -252,6 +259,33 @@ async function fetchExchangeEthUsdt(exchangeId) {
   return candidates[0];
 }
 
+// Chainlink AggregatorV3Interface — decimals() + latestRoundData().
+const CHAINLINK_AGGREGATOR_ABI = [
+  'function decimals() view returns (uint8)',
+  'function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)'
+];
+
+// On-chain ETH/USD from the Chainlink feed. Robust fallback to the CEX fetch:
+// uses the same RPC (no API key / rate limit). Rejects a stale or non-positive
+// answer so a frozen feed can never feed a bad price into trade decisions.
+async function fetchChainlinkEthUsdPrice(config) {
+  if (!config || !config.chainlinkEthUsdFeed) throw new Error('no Chainlink feed configured');
+  const provider = getProvider(config);
+  const feed = new ethers.Contract(config.chainlinkEthUsdFeed, CHAINLINK_AGGREGATOR_ABI, provider);
+  const [decimals, round] = await Promise.all([feed.decimals(), feed.latestRoundData()]);
+  const answer = round.answer;
+  if (answer == null || answer <= 0n) throw new Error('Chainlink returned a non-positive answer');
+  const price = Number(ethers.formatUnits(answer, Number(decimals)));
+  if (!Number.isFinite(price) || price <= 0) throw new Error('Chainlink price not finite');
+  const updatedAt = Number(round.updatedAt);
+  const ageSeconds = Math.floor(Date.now() / 1000) - updatedAt;
+  const maxStale = config.chainlinkMaxStaleSeconds;
+  if (maxStale && ageSeconds > maxStale) {
+    throw new Error(`Chainlink answer stale: ${ageSeconds}s old (max ${maxStale}s)`);
+  }
+  return { price, ageSeconds };
+}
+
 async function fetchLiveEthUsdPrice() {
   const results = await Promise.allSettled([
     fetchExchangeEthUsdt('bitmart'),
@@ -289,7 +323,9 @@ async function fetchLiveEthUsdPrice() {
   };
 }
 
-// Resolution order: live exchanges -> explicit override -> ETH_USD_PRICE env.
+// Resolution order: live exchanges -> explicit override -> Chainlink on-chain
+// feed -> static ETH_USD_PRICE env. Chainlink sits above the static env so a
+// CEX outage falls back to a live on-chain price, not a hardcoded (stale) one.
 async function resolveEthUsdPrice({ override = null, config, log = noop }) {
   try {
     const live = await fetchLiveEthUsdPrice();
@@ -310,6 +346,20 @@ async function resolveEthUsdPrice({ override = null, config, log = noop }) {
     };
   }
 
+  if (config && config.chainlinkEthUsdFeed) {
+    try {
+      const cl = await fetchChainlinkEthUsdPrice(config);
+      log(`ETH/USD via Chainlink: $${cl.price} (${cl.ageSeconds}s old)`);
+      return {
+        price: cl.price,
+        source: 'chainlink',
+        details: [{ name: 'chainlink', price: cl.price, ageSeconds: cl.ageSeconds }]
+      };
+    } catch (error) {
+      log(`Chainlink ETH/USD fetch failed: ${error.message}`);
+    }
+  }
+
   if (config.ethUsdPrice) {
     return {
       price: config.ethUsdPrice,
@@ -318,7 +368,7 @@ async function resolveEthUsdPrice({ override = null, config, log = noop }) {
     };
   }
 
-  throw new Error('Could not resolve ETH/USD price from live exchanges, --eth-usd, or ETH_USD_PRICE');
+  throw new Error('Could not resolve ETH/USD price from live exchanges, --eth-usd, Chainlink, or ETH_USD_PRICE');
 }
 
 // Quote one swap side. side: 'buy' (WETH->L1X) or 'sell' (L1X->WETH).
@@ -738,6 +788,7 @@ module.exports = {
   fetchExchangeEthUsdt,
   fetchLiveEthUsdPrice,
   resolveEthUsdPrice,
+  fetchChainlinkEthUsdPrice,
   buildSwapQuote,
   evaluateSell,
   evaluateBuy,
