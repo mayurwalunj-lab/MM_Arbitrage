@@ -40,6 +40,16 @@ module.exports = {
       cwd: __dirname,
       autorestart: false,
       cron_restart: '*/30 * * * *'
+    },
+    {
+      // Treasury sell/buy loop. Live vs dry-run is driven by TREASURY_EXECUTE
+      // in .env (true = real trades; anything else = simulate). No --execute
+      // arg here so you can toggle it from env without editing this file.
+      name: 'treasury_monitor',
+      script: 'arb/treasury_monitor.js',
+      cwd: __dirname,
+      restart_delay: 10000,
+      max_restarts: 50
     }
   ]
 };
