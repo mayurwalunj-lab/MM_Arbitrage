@@ -100,6 +100,9 @@ function invalidateOpenOrdersCache(botName) { if (openOrdersCache[botName]) open
 // 2. DATABASE SETUP
 // ============================================================
 let dbPool = null;
+// Module-level so cancelAllOrders can reuse the throttled, markets-loaded
+// instances instead of creating fresh un-throttled ones each call.
+let botA = null, botB = null;
 
 const pendingDbWrites = {
     tradeHistory: [],
@@ -423,6 +426,9 @@ const TERM_COLORS = {
 };
 
 function broadcastLog(msg, type = 'info') {
+    // Cap log lines so a Cloudflare/rate-limit HTML body (dumped via an error
+    // message) can't bloat the logs to hundreds of MB.
+    if (typeof msg === 'string' && msg.length > 400) msg = msg.slice(0, 400) + ' …[truncated]';
     const time = new Date().toLocaleTimeString('en-US',{hour12:false});
     io.emit('log', { time, msg, type });
     let color = TERM_COLORS.WHITE;
@@ -635,8 +641,8 @@ async function runLiveEngine() {
     io.emit('status_update', true);
 
     const exOpt = { enableRateLimit: true, options: { 'defaultType': 'spot', 'adjustForTimeDifference': true } };
-    let botA, botB;
     try {
+        // assign the module-level botA/botB (no `let` — so cancelAllOrders can reuse them)
         botA = new ccxt.lbank({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret, ...exOpt });
         botB = new ccxt.lbank({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret, ...exOpt });
         if(!CONFIG.dryRun) { await botA.loadMarkets(); await botB.loadMarkets(); }
@@ -861,12 +867,16 @@ async function runLiveEngine() {
 async function cancelAllOrders() {
     if(CONFIG.dryRun) return;
     try {
-        const botA = new ccxt.lbank({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret });
-        const botB = new ccxt.lbank({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret });
-        await botA.cancelAllOrders(CONFIG.pair);
-        await botB.cancelAllOrders(CONFIG.pair);
+        // Reuse the throttled, markets-loaded instances from the engine. Only
+        // fall back to fresh ones (still rate-limited) if the engine never ran —
+        // the old code made un-throttled instances that reloaded markets every
+        // call, which is what tripped LBank's Cloudflare rate-limit and crashed.
+        const a = botA || new ccxt.lbank({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret, enableRateLimit: true });
+        const b = botB || new ccxt.lbank({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret, enableRateLimit: true });
+        await a.cancelAllOrders(CONFIG.pair);
+        await b.cancelAllOrders(CONFIG.pair);
         broadcastLog("🚨 EMERGENCY STOP: All Orders Cancelled.", 'warn');
-    } catch(e) { console.error(e); }
+    } catch(e) { console.error('cancelAllOrders failed:', String((e && e.message) || e).slice(0, 200)); }
 }
 
 io.on('connection', (socket) => {
