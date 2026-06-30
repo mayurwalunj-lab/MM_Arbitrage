@@ -113,6 +113,9 @@ function invalidateOpenOrdersCache(botName) { if (openOrdersCache[botName]) open
 // 2. DATABASE SETUP
 // ============================================================
 let dbPool = null;
+// Module-level so cancelAllOrders can reuse the throttled, markets-loaded
+// instances instead of creating fresh un-throttled ones each call.
+let botA = null, botB = null;
 
 const pendingDbWrites = {
     tradeHistory: [],
@@ -535,8 +538,10 @@ const TERM_COLORS = {
 };
 
 function broadcastLog(msg, type = 'info') {
+    // Cap log lines so an error response body (e.g. ccxt/rate-limit) can't bloat the logs.
+    if (typeof msg === 'string' && msg.length > 400) msg = msg.slice(0, 400) + ' …[truncated]';
     const time = new Date().toLocaleTimeString('en-US',{hour12:false});
-    
+
     // 1. Emit to Frontend (Socket)
     io.emit('log', { time, msg, type });
 
@@ -849,8 +854,8 @@ async function runLiveEngine() {
     io.emit('status_update', true);
 
     const exOpt = { enableRateLimit: true, options: { 'defaultType': 'spot', 'adjustForTimeDifference': true } };
-    let botA, botB;
     try {
+        // assign the module-level botA/botB (no `let` — so cancelAllOrders can reuse them)
         botA = new ccxt.bitmart({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret, uid: CONFIG.botA.uid, ...exOpt });
         botB = new ccxt.bitmart({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret, uid: CONFIG.botB.uid, ...exOpt });
         if(!CONFIG.dryRun) { await botA.loadMarkets(); await botB.loadMarkets(); }
@@ -1101,12 +1106,15 @@ async function runLiveEngine() {
 async function cancelAllOrders() {
     if(CONFIG.dryRun) return;
     try {
-        const botA = new ccxt.bitmart({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret, uid: CONFIG.botA.uid });
-        const botB = new ccxt.bitmart({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret, uid: CONFIG.botB.uid });
-        await botA.cancelAllOrders(CONFIG.pair);
-        await botB.cancelAllOrders(CONFIG.pair);
+        // Reuse the throttled, markets-loaded engine instances; only fall back to
+        // fresh (still rate-limited) ones if the engine never ran. The old code
+        // made un-throttled instances that reloaded markets every call.
+        const a = botA || new ccxt.bitmart({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret, uid: CONFIG.botA.uid, enableRateLimit: true });
+        const b = botB || new ccxt.bitmart({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret, uid: CONFIG.botB.uid, enableRateLimit: true });
+        await a.cancelAllOrders(CONFIG.pair);
+        await b.cancelAllOrders(CONFIG.pair);
         broadcastLog("🚨 EMERGENCY STOP: All Orders Cancelled.", 'warn');
-    } catch(e) { console.error(e); }
+    } catch(e) { console.error('cancelAllOrders failed:', String((e && e.message) || e).slice(0, 200)); }
 }
 
 io.on('connection', (socket) => {
