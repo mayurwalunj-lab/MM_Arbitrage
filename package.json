@@ -50,6 +50,8 @@
     "treasury:sell": "node arb/treasury_sell.js",
     "treasury:buy": "node arb/treasury_sell.js --buy",
     "treasury:monitor": "node arb/treasury_monitor.js",
+    "qdex:mm": "node qdex/qdex_mm.js",
+    "qdex:mm:once": "node qdex/qdex_mm.js --once",
     "arb:report": "node arb/accounting.js report",
     "arb:snapshot": "node arb/accounting.js snapshot",
     "arb:record-trade": "node arb/accounting.js record-trade"
