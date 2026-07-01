@@ -29,6 +29,11 @@ const ERC20_ABI = [
 const SWAP_ROUTER_ABI = [
   'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)'
 ];
+// L1X price oracle — getLatestPrice(token) returns USD price with `decimals()` dp.
+const ORACLE_ABI = [
+  'function getLatestPrice(address) view returns (uint256)',
+  'function decimals() view returns (uint8)'
+];
 
 function envNum(name, fallback) {
   const v = Number(process.env[name]);
@@ -47,9 +52,16 @@ function getConfig() {
     // from the pool if not set, but pinned here for clarity.
     baseToken: process.env.QDEX_BASE_TOKEN ? ethers.getAddress(process.env.QDEX_BASE_TOKEN) : ethers.getAddress('0x743B3A9094B2226AEfd5EbEE22071FCDb64c707f'),
     quoteToken: process.env.QDEX_QUOTE_TOKEN ? ethers.getAddress(process.env.QDEX_QUOTE_TOKEN) : ethers.getAddress('0xcCD313e2c962BCea8501A6691598EF9A98975ba7'),
+    // oracle (authoritative WL1X USD price on L1X)
+    oracleAddress: ethers.getAddress(process.env.QDEX_ORACLE_ADDRESS || '0xbF730f5a23a63653457829ee88d3Aaf54453a809'),
     // strategy
+    //   peg mode: QDEX_XUSD_PEG > 0 -> hold XUSD at that USD value (target pool
+    //     ratio = oracleWL1X / peg). Overrides QDEX_TARGET_PRICE.
+    //   fixed mode: QDEX_TARGET_PRICE = XUSD per WL1X to hold directly.
+    xusdPeg: envNum('QDEX_XUSD_PEG', 0),
     targetPrice: envNum('QDEX_TARGET_PRICE', 0),   // XUSD per WL1X to hold (0 = unset)
     bandPct: envNum('QDEX_BAND_PCT', 0.5),
+    maxDeviationPct: envNum('QDEX_MAX_DEVIATION_PCT', 5), // circuit breaker
     maxTradeBase: envNum('QDEX_MAX_TRADE_BASE', 0),
     slippageBps: envNum('QDEX_SLIPPAGE_BPS', 100),
     deadlineSeconds: envNum('QDEX_DEADLINE_SECONDS', 600)
@@ -100,6 +112,16 @@ function priceFromSqrt(market) {
 async function getPoolPrice(config, provider) {
   const market = await loadPool(config, provider);
   return priceFromSqrt(market);
+}
+
+// Authoritative USD price for a token from the L1X oracle (WL1X is registered;
+// XUSD is not — derive XUSD = oracleWL1X / poolRatio instead).
+let _oracleDecimals = null;
+async function getOraclePrice(config, provider, tokenAddress) {
+  const oracle = new ethers.Contract(config.oracleAddress, ORACLE_ABI, provider);
+  if (_oracleDecimals == null) _oracleDecimals = Number(await oracle.decimals());
+  const raw = await oracle.getLatestPrice(tokenAddress);
+  return Number(raw) / Math.pow(10, _oracleDecimals);
 }
 
 // Amount of BASE to trade to move the pool price to `targetPrice`, using the
@@ -157,8 +179,14 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
     await atx.wait();
   }
 
-  const minOut = 0n; // TODO(qdex): set from a quote * (1 - slippage) once a Quoter is wired
-  void slippageBps;
+  // slippage floor: expected out from the current pool price, minus tolerance
+  const bps = Number.isFinite(slippageBps) ? slippageBps : config.slippageBps;
+  const expectedOutHuman = side === 'sell'
+    ? amountInHuman * px            // base -> quote: out ≈ base * price
+    : amountInHuman / px;           // quote -> base: out ≈ quote / price
+  const minOutHuman = expectedOutHuman * (1 - bps / 10000);
+  const minOut = ethers.parseUnits(minOutHuman.toFixed(tokenOut.decimals), tokenOut.decimals);
+  log(`amountIn=${amountInHuman} ${tokenIn.symbol} minOut=${minOutHuman.toFixed(6)} ${tokenOut.symbol} (slippage ${bps}bps)`);
   const router = new ethers.Contract(config.routerAddress, SWAP_ROUTER_ABI, wallet);
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const params = {
@@ -172,5 +200,5 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
 module.exports = {
   Q96, V3_POOL_ABI, ERC20_ABI,
   getConfig, getProvider, getWallet, loadPool, priceFromSqrt,
-  getPoolPrice, sizeToTarget, executeSwap
+  getPoolPrice, getOraclePrice, sizeToTarget, executeSwap
 };

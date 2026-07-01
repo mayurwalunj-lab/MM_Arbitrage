@@ -29,35 +29,56 @@ const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 
 async function tick() {
   const config = lib.getConfig();
-  if (!config.targetPrice || config.targetPrice <= 0) {
-    log('QDEX_TARGET_PRICE not set (>0) — nothing to hold. Skipping.');
+  const pegMode = config.xusdPeg > 0;
+  if (!pegMode && (!config.targetPrice || config.targetPrice <= 0)) {
+    log('Neither QDEX_XUSD_PEG nor QDEX_TARGET_PRICE set — nothing to hold. Skipping.');
     return;
   }
   const provider = lib.getProvider(config);
 
-  // 1. read pool state once + current price (quote per base)
+  // 1. read pool state once + current price (quote per base = XUSD per WL1X)
   const market = await lib.loadPool(config, provider);
   const price = lib.priceFromSqrt(market);
 
-  // 2. compare to target ± band
-  const band = config.targetPrice * (config.bandPct / 100);
-  const upper = config.targetPrice + band;
-  const lower = config.targetPrice - band;
-  const driftPct = ((price - config.targetPrice) / config.targetPrice) * 100;
-  log(`${market.base.symbol}/${market.quote.symbol} pool=${price.toFixed(6)} target=${config.targetPrice} band=±${config.bandPct}% drift=${driftPct.toFixed(3)}%`);
+  // 2. figure out the TARGET pool ratio.
+  //   peg mode: hold XUSD at QDEX_XUSD_PEG. XUSD = oracleWL1X / poolRatio, so
+  //     target poolRatio = oracleWL1X / peg. Circuit-break on a huge deviation.
+  //   fixed mode: target = QDEX_TARGET_PRICE directly.
+  let target, pegInfo = '';
+  if (pegMode) {
+    const oracleWL1X = await lib.getOraclePrice(config, provider, market.base.address);
+    if (!(oracleWL1X > 0)) { log('oracle returned no WL1X price — skipping (circuit breaker).'); return; }
+    const xusdPrice = oracleWL1X / price;                 // current XUSD in USD
+    const devPct = ((xusdPrice - config.xusdPeg) / config.xusdPeg) * 100;
+    pegInfo = `XUSD=$${xusdPrice.toFixed(5)} (peg $${config.xusdPeg}, dev ${devPct.toFixed(3)}%) | WL1X oracle=$${oracleWL1X.toFixed(4)}`;
+    if (Math.abs(devPct) > config.maxDeviationPct) {
+      log(`CIRCUIT BREAKER: XUSD ${devPct.toFixed(2)}% off peg > ${config.maxDeviationPct}% — not trading. ${pegInfo}`);
+      return;
+    }
+    target = oracleWL1X / config.xusdPeg;                 // target pool ratio for XUSD=peg
+  } else {
+    target = config.targetPrice;
+  }
+
+  // 3. compare pool ratio to target ± band
+  const band = target * (config.bandPct / 100);
+  const upper = target + band, lower = target - band;
+  const driftPct = ((price - target) / target) * 100;
+  log(`${market.base.symbol}/${market.quote.symbol} pool=${price.toFixed(6)} target=${target.toFixed(6)} band=±${config.bandPct}% drift=${driftPct.toFixed(3)}%${pegInfo ? ' | ' + pegInfo : ''}`);
 
   let side = null;
-  if (price > upper) side = 'sell';       // too high -> sell base to push down
-  else if (price < lower) side = 'buy';   // too low  -> buy base to push up
+  if (price > upper) side = 'sell';       // ratio too high -> sell WL1X (ratio down / XUSD up)
+  else if (price < lower) side = 'buy';   // ratio too low  -> buy WL1X (ratio up / XUSD down)
   if (!side) { log('within band — no action.'); return; }
 
-  // 3. size the trade to bring price back to target (capped)
-  let sizeBase = await lib.sizeToTarget({ config, provider, side, targetPrice: config.targetPrice, market });
+  // 4. size the trade to bring the ratio back to target (capped)
+  let sizeBase = await lib.sizeToTarget({ config, provider, side, targetPrice: target, market });
   if (config.maxTradeBase > 0) sizeBase = Math.min(sizeBase, config.maxTradeBase);
   if (!(sizeBase > 0)) { log('no feasible size — skipping.'); return; }
 
-  const notional = side === 'sell' ? sizeBase * price : sizeBase * price;
-  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol}) to restore target (${execute ? 'LIVE' : 'DRY-RUN'})`);
+  const notional = sizeBase * price;
+  const pegGoal = pegMode ? ` to bring XUSD → $${config.xusdPeg}` : ' to restore target';
+  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol})${pegGoal} (${execute ? 'LIVE' : 'DRY-RUN'})`);
 
   // 4. execute (or simulate)
   if (!execute) {
