@@ -97,8 +97,13 @@ async function tick() {
   if (!side) { log('within band — no action.'); await record('observed', 'within band'); return; }
   rec.side = side;
 
-  // 4. size the trade (center = to target, edge = to near band edge), capped
-  const correctionTarget = config.correctTo === 'edge' ? (side === 'sell' ? upper : lower) : target;
+  // 4. size the trade. correctTo: center = to target, edge = to near band edge,
+  //    random = pick one per tick (less mechanical / harder to read).
+  const effectiveCorrectTo = config.correctTo === 'random'
+    ? (Math.random() < 0.5 ? 'center' : 'edge')
+    : config.correctTo;
+  rec.correctTo = effectiveCorrectTo;
+  const correctionTarget = effectiveCorrectTo === 'edge' ? (side === 'sell' ? upper : lower) : target;
   let sizeBase = await lib.sizeToTarget({ config, provider, side, targetPrice: correctionTarget, market });
   if (config.maxTradeBase > 0) sizeBase = Math.min(sizeBase, config.maxTradeBase);
   if (!(sizeBase > 0)) { log('no feasible size — skipping.'); await record('skipped', 'no feasible size'); return; }
@@ -111,7 +116,7 @@ async function tick() {
   const q = await lib.quoteAmountOut({ config, provider, market, side, sizeBase, slippageBps: config.slippageBps });
   rec.minOut = q.minOutHuman;
   const pegGoal = pegMode ? ` toward XUSD $${config.xusdPeg}` : ' toward target';
-  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol})${pegGoal} [correct-to-${config.correctTo}] | quote(${q.method}): expect ${q.amountOutHuman.toFixed(4)} ${q.tokenOut.symbol}, minOut ${q.minOutHuman.toFixed(4)} (${execute ? 'LIVE' : 'DRY-RUN'})`);
+  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol})${pegGoal} [correct-to-${effectiveCorrectTo}${config.correctTo === 'random' ? ' (random)' : ''}] | quote(${q.method}): expect ${q.amountOutHuman.toFixed(4)} ${q.tokenOut.symbol}, minOut ${q.minOutHuman.toFixed(4)} (${execute ? 'LIVE' : 'DRY-RUN'})`);
 
   // 6. execute (or simulate) — dry-run records as executed + is_dry_run=1
   if (!execute) {
