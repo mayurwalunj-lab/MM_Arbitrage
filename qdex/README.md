@@ -13,9 +13,11 @@ Hold the **QDex (QuantumDex) WL1X/XUSD** pool price at a fixed target, on the
 Each tick (`qdex/qdex_mm.js`):
 1. Read the pool ratio on-chain (`slot0.sqrtPriceX96` = XUSD per WL1X).
 2. Determine the target ratio: peg mode → `oracleWL1X / peg`; fixed mode → `QDEX_TARGET_PRICE`.
-3. Circuit breaker (peg mode): if XUSD is > `QDEX_MAX_DEVIATION_PCT` off peg (or the
-   oracle returns nothing), **skip** — don't burn inventory on a possible real
-   de-peg / stale oracle.
+3. Circuit breaker (peg mode): if XUSD is > `QDEX_MAX_DEVIATION_PCT` off peg, it
+   **re-checks for `QDEX_BREAKER_CONFIRM_TICKS` ticks** before acting — a transient
+   oracle glitch resolves and resets; a persistent deviation is confirmed real and
+   then **corrected back to the band** (still capped by `QDEX_MAX_TRADE_BASE`). If
+   the oracle returns nothing, it skips.
 4. Compare ratio to target ± `QDEX_BAND_PCT`. Above band → **sell WL1X** (ratio down /
    XUSD up); below → **buy WL1X** (ratio up / XUSD down); inside → nothing.
 5. Size the swap (V3 single-range math) to restore the target, capped by `QDEX_MAX_TRADE_BASE`.

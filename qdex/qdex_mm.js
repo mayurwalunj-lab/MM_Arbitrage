@@ -27,6 +27,12 @@ const pollMs = Number(process.env.QDEX_POLL_MS) || 30000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 
+// Breaker confirmation: a >maxDeviation reading must persist this many
+// consecutive ticks before we act on it — filters out a transient oracle glitch
+// / momentary spike. If it stays off that long, it's real -> correct it.
+const breakerConfirmTicks = Number(process.env.QDEX_BREAKER_CONFIRM_TICKS) || 3;
+let breachCount = 0;
+
 async function tick() {
   const config = lib.getConfig();
   const pegMode = config.xusdPeg > 0;
@@ -52,8 +58,16 @@ async function tick() {
     const devPct = ((xusdPrice - config.xusdPeg) / config.xusdPeg) * 100;
     pegInfo = `XUSD=$${xusdPrice.toFixed(5)} (peg $${config.xusdPeg}, dev ${devPct.toFixed(3)}%) | WL1X oracle=$${oracleWL1X.toFixed(4)}`;
     if (Math.abs(devPct) > config.maxDeviationPct) {
-      log(`CIRCUIT BREAKER: XUSD ${devPct.toFixed(2)}% off peg > ${config.maxDeviationPct}% — not trading. ${pegInfo}`);
-      return;
+      breachCount++;
+      if (breachCount < breakerConfirmTicks) {
+        // not confirmed yet — re-check next tick before acting (could be a glitch)
+        log(`BREAKER: XUSD ${devPct.toFixed(2)}% off peg > ${config.maxDeviationPct}% — re-checking (${breachCount}/${breakerConfirmTicks}) before acting. ${pegInfo}`);
+        return;
+      }
+      // confirmed across N ticks -> treat as real, correct it back to the band
+      log(`BREAKER: large deviation CONFIRMED (${breachCount}/${breakerConfirmTicks} checks, ${devPct.toFixed(2)}% off) — correcting back to the band. ${pegInfo}`);
+    } else {
+      breachCount = 0; // back inside the safe range
     }
     target = oracleWL1X / config.xusdPeg;                 // target pool ratio for XUSD=peg
   } else {
