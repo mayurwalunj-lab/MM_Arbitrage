@@ -46,7 +46,9 @@ oracle WL1X = $8.7139; circuit breaker halts when deviation exceeds the limit.
 - ✅ Oracle integration (`getLatestPrice`, 8 dec) — WL1X = $8.7139; XUSD derived = $1.027.
 - ✅ Circuit breaker (`QDEX_MAX_DEVIATION_PCT`) — halts on large deviation / missing oracle.
 - ✅ Slippage floor — `executeSwap` sets `amountOutMinimum` from the pool price × (1 − slippage).
-- ⚠️ `executeSwap` (live) is a standard V3 `exactInputSingle` but **NOT yet verified against
-  QDex's router**. Before going live: confirm the router variant (deadline vs no-deadline
-  struct — QDex router is v2) and test with a tiny `QDEX_MAX_TRADE_BASE`.
+- ✅ Router verified on-chain — QDex router `0xA3A2…37eB` is the **classic Uniswap V3
+  SwapRouter** (`exactInputSingle` selector `0x414bf389`, **deadline inside the struct**).
+  `executeSwap`'s ABI matches it exactly (unlike Uniswap mainnet's SwapRouter02).
+- ⏳ Final live check: a tiny live swap with a funded wallet + `QDEX_MAX_TRADE_BASE`
+  (can't be simulated without the wallet key/balances). Approvals are handled (MaxUint256).
 - TODO: record swaps to a DB table (e.g. `qdex_trades`) like the other venues.
