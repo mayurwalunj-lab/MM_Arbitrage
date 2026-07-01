@@ -71,14 +71,18 @@ async function tick() {
   else if (price < lower) side = 'buy';   // ratio too low  -> buy WL1X (ratio up / XUSD down)
   if (!side) { log('within band — no action.'); return; }
 
-  // 4. size the trade to bring the ratio back to target (capped)
-  let sizeBase = await lib.sizeToTarget({ config, provider, side, targetPrice: target, market });
+  // 4. size the trade. 'center' -> correct all the way to target; 'edge' ->
+  //    correct only to the near band edge (smaller, more frequent trades).
+  const correctionTarget = config.correctTo === 'edge'
+    ? (side === 'sell' ? upper : lower)
+    : target;
+  let sizeBase = await lib.sizeToTarget({ config, provider, side, targetPrice: correctionTarget, market });
   if (config.maxTradeBase > 0) sizeBase = Math.min(sizeBase, config.maxTradeBase);
   if (!(sizeBase > 0)) { log('no feasible size — skipping.'); return; }
 
   const notional = sizeBase * price;
-  const pegGoal = pegMode ? ` to bring XUSD → $${config.xusdPeg}` : ' to restore target';
-  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol})${pegGoal} (${execute ? 'LIVE' : 'DRY-RUN'})`);
+  const pegGoal = pegMode ? ` toward XUSD $${config.xusdPeg}` : ' toward target';
+  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol})${pegGoal} [correct-to-${config.correctTo}] (${execute ? 'LIVE' : 'DRY-RUN'})`);
 
   // 4. execute (or simulate)
   if (!execute) {

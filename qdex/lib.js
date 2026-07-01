@@ -61,6 +61,10 @@ function getConfig() {
     xusdPeg: envNum('QDEX_XUSD_PEG', 0),
     targetPrice: envNum('QDEX_TARGET_PRICE', 0),   // XUSD per WL1X to hold (0 = unset)
     bandPct: envNum('QDEX_BAND_PCT', 0.5),
+    // 'center' = correct all the way back to the peg/target (fewer, bigger trades
+    // that fully re-center). 'edge' = correct only to the near band edge (smaller,
+    // more frequent trades, lets it hug the band — lower churn per trade).
+    correctTo: (process.env.QDEX_CORRECT_TO || 'center').toLowerCase(),
     maxDeviationPct: envNum('QDEX_MAX_DEVIATION_PCT', 5), // circuit breaker
     maxTradeBase: envNum('QDEX_MAX_TRADE_BASE', 0),
     slippageBps: envNum('QDEX_SLIPPAGE_BPS', 100),
