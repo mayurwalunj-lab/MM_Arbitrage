@@ -50,6 +50,17 @@ module.exports = {
       cwd: __dirname,
       restart_delay: 10000,
       max_restarts: 50
+    },
+    {
+      // QDex market maker — holds the WL1X/XUSD pool to peg XUSD ($1). Live vs
+      // dry-run is driven by QDEX_EXECUTE in .env (true = real swaps; else
+      // simulate). Loop cadence = QDEX_POLL_MS; size cap = QDEX_MAX_TRADE_BASE.
+      // No --execute/--once arg here so it loops and toggles from env.
+      name: 'qdex_mm',
+      script: 'qdex/qdex_mm.js',
+      cwd: __dirname,
+      restart_delay: 10000,
+      max_restarts: 50
     }
   ]
 };
