@@ -45,43 +45,51 @@ function envNum(name, fallback) {
   return Number.isFinite(v) ? v : fallback;
 }
 
+// Address from env or '' (no hardcoded fallback — all config comes from .env).
+const envAddr = (name) => (process.env[name] ? ethers.getAddress(process.env[name]) : '');
+
 function getConfig() {
   return {
-    rpcUrl: process.env.QDEX_RPC_URL || 'https://v2-mainnet-rpc.l1x.foundation',
-    chainId: envNum('QDEX_CHAIN_ID', 1066),
-    walletAddress: process.env.QDEX_WALLET_ADDRESS ? ethers.getAddress(process.env.QDEX_WALLET_ADDRESS) : null,
+    // network + contracts — all sourced from .env (see .env.example for values)
+    rpcUrl: process.env.QDEX_RPC_URL || '',
+    chainId: envNum('QDEX_CHAIN_ID', 0),
+    poolAddress: envAddr('QDEX_POOL_ADDRESS'),
+    routerAddress: envAddr('QDEX_ROUTER_ADDRESS'),
+    baseToken: envAddr('QDEX_BASE_TOKEN'),        // WL1X — the token whose price we hold
+    quoteToken: envAddr('QDEX_QUOTE_TOKEN'),      // XUSD
+    oracleAddress: envAddr('QDEX_ORACLE_ADDRESS'), // authoritative WL1X USD price
+    quoterAddress: envAddr('QDEX_QUOTER_ADDRESS'), // optional QuoterV2 (else pool-math quote)
+    // wallet
+    walletAddress: envAddr('QDEX_WALLET_ADDRESS') || null,
     privateKey: process.env.QDEX_WALLET_PRIVATE_KEY || '',
-    poolAddress: ethers.getAddress(process.env.QDEX_POOL_ADDRESS || '0x35a4Ef191750f6f70a29e58AcC2886de33a16DbD'),
-    routerAddress: ethers.getAddress(process.env.QDEX_ROUTER_ADDRESS || '0xA3A2dfF9f43Edc2825AC4C2Ff1A2945e103a37eB'),
-    // base = the token whose price we hold (WL1X); quote = XUSD. Defaults resolved
-    // from the pool if not set, but pinned here for clarity.
-    baseToken: process.env.QDEX_BASE_TOKEN ? ethers.getAddress(process.env.QDEX_BASE_TOKEN) : ethers.getAddress('0x743B3A9094B2226AEfd5EbEE22071FCDb64c707f'),
-    quoteToken: process.env.QDEX_QUOTE_TOKEN ? ethers.getAddress(process.env.QDEX_QUOTE_TOKEN) : ethers.getAddress('0xcCD313e2c962BCea8501A6691598EF9A98975ba7'),
-    // oracle (authoritative WL1X USD price on L1X)
-    oracleAddress: ethers.getAddress(process.env.QDEX_ORACLE_ADDRESS || '0xbF730f5a23a63653457829ee88d3Aaf54453a809'),
-    // optional QuoterV2 — if set, quotes use it (canonical); else pool-math quote
-    quoterAddress: process.env.QDEX_QUOTER_ADDRESS ? ethers.getAddress(process.env.QDEX_QUOTER_ADDRESS) : '',
-    // strategy
-    //   peg mode: QDEX_XUSD_PEG > 0 -> hold XUSD at that USD value (target pool
-    //     ratio = oracleWL1X / peg). Overrides QDEX_TARGET_PRICE.
-    //   fixed mode: QDEX_TARGET_PRICE = XUSD per WL1X to hold directly.
-    xusdPeg: envNum('QDEX_XUSD_PEG', 0),
-    targetPrice: envNum('QDEX_TARGET_PRICE', 0),   // XUSD per WL1X to hold (0 = unset)
+    // strategy (numeric tuning — env with a safe fallback)
+    xusdPeg: envNum('QDEX_XUSD_PEG', 0),           // peg mode: hold XUSD at this USD value
+    targetPrice: envNum('QDEX_TARGET_PRICE', 0),   // fixed mode: XUSD per WL1X (if no peg)
     bandPct: envNum('QDEX_BAND_PCT', 0.5),
-    // 'center' = correct all the way back to the peg/target (fewer, bigger trades
-    // that fully re-center). 'edge' = correct only to the near band edge (smaller,
-    // more frequent trades, lets it hug the band — lower churn per trade).
     correctTo: (process.env.QDEX_CORRECT_TO || 'center').toLowerCase(),
-    maxDeviationPct: envNum('QDEX_MAX_DEVIATION_PCT', 5), // circuit breaker
+    maxDeviationPct: envNum('QDEX_MAX_DEVIATION_PCT', 5),
     maxTradeBase: envNum('QDEX_MAX_TRADE_BASE', 0),
     slippageBps: envNum('QDEX_SLIPPAGE_BPS', 100),
     deadlineSeconds: envNum('QDEX_DEADLINE_SECONDS', 600)
   };
 }
 
+// Validate required config comes from .env; throw a clear list of what's missing.
+function validateConfig(config) {
+  const missing = [];
+  if (!config.rpcUrl) missing.push('QDEX_RPC_URL');
+  if (!config.chainId) missing.push('QDEX_CHAIN_ID');
+  if (!config.poolAddress) missing.push('QDEX_POOL_ADDRESS');
+  if (!config.routerAddress) missing.push('QDEX_ROUTER_ADDRESS');
+  if (!config.baseToken) missing.push('QDEX_BASE_TOKEN');
+  if (!config.quoteToken) missing.push('QDEX_QUOTE_TOKEN');
+  if (config.xusdPeg > 0 && !config.oracleAddress) missing.push('QDEX_ORACLE_ADDRESS (peg mode needs it)');
+  if (missing.length) throw new Error('Missing QDex config in .env: ' + missing.join(', '));
+}
+
 function getProvider(config) {
-  if (!config.rpcUrl) throw new Error('QDEX_RPC_URL not set');
-  return new ethers.JsonRpcProvider(config.rpcUrl, config.chainId);
+  if (!config.rpcUrl) throw new Error('QDEX_RPC_URL not set in .env');
+  return new ethers.JsonRpcProvider(config.rpcUrl, config.chainId || undefined);
 }
 
 function getWallet(config, provider, requireKey = false) {
@@ -261,6 +269,6 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
 
 module.exports = {
   Q96, V3_POOL_ABI, ERC20_ABI,
-  getConfig, getProvider, getWallet, loadPool, priceFromSqrt,
+  getConfig, validateConfig, getProvider, getWallet, loadPool, priceFromSqrt,
   getPoolPrice, getOraclePrice, sizeToTarget, quoteAmountOut, estimateAmountOutWei, executeSwap
 };

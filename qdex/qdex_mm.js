@@ -134,6 +134,8 @@ async function tick() {
 
 async function main() {
   log(`QDex MM starting — ${execute ? 'LIVE (real swaps)' : 'DRY-RUN (simulate)'} poll=${pollMs}ms once=${once}`);
+  try { lib.validateConfig(lib.getConfig()); }
+  catch (e) { console.error(`CONFIG ERROR: ${e.message}`); process.exit(1); }
   try { await db.init(); log('accounting DB connected (qdex_actions)'); }
   catch (e) { log(`WARN accounting DB not connected (${String(e.message).slice(0, 80)}) — running without recording`); }
   // eslint-disable-next-line no-constant-condition
