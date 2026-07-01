@@ -18,6 +18,7 @@
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), quiet: true });
 
 const lib = require('./lib');
+const db = require('./db');
 
 const execute = process.argv.includes('--execute') ||
   (process.env.QDEX_EXECUTE || '').toLowerCase() === 'true';
@@ -36,8 +37,16 @@ let breachCount = 0;
 async function tick() {
   const config = lib.getConfig();
   const pegMode = config.xusdPeg > 0;
+  // accounting record — filled progressively, written on every tick (non-fatal)
+  const rec = { mode: pegMode ? 'peg' : 'fixed', isDryRun: !execute, correctTo: config.correctTo, peg: pegMode ? config.xusdPeg : null };
+  const record = async (status, note) => {
+    rec.status = status; if (note) rec.note = note;
+    try { await db.insertAction(rec); } catch (e) { log(`WARN not recorded: ${String(e.message).slice(0, 120)}`); }
+  };
+
   if (!pegMode && (!config.targetPrice || config.targetPrice <= 0)) {
     log('Neither QDEX_XUSD_PEG nor QDEX_TARGET_PRICE set — nothing to hold. Skipping.');
+    await record('skipped', 'no peg/target set');
     return;
   }
   const provider = lib.getProvider(config);
@@ -45,34 +54,36 @@ async function tick() {
   // 1. read pool state once + current price (quote per base = XUSD per WL1X)
   const market = await lib.loadPool(config, provider);
   const price = lib.priceFromSqrt(market);
+  rec.pair = `${market.base.symbol}/${market.quote.symbol}`;
+  rec.poolRatio = price;
 
-  // 2. figure out the TARGET pool ratio.
-  //   peg mode: hold XUSD at QDEX_XUSD_PEG. XUSD = oracleWL1X / poolRatio, so
-  //     target poolRatio = oracleWL1X / peg. Circuit-break on a huge deviation.
-  //   fixed mode: target = QDEX_TARGET_PRICE directly.
+  // 2. figure out the TARGET pool ratio + circuit breaker.
   let target, pegInfo = '';
   if (pegMode) {
     const oracleWL1X = await lib.getOraclePrice(config, provider, market.base.address);
-    if (!(oracleWL1X > 0)) { log('oracle returned no WL1X price — skipping (circuit breaker).'); return; }
+    if (!(oracleWL1X > 0)) { log('oracle returned no WL1X price — skipping.'); await record('skipped', 'oracle no price'); return; }
+    rec.oracleWl1xUsd = oracleWL1X;
     const xusdPrice = oracleWL1X / price;                 // current XUSD in USD
+    rec.xusdPrice = xusdPrice;
     const devPct = ((xusdPrice - config.xusdPeg) / config.xusdPeg) * 100;
+    rec.deviationPct = devPct;
     pegInfo = `XUSD=$${xusdPrice.toFixed(5)} (peg $${config.xusdPeg}, dev ${devPct.toFixed(3)}%) | WL1X oracle=$${oracleWL1X.toFixed(4)}`;
     if (Math.abs(devPct) > config.maxDeviationPct) {
       breachCount++;
       if (breachCount < breakerConfirmTicks) {
-        // not confirmed yet — re-check next tick before acting (could be a glitch)
         log(`BREAKER: XUSD ${devPct.toFixed(2)}% off peg > ${config.maxDeviationPct}% — re-checking (${breachCount}/${breakerConfirmTicks}) before acting. ${pegInfo}`);
+        await record('skipped', `breaker re-check ${breachCount}/${breakerConfirmTicks}`);
         return;
       }
-      // confirmed across N ticks -> treat as real, correct it back to the band
       log(`BREAKER: large deviation CONFIRMED (${breachCount}/${breakerConfirmTicks} checks, ${devPct.toFixed(2)}% off) — correcting back to the band. ${pegInfo}`);
     } else {
-      breachCount = 0; // back inside the safe range
+      breachCount = 0;
     }
-    target = oracleWL1X / config.xusdPeg;                 // target pool ratio for XUSD=peg
+    target = oracleWL1X / config.xusdPeg;
   } else {
     target = config.targetPrice;
   }
+  rec.targetRatio = target;
 
   // 3. compare pool ratio to target ± band
   const band = target * (config.bandPct / 100);
@@ -83,39 +94,55 @@ async function tick() {
   let side = null;
   if (price > upper) side = 'sell';       // ratio too high -> sell WL1X (ratio down / XUSD up)
   else if (price < lower) side = 'buy';   // ratio too low  -> buy WL1X (ratio up / XUSD down)
-  if (!side) { log('within band — no action.'); return; }
+  if (!side) { log('within band — no action.'); await record('observed', 'within band'); return; }
+  rec.side = side;
 
-  // 4. size the trade. 'center' -> correct all the way to target; 'edge' ->
-  //    correct only to the near band edge (smaller, more frequent trades).
-  const correctionTarget = config.correctTo === 'edge'
-    ? (side === 'sell' ? upper : lower)
-    : target;
+  // 4. size the trade (center = to target, edge = to near band edge), capped
+  const correctionTarget = config.correctTo === 'edge' ? (side === 'sell' ? upper : lower) : target;
   let sizeBase = await lib.sizeToTarget({ config, provider, side, targetPrice: correctionTarget, market });
   if (config.maxTradeBase > 0) sizeBase = Math.min(sizeBase, config.maxTradeBase);
-  if (!(sizeBase > 0)) { log('no feasible size — skipping.'); return; }
+  if (!(sizeBase > 0)) { log('no feasible size — skipping.'); await record('skipped', 'no feasible size'); return; }
 
   const notional = sizeBase * price;
-  const pegGoal = pegMode ? ` toward XUSD $${config.xusdPeg}` : ' toward target';
-  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol})${pegGoal} [correct-to-${config.correctTo}] (${execute ? 'LIVE' : 'DRY-RUN'})`);
+  rec.sizeBase = sizeBase;
+  rec.notionalQuote = notional;
 
-  // 4. execute (or simulate)
+  // 5. QUOTE before swapping (impact-aware) -> slippage floor
+  const q = await lib.quoteAmountOut({ config, provider, market, side, sizeBase, slippageBps: config.slippageBps });
+  rec.minOut = q.minOutHuman;
+  const pegGoal = pegMode ? ` toward XUSD $${config.xusdPeg}` : ' toward target';
+  log(`${side.toUpperCase()} ${sizeBase.toFixed(4)} ${market.base.symbol} (~${notional.toFixed(2)} ${market.quote.symbol})${pegGoal} [correct-to-${config.correctTo}] | quote(${q.method}): expect ${q.amountOutHuman.toFixed(4)} ${q.tokenOut.symbol}, minOut ${q.minOutHuman.toFixed(4)} (${execute ? 'LIVE' : 'DRY-RUN'})`);
+
+  // 6. execute (or simulate) — dry-run records as executed + is_dry_run=1
   if (!execute) {
     log('[DRY] would swap — set --execute or QDEX_EXECUTE=true to go live.');
+    await record('executed', 'dry-run simulated');
     return;
   }
-  const receipt = await lib.executeSwap({ config, provider, side, amountBase: sizeBase, price, slippageBps: config.slippageBps, log });
-  log(`swap sent: ${receipt && receipt.hash ? receipt.hash : '(no hash)'}`);
-  // TODO(qdex): record to DB (qdex_trades) once the DB shape is decided.
+  try {
+    const receipt = await lib.executeSwap({ config, provider, side, amountBase: sizeBase, price, slippageBps: config.slippageBps, minOutHuman: q.minOutHuman, log });
+    rec.txHash = receipt && receipt.hash;
+    rec.blockNumber = receipt && receipt.blockNumber != null ? Number(receipt.blockNumber) : null;
+    if (receipt && receipt.gasUsed != null) rec.gasUsed = receipt.gasUsed.toString();
+    log(`swap sent: ${rec.txHash || '(no hash)'}`);
+    await record('executed', 'live swap');
+  } catch (e) {
+    log(`swap FAILED: ${String(e.message).slice(0, 160)}`);
+    await record('skipped', 'swap failed: ' + String(e.message).slice(0, 100));
+  }
 }
 
 async function main() {
   log(`QDex MM starting — ${execute ? 'LIVE (real swaps)' : 'DRY-RUN (simulate)'} poll=${pollMs}ms once=${once}`);
+  try { await db.init(); log('accounting DB connected (qdex_actions)'); }
+  catch (e) { log(`WARN accounting DB not connected (${String(e.message).slice(0, 80)}) — running without recording`); }
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try { await tick(); } catch (e) { log(`tick error: ${String(e.message).slice(0, 200)}`); }
     if (once) break;
     await sleep(pollMs);
   }
+  await db.end().catch(() => {});
 }
 
 main().catch((e) => { console.error(`FATAL: ${e.message}`); process.exit(1); });

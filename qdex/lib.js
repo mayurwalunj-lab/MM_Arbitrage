@@ -34,6 +34,11 @@ const ORACLE_ABI = [
   'function getLatestPrice(address) view returns (uint256)',
   'function decimals() view returns (uint8)'
 ];
+// Uniswap-V3 QuoterV2 (canonical off-chain quote — revert-based, needs no funds).
+// Only used if QDEX_QUOTER_ADDRESS is set; otherwise we quote from pool math.
+const QUOTER_V2_ABI = [
+  'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)'
+];
 
 function envNum(name, fallback) {
   const v = Number(process.env[name]);
@@ -54,6 +59,8 @@ function getConfig() {
     quoteToken: process.env.QDEX_QUOTE_TOKEN ? ethers.getAddress(process.env.QDEX_QUOTE_TOKEN) : ethers.getAddress('0xcCD313e2c962BCea8501A6691598EF9A98975ba7'),
     // oracle (authoritative WL1X USD price on L1X)
     oracleAddress: ethers.getAddress(process.env.QDEX_ORACLE_ADDRESS || '0xbF730f5a23a63653457829ee88d3Aaf54453a809'),
+    // optional QuoterV2 — if set, quotes use it (canonical); else pool-math quote
+    quoterAddress: process.env.QDEX_QUOTER_ADDRESS ? ethers.getAddress(process.env.QDEX_QUOTER_ADDRESS) : '',
     // strategy
     //   peg mode: QDEX_XUSD_PEG > 0 -> hold XUSD at that USD value (target pool
     //     ratio = oracleWL1X / peg). Overrides QDEX_TARGET_PRICE.
@@ -160,11 +167,59 @@ async function sizeToTarget({ config, provider, side, targetPrice, market }) {
   return baseUnits;
 }
 
+// Impact-aware expected output from the pool's own state (single active range):
+// given amountIn wei of the input token, walk the V3 curve to the post-trade
+// sqrt price and return the output wei. Same float approach as sizeToTarget.
+function estimateAmountOutWei(market, tokenInIsToken0, amountInWei) {
+  const L = Number(market.liquidity);
+  const sqrtCur = Number(market.sqrtPriceX96);
+  const amtIn = Number(amountInWei);
+  if (!(L > 0) || !(amtIn > 0) || !(sqrtCur > 0)) return 0;
+  if (tokenInIsToken0) {
+    // selling token0 -> sqrt moves down -> token1 out
+    const sqrtNew = 1 / (1 / sqrtCur + amtIn / (L * Q96));
+    return L * (sqrtCur - sqrtNew) / Q96;
+  }
+  // selling token1 -> sqrt moves up -> token0 out
+  const sqrtNew = sqrtCur + amtIn * Q96 / L;
+  return L * Q96 * (sqrtNew - sqrtCur) / (sqrtCur * sqrtNew);
+}
+
+// Quote a swap BEFORE executing: exact expected output + slippage floor. Uses
+// QuoterV2 if config.quoterAddress is set (canonical), otherwise the pool-math
+// estimate above. side 'sell' = base->quote; 'buy' = quote->base.
+async function quoteAmountOut({ config, provider, market, side, sizeBase, slippageBps }) {
+  const m = market;
+  const tokenIn = side === 'sell' ? m.base : m.quote;
+  const tokenOut = side === 'sell' ? m.quote : m.base;
+  const px = priceFromSqrt(m);
+  const amountInHuman = side === 'sell' ? sizeBase : sizeBase * px;
+  const amountIn = ethers.parseUnits(amountInHuman.toFixed(tokenIn.decimals), tokenIn.decimals);
+
+  let amountOutWei, method;
+  if (config.quoterAddress) {
+    const quoter = new ethers.Contract(config.quoterAddress, QUOTER_V2_ABI, provider);
+    const res = await quoter.quoteExactInputSingle.staticCall({
+      tokenIn: tokenIn.address, tokenOut: tokenOut.address, amountIn, fee: m.fee, sqrtPriceLimitX96: 0
+    });
+    amountOutWei = Number(res.amountOut ?? res[0]);
+    method = 'quoterV2';
+  } else {
+    const tokenInIsToken0 = tokenIn.address.toLowerCase() === m.token0.address.toLowerCase();
+    amountOutWei = estimateAmountOutWei(m, tokenInIsToken0, Number(amountIn));
+    method = 'pool-math';
+  }
+  const amountOutHuman = amountOutWei / Math.pow(10, tokenOut.decimals);
+  const bps = Number.isFinite(slippageBps) ? slippageBps : config.slippageBps;
+  const minOutHuman = amountOutHuman * (1 - bps / 10000);
+  return { amountInHuman, amountOutHuman, minOutHuman, tokenIn, tokenOut, method };
+}
+
 // Execute a swap on the QDex router. side 'sell' = base->quote (amountIn in base);
 // 'buy' = quote->base (amountIn in quote ≈ amountBase * price). exactInputSingle.
 // NOTE: unverified against QDex's router in production — confirm the router
 // variant (deadline vs no-deadline) and approvals on a tiny live test first.
-async function executeSwap({ config, provider, side, amountBase, price, slippageBps, log = () => {} }) {
+async function executeSwap({ config, provider, side, amountBase, price, slippageBps, minOutHuman, log = () => {} }) {
   const wallet = getWallet(config, provider, true);
   const m = await loadPool(config, provider);
   const tokenIn = side === 'sell' ? m.base : m.quote;
@@ -183,14 +238,17 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
     await atx.wait();
   }
 
-  // slippage floor: expected out from the current pool price, minus tolerance
+  // slippage floor from a QUOTE (impact-aware). Use the caller's precomputed
+  // minOutHuman if given; otherwise quote here.
   const bps = Number.isFinite(slippageBps) ? slippageBps : config.slippageBps;
-  const expectedOutHuman = side === 'sell'
-    ? amountInHuman * px            // base -> quote: out ≈ base * price
-    : amountInHuman / px;           // quote -> base: out ≈ quote / price
-  const minOutHuman = expectedOutHuman * (1 - bps / 10000);
-  const minOut = ethers.parseUnits(minOutHuman.toFixed(tokenOut.decimals), tokenOut.decimals);
-  log(`amountIn=${amountInHuman} ${tokenIn.symbol} minOut=${minOutHuman.toFixed(6)} ${tokenOut.symbol} (slippage ${bps}bps)`);
+  let floorHuman = minOutHuman;
+  if (floorHuman == null) {
+    const q = await quoteAmountOut({ config, provider, market: m, side, sizeBase: amountBase, slippageBps: bps });
+    floorHuman = q.minOutHuman;
+    log(`quote(${q.method}): expect ${q.amountOutHuman.toFixed(6)} ${tokenOut.symbol}`);
+  }
+  const minOut = ethers.parseUnits(floorHuman.toFixed(tokenOut.decimals), tokenOut.decimals);
+  log(`amountIn=${amountInHuman} ${tokenIn.symbol} minOut=${floorHuman.toFixed(6)} ${tokenOut.symbol} (slippage ${bps}bps)`);
   const router = new ethers.Contract(config.routerAddress, SWAP_ROUTER_ABI, wallet);
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const params = {
@@ -204,5 +262,5 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
 module.exports = {
   Q96, V3_POOL_ABI, ERC20_ABI,
   getConfig, getProvider, getWallet, loadPool, priceFromSqrt,
-  getPoolPrice, getOraclePrice, sizeToTarget, executeSwap
+  getPoolPrice, getOraclePrice, sizeToTarget, quoteAmountOut, estimateAmountOutWei, executeSwap
 };

@@ -21,7 +21,10 @@ Each tick (`qdex/qdex_mm.js`):
 4. Compare ratio to target ± `QDEX_BAND_PCT`. Above band → **sell WL1X** (ratio down /
    XUSD up); below → **buy WL1X** (ratio up / XUSD down); inside → nothing.
 5. Size the swap (V3 single-range math) to restore the target, capped by `QDEX_MAX_TRADE_BASE`.
-6. Live swaps use an oracle/pool-derived `amountOutMinimum` (slippage floor).
+6. **Quote before swapping** — the expected output is quoted impact-aware (from the
+   pool's own liquidity/sqrtPrice, or QuoterV2 if `QDEX_QUOTER_ADDRESS` is set), and
+   `amountOutMinimum` is set from that real quote × (1 − slippage) — not a naive spot
+   estimate, so a price-moving swap won't revert on the slippage floor.
 7. Dry-run by default; live only with `--execute` or `QDEX_EXECUTE=true`.
 
 ## Run
@@ -51,6 +54,8 @@ oracle WL1X = $8.7139; circuit breaker halts when deviation exceeds the limit.
 - ✅ Router verified on-chain — QDex router `0xA3A2…37eB` is the **classic Uniswap V3
   SwapRouter** (`exactInputSingle` selector `0x414bf389`, **deadline inside the struct**).
   `executeSwap`'s ABI matches it exactly (unlike Uniswap mainnet's SwapRouter02).
+- ✅ DB recording — every tick (observed / skipped / executed) writes to `qdex_actions`
+  in `mm_production` with `is_dry_run` + all data columns (pool ratio, oracle, XUSD price,
+  deviation, side, size, notional, tx/gas). Auto-created; DB config = `QDEX_DB_* → DB_*`.
 - ⏳ Final live check: a tiny live swap with a funded wallet + `QDEX_MAX_TRADE_BASE`
   (can't be simulated without the wallet key/balances). Approvals are handled (MaxUint256).
-- TODO: record swaps to a DB table (e.g. `qdex_trades`) like the other venues.
