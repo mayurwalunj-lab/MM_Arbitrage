@@ -5,6 +5,7 @@ const ccxt = require('ccxt');
 const path = require('path');
 const mysql = require('mysql2/promise');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+const priceBand = require('../shared/price_band'); // dynamic DEX-following band (off unless DYNAMIC_BAND=true)
 
 // --- SERVER SETUP ---
 const app = express();
@@ -663,21 +664,33 @@ async function runLiveEngine() {
     }
     await takeAndLogInventorySnapshot(botA, botB, 'initial');
 
+    let lastMid = 0;
     while (isRunning && stats.volume < volumeTarget && Date.now() < timeLimit) {
         try {
             if(!isRunning) break;
+
+            // 0. DYNAMIC BAND — follow the DEX (only if DYNAMIC_BAND=true; else the
+            //    fixed CONFIG box, so behavior is unchanged when off).
+            let bandFloor = CONFIG.hardFloorPrice, bandResist = CONFIG.hardResistancePrice, bandMinAsk = CONFIG.minBestAskToTrade;
+            if (priceBand.isEnabled()) {
+                try {
+                    const band = await priceBand.getBand(lastMid || (CONFIG.hardFloorPrice + CONFIG.hardResistancePrice) / 2);
+                    bandFloor = band.floor; bandResist = band.resistance; bandMinAsk = band.minAsk;
+                    if (band.moved || band.frozen) broadcastLog(`📊 BAND center $${band.center.toFixed(4)} [$${bandFloor.toFixed(4)}–$${bandResist.toFixed(4)}] DEX $${band.dexPrice ? band.dexPrice.toFixed(4) : 'n/a'}${band.frozen ? ' FROZEN(' + band.reason + ')' : ''}`, 'info');
+                } catch (e) { broadcastLog(`⚠️ band unavailable, using fixed box: ${String(e.message).slice(0, 60)}`, 'warn'); }
+            }
 
             // 1. GET MARKET DATA
             let bestBid, bestAsk;
             if (CONFIG.dryRun) {
                 if (microTrend.targetPrice > 0) {
-                    let move = (microTrend.targetPrice - simPrice) * 0.05; 
+                    let move = (microTrend.targetPrice - simPrice) * 0.05;
                     simPrice += move;
                 }
                 simPrice += randomVal(-0.0005, 0.0005);
-                simPrice = Math.max(CONFIG.hardFloorPrice, Math.min(CONFIG.hardResistancePrice, simPrice));
-                bestBid = simPrice; 
-                bestAsk = simPrice + 0.003; 
+                simPrice = Math.max(bandFloor, Math.min(bandResist, simPrice));
+                bestBid = simPrice;
+                bestAsk = simPrice + 0.003;
             } else {
                 const book = await botA.fetchOrderBook(CONFIG.pair);
                 bestBid = book.bids[0][0];
@@ -685,24 +698,25 @@ async function runLiveEngine() {
             }
 
             // 2. STRICT GATEKEEPER CHECK
-            const minAskLimit = Number(CONFIG.minBestAskToTrade);
+            const minAskLimit = Number(bandMinAsk);
             if (bestAsk < minAskLimit) {
                 broadcastLog(`🛑 GATEKEEPER: Best Ask (${bestAsk.toFixed(4)}) < Min Limit (${minAskLimit}). Waiting.`, 'warn');
-                await delay(5000); continue; 
+                await delay(5000); continue;
             }
 
             // 3. DEFINE VALID TRADING BAND
-            let lowerBound = Math.max(bestBid + CONFIG.safeZoneBuffer, CONFIG.hardFloorPrice);
-            let upperBound = Math.min(bestAsk - CONFIG.safeZoneBuffer, CONFIG.hardResistancePrice);
+            let lowerBound = Math.max(bestBid + CONFIG.safeZoneBuffer, bandFloor);
+            let upperBound = Math.min(bestAsk - CONFIG.safeZoneBuffer, bandResist);
 
             if (lowerBound >= upperBound) {
-                broadcastLog(`⚠️ No trade room. Spread: ${bestBid.toFixed(4)}-${bestAsk.toFixed(4)} vs Limits: ${CONFIG.hardFloorPrice}-${CONFIG.hardResistancePrice}`, 'warn');
+                broadcastLog(`⚠️ No trade room. Spread: ${bestBid.toFixed(4)}-${bestAsk.toFixed(4)} vs Limits: ${bandFloor.toFixed(4)}-${bandResist.toFixed(4)}`, 'warn');
                 await delay(5000); continue;
             }
 
             // 4. NATURAL PRICE CALCULATION
             const currentMid = (bestBid + bestAsk) / 2;
-            updateMicroTrend(currentMid, CONFIG.hardFloorPrice, CONFIG.hardResistancePrice);
+            lastMid = currentMid;
+            updateMicroTrend(currentMid, bandFloor, bandResist);
 
             const now = Date.now();
             const progress = Math.max(0, Math.min(1, (now - microTrend.startTime) / (microTrend.endTime - microTrend.startTime)));
