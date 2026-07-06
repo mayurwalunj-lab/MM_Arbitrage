@@ -47,7 +47,7 @@ fight each other.
    `observationCardinality = 1` — no TWAP window — so we use the EMA. The
    manipulation resistance instead comes from the guards in §4.)
 3. **Rate-limit** movement: the center moves at most `BAND_MAX_MOVE_PCT` per
-   update (default 0.5%). A larger DEX move is caught up over the next few cycles.
+   update (default 1.0%). A larger DEX move is caught up over the next few cycles.
 4. **Clamp** to absolute safety limits `BAND_ABS_MIN` / `BAND_ABS_MAX`.
 5. Return `{ center, floor, resistance, minAsk, highestBuy, lowestSell }`:
    - `highestBuy = center × (1 − halfSpread)`
@@ -100,7 +100,7 @@ Band engine: EMA + max-move cap + abs clamp  →  center (updated every 10 min)
 | `BAND_REFRESH_MS` | how often to refetch DEX + move the band | `600000` (10 min) |
 | `BAND_SMOOTHING_ALPHA` | EMA smoothing (0.2 = 9 EMA ≈ 90 min) | `0.2` |
 | `BAND_FOLLOW_MAX_PCT` | stop following if DEX is this far from CEX (freeze) | `5` |
-| `BAND_MAX_MOVE_PCT` | max center move per update | `0.5` |
+| `BAND_MAX_MOVE_PCT` | max center move per update (10 min) | `1.0` |
 | `INNER_SPREAD_PCT` | grid buy↔sell gap (**hard-capped 1.0**) | `0.7` |
 | `BAND_ABS_MIN` / `BAND_ABS_MAX` | absolute safety floor/ceiling | e.g. `5` / `20` |
 | `BAND_STALE_MS` | freeze band if DEX price older than this | `300000` |
