@@ -42,7 +42,7 @@ fight each other.
 1. Fetch the DEX price via `uniswap/lib.js`, **cached**, refreshed every
    `BAND_REFRESH_MS` (default 10 min = the grid cycle).
 2. **Smooth** it with an **EMA**: `EMA = α·price + (1−α)·EMA_prev`,
-   `α = BAND_SMOOTHING_ALPHA` (default 0.3, ≈ last hour weighted to recent).
+   `α = BAND_SMOOTHING_ALPHA` (default 0.2 = 9 EMA, ≈ 90 min weighted to recent).
    (Uniswap V3 TWAP was considered but the L1X/WETH pool has
    `observationCardinality = 1` — no TWAP window — so we use the EMA. The
    manipulation resistance instead comes from the guards in §4.)
@@ -98,7 +98,7 @@ Band engine: EMA + max-move cap + abs clamp  →  center (updated every 10 min)
 |-----|---------|---------|
 | `DYNAMIC_BAND` | master on/off (false = today's fixed box) | `false` |
 | `BAND_REFRESH_MS` | how often to refetch DEX + move the band | `600000` (10 min) |
-| `BAND_SMOOTHING_ALPHA` | EMA smoothing 0–1 (lower = smoother) | `0.3` |
+| `BAND_SMOOTHING_ALPHA` | EMA smoothing (0.2 = 9 EMA ≈ 90 min) | `0.2` |
 | `BAND_FOLLOW_MAX_PCT` | stop following if DEX is this far from CEX (freeze) | `5` |
 | `BAND_MAX_MOVE_PCT` | max center move per update | `0.5` |
 | `INNER_SPREAD_PCT` | grid buy↔sell gap (**hard-capped 1.0**) | `0.7` |
