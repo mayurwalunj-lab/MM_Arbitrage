@@ -41,14 +41,11 @@ fight each other.
 ### Part A — Shared Band Engine (new: `shared/price_band.js`)
 1. Fetch the DEX price via `uniswap/lib.js`, **cached**, refreshed every
    `BAND_REFRESH_MS` (default 10 min = the grid cycle).
-2. **Smooth** it. Two options, in priority order:
-   - **EMA (primary, available now):** `EMA = α·price + (1−α)·EMA_prev`,
-     `α = BAND_SMOOTHING_ALPHA` (default 0.3, ≈ last hour weighted to recent).
-   - **Uniswap V3 TWAP (future upgrade):** more manipulation-resistant, but the
-     L1X/WETH pool currently has `observationCardinality = 1` — **no TWAP window
-     available.** Enabling it needs a one-time `increaseObservationCardinalityNext`
-     tx **and** time for the (thin) pool to fill the window with swaps. Switch to
-     TWAP as primary once cardinality is raised and the window is warm.
+2. **Smooth** it with an **EMA**: `EMA = α·price + (1−α)·EMA_prev`,
+   `α = BAND_SMOOTHING_ALPHA` (default 0.3, ≈ last hour weighted to recent).
+   (Uniswap V3 TWAP was considered but the L1X/WETH pool has
+   `observationCardinality = 1` — no TWAP window — so we use the EMA. The
+   manipulation resistance instead comes from the guards in §4.)
 3. **Rate-limit** movement: the center moves at most `BAND_MAX_MOVE_PCT` per
    update (default 0.5%). A larger DEX move is caught up over the next few cycles.
 4. **Clamp** to absolute safety limits `BAND_ABS_MIN` / `BAND_ABS_MAX`.
@@ -180,6 +177,6 @@ Band engine: EMA + max-move cap + abs clamp  →  center (updated every 10 min)
 4. **Absolute safety limits:** what min/max is safe for L1X (e.g. $5–$20)?
 5. **DEX source:** the Uniswap L1X/WETH pool (Ethereum) — confirm (not the QDex
    L1X-chain pool).
-6. **TWAP:** enable it later? (one-time `increaseObservationCardinalityNext` tx +
-   warm-up), or stay on EMA + the freeze-beyond-threshold guard. Checked
-   2026-07: pool cardinality = 1, so TWAP is not available today.
+
+_Note: smoothing = EMA. Uniswap TWAP is not used (pool cardinality = 1, checked
+2026-07)._
