@@ -9,6 +9,7 @@ const mysql = require('mysql2/promise');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+const priceBand = require('../shared/price_band'); // dynamic DEX-following band (off unless DYNAMIC_BAND=true)
 
 // Signals the arb monitor (arb/monitor.js) that our orders are being
 // mass-cancelled, so it must not trust the L1X orderbook during this window.
@@ -71,6 +72,10 @@ const GRID_CONFIG = {
         ]
     },
     
+    // Price the priceRangeGrids above are designed around (for DYNAMIC_BAND: all
+    // ranges are scaled by centerPrice/baseCenterPrice so the whole grid slides).
+    baseCenterPrice: 8.50,
+
     // Refresh interval (seconds)
     refreshIntervalSeconds: 600,
     
@@ -100,6 +105,32 @@ const randomVal = (min, max) => Math.random() * (max - min) + min;
 function log(message, type = 'info') {
     const time = new Date().toLocaleTimeString('en-US', { hour12: false });
     console.log(`[${time}] [GRID] ${message}`);
+}
+
+// Effective price ranges for this refresh. With DYNAMIC_BAND on, every range is
+// scaled by centerPrice/baseCenterPrice so the whole grid slides to follow the
+// DEX-driven center (relative spacing preserved). Off = the fixed absolute ranges.
+function effectiveRanges(centerPrice) {
+    const src = GRID_CONFIG.priceRangeGrids;
+    if (!priceBand.isEnabled() || !src || !(centerPrice > 0)) return src;
+    const base = GRID_CONFIG.baseCenterPrice || centerPrice;
+    const ratio = centerPrice / base;
+    const shift = (arr) => (arr || []).map(r => ({ ...r, minPrice: r.minPrice * ratio, maxPrice: r.maxPrice * ratio }));
+    return { buy: shift(src.buy), sell: shift(src.sell) };
+}
+
+// The center the grid should build around: the DEX-following band center when
+// DYNAMIC_BAND is on, otherwise the current market price (today's behavior).
+async function resolveGridCenter(marketPrice) {
+    if (!priceBand.isEnabled()) return marketPrice;
+    try {
+        const band = await priceBand.getBand(marketPrice);
+        log(`📊 BAND center $${band.center.toFixed(4)} (DEX $${band.dexPrice ? band.dexPrice.toFixed(4) : 'n/a'}${band.frozen ? ', FROZEN' : ''}) — grid follows`, 'info');
+        return band.center;
+    } catch (e) {
+        log(`⚠️ band unavailable, grid centered on market: ${String(e.message).slice(0, 60)}`, 'warn');
+        return marketPrice;
+    }
 }
 
 // Prefix for orders placed by the Grid Manager API. Only these are cancelled on refresh/stop.
@@ -463,6 +494,8 @@ function adjustPriceToMeetMinNotional({ bot, symbol, price, amount, range }) {
  */
 async function maintainGrid(bot, centerPrice, symbol) {
     if (!isRunning) return;
+    // Effective ranges for this refresh (shifted to follow the band when enabled).
+    const ranges = effectiveRanges(centerPrice);
     const startTime = Date.now();
     // Use orderOperationTimeWindow (5 minutes) for operation time limit
     // Add 10 seconds buffer to ensure we finish before next refresh
@@ -508,8 +541,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
     if (GRID_CONFIG.dryRun) {
         let visualGrid = { bids: [], asks: [] };
         
-        if (GRID_CONFIG.priceRangeGrids && GRID_CONFIG.priceRangeGrids.buy) {
-            for (const range of GRID_CONFIG.priceRangeGrids.buy) {
+        if (GRID_CONFIG.priceRangeGrids && ranges.buy) {
+            for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
                 
@@ -529,8 +562,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
             }
         }
         
-        if (GRID_CONFIG.priceRangeGrids && GRID_CONFIG.priceRangeGrids.sell) {
-            for (const range of GRID_CONFIG.priceRangeGrids.sell) {
+        if (GRID_CONFIG.priceRangeGrids && ranges.sell) {
+            for (const range of ranges.sell) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
                 
@@ -576,8 +609,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
         
         // Collect valid price ranges
         const validRanges = {
-            buy: GRID_CONFIG.priceRangeGrids?.buy?.map(r => ({ min: r.minPrice, max: r.maxPrice })) || [],
-            sell: GRID_CONFIG.priceRangeGrids?.sell?.map(r => ({ min: r.minPrice, max: r.maxPrice })) || []
+            buy: (ranges?.buy || []).map(r => ({ min: r.minPrice, max: r.maxPrice })),
+            sell: (ranges?.sell || []).map(r => ({ min: r.minPrice, max: r.maxPrice }))
         };
         
         // Separate orders by side and range (grid orders only; manual frontend orders are never touched)
@@ -629,8 +662,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
         const targetSellOrders = [];
         
         // Generate BUY target orders
-        if (canBuy && GRID_CONFIG.priceRangeGrids && GRID_CONFIG.priceRangeGrids.buy) {
-            for (const range of GRID_CONFIG.priceRangeGrids.buy) {
+        if (canBuy && GRID_CONFIG.priceRangeGrids && ranges.buy) {
+            for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
                 
@@ -655,8 +688,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
         }
         
         // Generate SELL target orders
-        if (canSell && GRID_CONFIG.priceRangeGrids && GRID_CONFIG.priceRangeGrids.sell) {
-            for (const range of GRID_CONFIG.priceRangeGrids.sell) {
+        if (canSell && GRID_CONFIG.priceRangeGrids && ranges.sell) {
+            for (const range of ranges.sell) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
                 
@@ -962,7 +995,7 @@ async function startGridManager() {
         return;
     }
     
-    await maintainGrid(gridBot, currentPrice, gridSymbol);
+    await maintainGrid(gridBot, await resolveGridCenter(currentPrice), gridSymbol);
     
     // Set up periodic refresh
     gridLoopInterval = setInterval(async () => {
@@ -971,7 +1004,7 @@ async function startGridManager() {
         try {
             const price = await getCurrentPrice(gridBot, GRID_CONFIG.pair);
             if (price) {
-                await maintainGrid(gridBot, price, gridSymbol);
+                await maintainGrid(gridBot, await resolveGridCenter(price), gridSymbol);
             }
         } catch (e) {
             log(`⚠️ Error in grid loop: ${e.message}`, 'warn');
