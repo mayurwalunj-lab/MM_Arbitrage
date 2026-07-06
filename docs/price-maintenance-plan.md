@@ -41,8 +41,14 @@ fight each other.
 ### Part A — Shared Band Engine (new: `shared/price_band.js`)
 1. Fetch the DEX price via `uniswap/lib.js`, **cached**, refreshed every
    `BAND_REFRESH_MS` (default 10 min = the grid cycle).
-2. **Smooth** it with an EMA (`BAND_SMOOTHING_ALPHA`) so pool noise doesn't
-   jitter the band.
+2. **Smooth** it. Two options, in priority order:
+   - **EMA (primary, available now):** `EMA = α·price + (1−α)·EMA_prev`,
+     `α = BAND_SMOOTHING_ALPHA` (default 0.3, ≈ last hour weighted to recent).
+   - **Uniswap V3 TWAP (future upgrade):** more manipulation-resistant, but the
+     L1X/WETH pool currently has `observationCardinality = 1` — **no TWAP window
+     available.** Enabling it needs a one-time `increaseObservationCardinalityNext`
+     tx **and** time for the (thin) pool to fill the window with swaps. Switch to
+     TWAP as primary once cardinality is raised and the window is warm.
 3. **Rate-limit** movement: the center moves at most `BAND_MAX_MOVE_PCT` per
    update (default 0.5%). A larger DEX move is caught up over the next few cycles.
 4. **Clamp** to absolute safety limits `BAND_ABS_MIN` / `BAND_ABS_MAX`.
@@ -96,6 +102,7 @@ Band engine: EMA + max-move cap + abs clamp  →  center (updated every 10 min)
 | `DYNAMIC_BAND` | master on/off (false = today's fixed box) | `false` |
 | `BAND_REFRESH_MS` | how often to refetch DEX + move the band | `600000` (10 min) |
 | `BAND_SMOOTHING_ALPHA` | EMA smoothing 0–1 (lower = smoother) | `0.3` |
+| `BAND_FOLLOW_MAX_PCT` | stop following if DEX is this far from CEX (freeze) | `5` |
 | `BAND_MAX_MOVE_PCT` | max center move per update | `0.5` |
 | `INNER_SPREAD_PCT` | grid buy↔sell gap (**hard-capped 1.0**) | `0.7` |
 | `BAND_ABS_MIN` / `BAND_ABS_MAX` | absolute safety floor/ceiling | e.g. `5` / `20` |
@@ -113,8 +120,12 @@ Band engine: EMA + max-move cap + abs clamp  →  center (updated every 10 min)
 4. **Inner spread hard-capped ≤ 1%** — the market always looks tight/liquid.
 5. **DEX-read fallback** — RPC blip → keep the last good band; bots keep running.
 6. **Staleness freeze** — if the DEX price is too old, stop moving the band.
-7. **Oracle cross-check (optional)** — compare the DEX price to the L1X oracle;
-   if they diverge beyond a threshold, freeze the band (guards a manipulated pool).
+7. **Follow-within-threshold, freeze-beyond (key manipulation guard)** — the band
+   only follows the DEX while the DEX is within the treasury trigger (~5%) of the
+   current CEX. If the DEX spikes *past* that, the band **freezes** (does NOT
+   chase it) — a big spike is either manipulation or a real event the **treasury**
+   handles by selling the DEX back. This is what replaces TWAP's protection while
+   the pool has no observation history.
 8. **Kill switch** — `DYNAMIC_BAND=false` instantly reverts to the fixed box, no
    redeploy.
 9. **Single source of truth** — volume bot, grid, and treasury all read the same
@@ -169,3 +180,6 @@ Band engine: EMA + max-move cap + abs clamp  →  center (updated every 10 min)
 4. **Absolute safety limits:** what min/max is safe for L1X (e.g. $5–$20)?
 5. **DEX source:** the Uniswap L1X/WETH pool (Ethereum) — confirm (not the QDex
    L1X-chain pool).
+6. **TWAP:** enable it later? (one-time `increaseObservationCardinalityNext` tx +
+   warm-up), or stay on EMA + the freeze-beyond-threshold guard. Checked
+   2026-07: pool cardinality = 1, so TWAP is not available today.
