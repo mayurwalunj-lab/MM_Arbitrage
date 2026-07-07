@@ -32,6 +32,11 @@ function config() {
     alpha: num('BAND_SMOOTHING_ALPHA', 0.2),        // 9 EMA
     maxMovePct: num('BAND_MAX_MOVE_PCT', 1.0),      // per refresh
     followMaxPct: num('BAND_FOLLOW_MAX_PCT', 5),    // freeze beyond this DEX↔CEX gap
+    // Treasury only SELLS (lifts the DEX when it runs high), so it covers the
+    // UPSIDE gap. On the downside nobody buys, so freezing there would leave the
+    // CEX stranded above the market. With this true, we only freeze on the upside
+    // and let the band ease DOWN to BAND_ABS_MIN and hold there instead.
+    freezeUpsideOnly: (process.env.BAND_FREEZE_UPSIDE_ONLY || '').toLowerCase() === 'true',
     innerSpreadPct,                                 // grid buy↔sell gap (≤1%)
     absMin: num('BAND_ABS_MIN', 5),
     absMax: num('BAND_ABS_MAX', 20),
@@ -111,14 +116,22 @@ async function refresh(cexRef, c) {
   if (state.center == null) state.center = clamp(cexRef || dex, c.absMin, c.absMax);
   let center = state.center;
 
-  // freeze-beyond: if the DEX (EMA) is > followMaxPct from the CEX reference, don't chase it
+  // freeze-beyond: if the DEX (EMA) runs too far from the CEX, don't chase it.
+  // signedPct > 0 means DEX is ABOVE the CEX (upside), < 0 means BELOW (downside).
   const ref = (cexRef && cexRef > 0) ? cexRef : center;
-  const divPct = Math.abs(target - ref) / ref * 100;
+  const signedPct = (target - ref) / ref * 100;
+  const divPct = Math.abs(signedPct);
   let frozen = false, moved = false, reason = 'ok';
 
-  if (divPct > c.followMaxPct) {
+  // Upside break is always the treasury's job (it SELLS to pull the DEX down) → freeze.
+  // Downside break: freeze only if freezeUpsideOnly is off. With it ON, we DON'T freeze
+  // on the downside — the band eases down and holds at BAND_ABS_MIN, because the
+  // treasury does not buy the dip and a frozen CEX would just sit above the market.
+  const upsideBreak = signedPct > c.followMaxPct;
+  const downsideBreak = signedPct < -c.followMaxPct;
+  if (upsideBreak || (downsideBreak && !c.freezeUpsideOnly)) {
     frozen = true;
-    reason = `frozen: DEX ${divPct.toFixed(2)}% from CEX > ${c.followMaxPct}% (treasury handles it)`;
+    reason = `frozen: DEX ${divPct.toFixed(2)}% ${signedPct > 0 ? 'above' : 'below'} CEX > ${c.followMaxPct}% (treasury handles it)`;
   } else {
     // move the center toward the target, capped by maxMovePct of the center
     const maxStep = center * (c.maxMovePct / 100);
@@ -127,7 +140,8 @@ async function refresh(cexRef, c) {
     if (step !== 0) moved = true;
     center = clamp(center + step, c.absMin, c.absMax);
     state.center = center;
-    if (center === c.absMin || center === c.absMax) reason = 'clamped to absolute fence';
+    if (center === c.absMin) reason = 'holding at absolute floor (BAND_ABS_MIN)';
+    else if (center === c.absMax) reason = 'holding at absolute ceiling (BAND_ABS_MAX)';
   }
 
   state.lastBand = { ...buildBand(center, c), dexPrice: dex, dexEma: target, cexRef: ref, frozen, moved, reason };
