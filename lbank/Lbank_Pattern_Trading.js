@@ -665,6 +665,18 @@ async function runLiveEngine() {
     await takeAndLogInventorySnapshot(botA, botB, 'initial');
 
     let lastMid = 0;
+    // Seed lastMid from the REAL current market so the band's first read references
+    // the live price, not the static box midpoint — otherwise the band seeds low
+    // (~$8.50) and the bot sits in "No trade room" while it slowly climbs. Best-effort.
+    if (priceBand.isEnabled() && !CONFIG.dryRun) {
+        try {
+            const seedBook = await botA.fetchOrderBook(CONFIG.pair);
+            if (seedBook?.bids?.[0]?.[0] && seedBook?.asks?.[0]?.[0]) {
+                lastMid = (seedBook.bids[0][0] + seedBook.asks[0][0]) / 2;
+                broadcastLog(`📊 Band seed: market mid $${lastMid.toFixed(4)}`, 'info');
+            }
+        } catch (e) { broadcastLog(`⚠️ band seed fetch failed: ${String(e.message).slice(0, 50)}`, 'warn'); }
+    }
     while (isRunning && stats.volume < volumeTarget && Date.now() < timeLimit) {
         try {
             if(!isRunning) break;
@@ -695,6 +707,12 @@ async function runLiveEngine() {
                 const book = await botA.fetchOrderBook(CONFIG.pair);
                 bestBid = book.bids[0][0];
                 bestAsk = book.asks[0][0];
+            }
+
+            // Keep the band's reference price current EVERY tick — even if we bail out
+            // below on "no trade room"/gatekeeper — so it never goes stale during a lockout.
+            {
+                lastMid = (bestBid + bestAsk) / 2;
             }
 
             // 2. STRICT GATEKEEPER CHECK
