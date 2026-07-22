@@ -51,6 +51,7 @@
     "treasury:buy": "node arb/treasury_sell.js --buy",
     "treasury:monitor": "node arb/treasury_monitor.js",
     "qdex:mm": "node qdex/qdex_mm.js",
+    "qdex:check": "node qdex/check_wallet.js",
     "band:dryrun": "node scripts/band_dryrun.js",
     "qdex:mm:once": "node qdex/qdex_mm.js --once",
     "arb:report": "node arb/accounting.js report",

@@ -48,6 +48,33 @@ function envNum(name, fallback) {
 // Address from env or '' (no hardcoded fallback — all config comes from .env).
 const envAddr = (name) => (process.env[name] ? ethers.getAddress(process.env[name]) : '');
 
+// Is this a transient RPC/network failure (retryable) vs a real revert (fatal)?
+// 502/503/504 gateway errors, timeouts, and dropped sockets are transient — the
+// swap itself is valid, the node just hiccuped. Real contract reverts are NOT.
+function isTransientRpcError(e) {
+  if (!e) return false;
+  if (['SERVER_ERROR', 'TIMEOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ECONNREFUSED'].includes(e.code)) return true;
+  const m = String(e.shortMessage || e.message || '') + ' ' + String(e.info && e.info.responseStatus || '');
+  return /\b50[234]\b|bad gateway|gateway time|timeout|ETIMEDOUT|ECONNRESET|socket hang up|fetch failed|network error/i.test(m);
+}
+
+// Retry a transient-failing RPC op with exponential backoff. Only retries
+// transient errors (see above); a real revert throws immediately.
+async function withRetry(fn, { attempts = 4, baseDelayMs = 800, label = 'rpc', log = () => {} } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try { return await fn(); }
+    catch (e) {
+      lastErr = e;
+      if (!isTransientRpcError(e) || i === attempts) throw e;
+      const wait = baseDelayMs * Math.pow(2, i - 1);
+      log(`${label}: transient RPC error (${e.code || e.info?.responseStatus || 'err'}) — retry ${i}/${attempts - 1} in ${wait}ms`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastErr;
+}
+
 function getConfig() {
   return {
     // network + contracts — all sourced from .env (see .env.example for values)
@@ -89,7 +116,20 @@ function validateConfig(config) {
 
 function getProvider(config) {
   if (!config.rpcUrl) throw new Error('QDEX_RPC_URL not set in .env');
-  return new ethers.JsonRpcProvider(config.rpcUrl, config.chainId || undefined);
+  // QDEX_RPC_URL may be a comma-separated list → failover across endpoints.
+  const urls = String(config.rpcUrl).split(',').map((s) => s.trim()).filter(Boolean);
+  const chainId = config.chainId || undefined;
+  const network = chainId ? ethers.Network.from(chainId) : undefined;
+  // staticNetwork stops ethers' background eth_chainId polling — that background
+  // call is what 502s and throws an UNHANDLED rejection that kills the process.
+  const opts = { staticNetwork: network || true };
+  const mk = (u) => new ethers.JsonRpcProvider(u, network, opts);
+  if (urls.length <= 1) return mk(urls[0] || config.rpcUrl);
+  // Multiple endpoints: first healthy one wins (quorum 1 = no cross-checking).
+  return new ethers.FallbackProvider(
+    urls.map((u, i) => ({ provider: mk(u), priority: i + 1, stallTimeout: 2500, weight: 1 })),
+    network, { quorum: 1 }
+  );
 }
 
 function getWallet(config, provider, requireKey = false) {
@@ -129,7 +169,7 @@ function priceFromSqrt(market) {
 }
 
 async function getPoolPrice(config, provider) {
-  const market = await loadPool(config, provider);
+  const market = await withRetry(() => loadPool(config, provider), { label: 'getPoolPrice' });
   return priceFromSqrt(market);
 }
 
@@ -138,8 +178,8 @@ async function getPoolPrice(config, provider) {
 let _oracleDecimals = null;
 async function getOraclePrice(config, provider, tokenAddress) {
   const oracle = new ethers.Contract(config.oracleAddress, ORACLE_ABI, provider);
-  if (_oracleDecimals == null) _oracleDecimals = Number(await oracle.decimals());
-  const raw = await oracle.getLatestPrice(tokenAddress);
+  if (_oracleDecimals == null) _oracleDecimals = Number(await withRetry(() => oracle.decimals(), { label: 'oracle.decimals' }));
+  const raw = await withRetry(() => oracle.getLatestPrice(tokenAddress), { label: 'oracle.getLatestPrice' });
   return Number(raw) / Math.pow(10, _oracleDecimals);
 }
 
@@ -263,12 +303,25 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
     tokenIn: tokenIn.address, tokenOut: tokenOut.address, fee: m.fee,
     recipient: wallet.address, deadline, amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0
   };
-  const tx = await router.exactInputSingle(params);
-  return tx.wait();
+  // Pre-flight the gas estimate WITH retry. This is the call that was 502-ing on
+  // the flaky RPC and surfacing as a bogus "execution reverted". Retrying it here
+  // (a) rides out transient 502s and (b) if it's a REAL revert, throws the true
+  // reason instead of a null one. Then send once with an explicit gasLimit so the
+  // broadcast doesn't re-estimate (and can't be retried into a double-send).
+  const gasEst = await withRetry(() => router.exactInputSingle.estimateGas(params),
+    { attempts: 4, label: 'swap.estimateGas', log });
+  // Pin the nonce so a retried broadcast reuses the SAME nonce — if the first
+  // send actually landed, the resubmit is rejected as a duplicate (not a second
+  // swap). This makes retrying the broadcast safe against transient 502s.
+  const nonce = await withRetry(() => wallet.getNonce('pending'), { attempts: 3, label: 'swap.nonce', log });
+  const tx = await withRetry(() => router.exactInputSingle(params, { gasLimit: (gasEst * 12n) / 10n, nonce }),
+    { attempts: 2, label: 'swap.send', log });
+  return withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
 }
 
 module.exports = {
   Q96, V3_POOL_ABI, ERC20_ABI,
   getConfig, validateConfig, getProvider, getWallet, loadPool, priceFromSqrt,
-  getPoolPrice, getOraclePrice, sizeToTarget, quoteAmountOut, estimateAmountOutWei, executeSwap
+  getPoolPrice, getOraclePrice, sizeToTarget, quoteAmountOut, estimateAmountOutWei, executeSwap,
+  withRetry, isTransientRpcError
 };

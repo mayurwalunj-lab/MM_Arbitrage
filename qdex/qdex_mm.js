@@ -137,7 +137,23 @@ async function tick() {
   }
 }
 
+// Never let a transient RPC hiccup kill the process. A 502 from ethers' background
+// polling surfaces as an unhandled rejection, which (Node ≥15) exits by default —
+// that's why the MM "stopped running". Log transient ones and keep polling; only a
+// genuinely unexpected non-RPC error is treated as fatal.
+function installCrashGuards() {
+  process.on('unhandledRejection', (e) => {
+    if (lib.isTransientRpcError(e)) { log(`ignored transient RPC error (unhandledRejection): ${String(e && (e.shortMessage || e.message)).slice(0, 100)}`); return; }
+    log(`unhandledRejection: ${String(e && (e.stack || e.message || e)).slice(0, 200)}`);
+  });
+  process.on('uncaughtException', (e) => {
+    if (lib.isTransientRpcError(e)) { log(`ignored transient RPC error (uncaughtException): ${String(e && (e.shortMessage || e.message)).slice(0, 100)}`); return; }
+    log(`uncaughtException: ${String(e && (e.stack || e.message || e)).slice(0, 200)}`);
+  });
+}
+
 async function main() {
+  installCrashGuards();
   log(`QDex MM starting — ${execute ? 'LIVE (real swaps)' : 'DRY-RUN (simulate)'} poll=${pollMs}ms once=${once}`);
   try { lib.validateConfig(lib.getConfig()); }
   catch (e) { console.error(`CONFIG ERROR: ${e.message}`); process.exit(1); }
