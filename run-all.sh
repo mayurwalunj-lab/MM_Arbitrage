@@ -38,6 +38,7 @@ trap stop_all INT TERM EXIT
 
 BITMART_DIR="bitmart"
 LBANK_DIR="lbank"
+MEXC_DIR="mexc"
 DASHBOARD_DIR="dashboard"
 
 case "$MODE" in
@@ -46,15 +47,19 @@ case "$MODE" in
     start_service "bitmart-grid" "$BITMART_DIR" "grid_manager_bitmart.js"
     start_service "lbank-pattern" "$LBANK_DIR" "Lbank_Pattern_Trading.js"
     start_service "lbank-grid" "$LBANK_DIR" "LBank_GridManager.js"
+    start_service "mexc-pattern" "$MEXC_DIR" "Mexc_Pattern_Trading.js"
+    start_service "mexc-grid" "$MEXC_DIR" "MEXC_GridManager.js"
     start_service "dashboard" "$DASHBOARD_DIR" "Server.js"
     ;;
   bots)
     start_service "bitmart-pattern" "$BITMART_DIR" "Bitmart_Pattern_Trading.js"
     start_service "lbank-pattern" "$LBANK_DIR" "Lbank_Pattern_Trading.js"
+    start_service "mexc-pattern" "$MEXC_DIR" "Mexc_Pattern_Trading.js"
     ;;
   grids)
     start_service "bitmart-grid" "$BITMART_DIR" "grid_manager_bitmart.js"
     start_service "lbank-grid" "$LBANK_DIR" "LBank_GridManager.js"
+    start_service "mexc-grid" "$MEXC_DIR" "MEXC_GridManager.js"
     ;;
   bitmart)
     start_service "bitmart-pattern" "$BITMART_DIR" "Bitmart_Pattern_Trading.js"
@@ -64,17 +69,22 @@ case "$MODE" in
     start_service "lbank-pattern" "$LBANK_DIR" "Lbank_Pattern_Trading.js"
     start_service "lbank-grid" "$LBANK_DIR" "LBank_GridManager.js"
     ;;
+  mexc)
+    start_service "mexc-pattern" "$MEXC_DIR" "Mexc_Pattern_Trading.js"
+    start_service "mexc-grid" "$MEXC_DIR" "MEXC_GridManager.js"
+    ;;
   ui|dashboard)
     start_service "dashboard" "$DASHBOARD_DIR" "Server.js"
     ;;
   *)
-    echo "Usage: ./run-all.sh [all|bots|grids|bitmart|lbank|dashboard]"
+    echo "Usage: ./run-all.sh [all|bots|grids|bitmart|lbank|mexc|dashboard]"
     echo
-    echo "all       Starts Bitmart pattern + Bitmart grid + LBank pattern + LBank grid + dashboard"
-    echo "bots      Starts Bitmart pattern + LBank pattern"
-    echo "grids     Starts Bitmart grid + LBank grid"
+    echo "all       Starts Bitmart + LBank + MEXC (pattern + grid each) + dashboard"
+    echo "bots      Starts Bitmart pattern + LBank pattern + MEXC pattern"
+    echo "grids     Starts Bitmart grid + LBank grid + MEXC grid"
     echo "bitmart   Starts Bitmart pattern + Bitmart grid"
     echo "lbank     Starts LBank pattern + LBank grid"
+    echo "mexc      Starts MEXC pattern + MEXC grid"
     echo "dashboard Starts only the dashboard"
     exit 1
     ;;
@@ -84,6 +94,7 @@ echo
 echo "Services started."
 echo "Bitmart bot UI: http://localhost:5010"
 echo "LBank bot UI:   http://localhost:5001"
+echo "MEXC bot UI:    http://localhost:5003"
 echo "Dashboard:      http://localhost:5002"
 echo
 echo "Press Ctrl+C to stop all services."

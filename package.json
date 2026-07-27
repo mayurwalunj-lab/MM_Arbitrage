@@ -15,6 +15,8 @@
     "bitmart:grid": "node bitmart/grid_manager_bitmart.js",
     "lbank:pattern": "node lbank/Lbank_Pattern_Trading.js",
     "lbank:grid": "node lbank/LBank_GridManager.js",
+    "mexc:pattern": "node mexc/Mexc_Pattern_Trading.js",
+    "mexc:grid": "node mexc/MEXC_GridManager.js",
     "dashboard": "node dashboard/Server.js",
     "pm2:start": "pm2 start ecosystem.config.js",
     "pm2:restart": "pm2 restart ecosystem.config.js",

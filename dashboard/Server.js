@@ -24,6 +24,13 @@ const dbConfigs = {
         password: process.env.DB_PASSWORD || process.env.LBANK_DB_PASSWORD || '',
         database: process.env.DB_NAME || process.env.LBANK_DB_NAME || 'mm_production',
         port: parseInt(process.env.DB_PORT || process.env.LBANK_DB_PORT) || 25060
+    },
+    mexc: {
+        host: process.env.DB_HOST || process.env.MEXC_DB_HOST || '159.195.76.213',
+        user: process.env.DB_USER || process.env.MEXC_DB_USER || 'root',
+        password: process.env.DB_PASSWORD || process.env.MEXC_DB_PASSWORD || '',
+        database: process.env.DB_NAME || process.env.MEXC_DB_NAME || 'mm_production',
+        port: parseInt(process.env.DB_PORT || process.env.MEXC_DB_PORT) || 25060
     }
 };
 
@@ -40,6 +47,12 @@ const pools = {
         waitForConnections: true,
         connectionLimit: 10,
         queueLimit: 0
+    }),
+    mexc: mysql.createPool({
+        ...dbConfigs.mexc,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0
     })
 };
 
@@ -49,14 +62,19 @@ function getPool(dbName) {
     if (normalizedName === 'lbank' || normalizedName === 'marketcap') {
         return pools.lbank;
     }
+    if (normalizedName === 'mexc') {
+        return pools.mexc;
+    }
     // Default to bitmart
     return pools.bitmart;
 }
 
-// Consolidated database: both exchanges share one DB, tables are prefixed.
+// Consolidated database: all exchanges share one DB, tables are prefixed.
 function tablePrefix(dbName) {
     const normalizedName = dbName?.toLowerCase();
-    return (normalizedName === 'lbank' || normalizedName === 'marketcap') ? 'lbank_' : 'bitmart_';
+    if (normalizedName === 'lbank' || normalizedName === 'marketcap') return 'lbank_';
+    if (normalizedName === 'mexc') return 'mexc_';
+    return 'bitmart_';
 }
 
 // Test connections on startup

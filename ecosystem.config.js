@@ -21,6 +21,16 @@ module.exports = {
       cwd: __dirname
     },
     {
+      name: 'Mexc_Pattern_Trading',
+      script: 'mexc/Mexc_Pattern_Trading.js',
+      cwd: __dirname
+    },
+    {
+      name: 'MEXC_GridManager',
+      script: 'mexc/MEXC_GridManager.js',
+      cwd: __dirname
+    },
+    {
       name: 'Server',
       script: 'dashboard/Server.js',
       cwd: __dirname
