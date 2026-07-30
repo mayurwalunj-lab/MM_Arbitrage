@@ -21,11 +21,11 @@ app.get('/', (req, res) => {
 // ============================================================
 let CONFIG = {
     pair: 'L1X/USDT',
-    dailyVolumeTarget: 50000, 
+    dailyVolumeTarget: 100000, 
 
     // Time-based volume target
     timeTargetEnabled: true,
-    timeTargetVolume: 50000,
+    timeTargetVolume: 100000,
     timeTargetHours: 24,
     
     // SAFETY BUFFER (USD)
@@ -43,8 +43,8 @@ let CONFIG = {
     checkPressureEveryMinutes: 5, 
 
     // Volume Trade Settings
-    minTradeSize: 6,       
-    maxTradeSize: 11,
+    minTradeSize: 15,       
+    maxTradeSize: 30,
 
     // Trend phase durations (minutes) - dry run simulation only
     trendUpMinMinutes: 15,
@@ -586,7 +586,7 @@ function calculateOrganicSleep(startTime, currentVol) {
 
     const tradesNeeded = Math.max(1, Math.ceil(remainingVol / avgUsdPerTrade));
     const desiredSleepMs = Math.floor(remainingMs / tradesNeeded);
-    const sleepMs = Math.max(1000, Math.min(30000, desiredSleepMs));
+    const sleepMs = Math.max(1000, Math.min(15000, desiredSleepMs)); // 15s max cap (was 30s) for higher throughput
     return { sleepMs };
 }
 
