@@ -875,7 +875,10 @@ async function startGridManager() {
         secret: GRID_CONFIG.bot.secret,
         ...exchangeOptions
     });
-    
+    // LBank's fetchCurrencies hits /v2/withdrawConfigs.do (heavily rate-limited,
+    // 429) and blocks startup. The grid only trades, so skip currency loading.
+    gridBot.has.fetchCurrencies = false;
+
     try {
         await gridBot.loadMarkets();
         log("✅ Connected to LBank", 'info');
