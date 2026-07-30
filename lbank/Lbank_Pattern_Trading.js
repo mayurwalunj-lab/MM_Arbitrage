@@ -646,6 +646,10 @@ async function runLiveEngine() {
         // assign the module-level botA/botB (no `let` — so cancelAllOrders can reuse them)
         botA = new ccxt.lbank({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret, ...exOpt });
         botB = new ccxt.lbank({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret, ...exOpt });
+        // LBank's fetchCurrencies hits /v2/withdrawConfigs.do, which is heavily
+        // rate-limited (429) and blocks startup + cancelAllOrders. We only trade,
+        // so skip currency loading entirely — loadMarkets then only needs markets.
+        botA.has.fetchCurrencies = false; botB.has.fetchCurrencies = false;
         if(!CONFIG.dryRun) { await botA.loadMarkets(); await botB.loadMarkets(); }
     } catch(e) { isRunning = false; return broadcastLog("❌ Init Failed: " + e.message, 'warn'); }
 
@@ -905,6 +909,8 @@ async function cancelAllOrders() {
         // call, which is what tripped LBank's Cloudflare rate-limit and crashed.
         const a = botA || new ccxt.lbank({ apiKey: CONFIG.botA.apiKey, secret: CONFIG.botA.secret, enableRateLimit: true });
         const b = botB || new ccxt.lbank({ apiKey: CONFIG.botB.apiKey, secret: CONFIG.botB.secret, enableRateLimit: true });
+        // skip fetchCurrencies (withdrawConfigs.do 429) on freshly-made fallbacks too
+        a.has.fetchCurrencies = false; b.has.fetchCurrencies = false;
         await a.cancelAllOrders(CONFIG.pair);
         await b.cancelAllOrders(CONFIG.pair);
         broadcastLog("🚨 EMERGENCY STOP: All Orders Cancelled.", 'warn');
