@@ -320,19 +320,32 @@ async function checkBalances(bot) {
         return balanceCache.data;
     }
     
-    try {
-        const bal = await bot.fetchBalance();
-        const result = {
-            usdt: bal['USDT'] ? bal['USDT'].free : 0,
-            l1x: bal['L1X'] ? bal['L1X'].free : 0
-        };
-        balanceCache.data = result;
-        balanceCache.timestamp = now;
-        return result;
-    } catch (e) {
-        log(`⚠️ Balance fetch error: ${e.message}`, 'warn');
-        return { usdt: 0, l1x: 0 };
+    // Retry transient LBank balance errors ("Internal error", 429, timeouts)
+    // before giving up — a FAILED fetch is not an EMPTY wallet.
+    let lastErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const bal = await bot.fetchBalance();
+            const result = {
+                usdt: bal['USDT'] ? bal['USDT'].free : 0,
+                l1x: bal['L1X'] ? bal['L1X'].free : 0
+            };
+            balanceCache.data = result;
+            balanceCache.timestamp = now;
+            return result;
+        } catch (e) {
+            lastErr = e;
+            if (attempt < 3) await delay(1500 * attempt);
+        }
     }
+    // All retries failed. Prefer the last-known-good balance over reporting zero
+    // (which would wrongly trip "WALLETS EMPTY" and skip the whole grid).
+    log(`⚠️ Balance fetch failed after retries: ${lastErr && lastErr.message}`, 'warn');
+    if (balanceCache.data) {
+        log(`↩️ Using last-known balances (USDT=${balanceCache.data.usdt}, L1X=${balanceCache.data.l1x})`, 'warn');
+        return balanceCache.data;
+    }
+    return null; // unknown (never fetched successfully) — caller must NOT treat as empty
 }
 
 async function fetchOpenOrdersCached(bot, pair) {
@@ -438,6 +451,12 @@ async function maintainGrid(bot, centerPrice, symbol) {
     
     const botBals = await checkBalances(bot);
     if (!isRunning) return;
+    // null = balance API unavailable (not empty). Keep existing orders in place and
+    // retry next refresh — do NOT cancel or claim wallets empty on a transient error.
+    if (!botBals) {
+        log("⚠️ Balances unavailable (API error) — keeping existing orders, retrying next refresh.", 'warn');
+        return;
+    }
     const canBuy = botBals.usdt > GRID_CONFIG.minUsdtBalance;
     const canSell = botBals.l1x > GRID_CONFIG.minL1xBalance;
 
@@ -702,8 +721,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
                 const currentBal = await checkBalances(bot);
                 
                 const orderSizeUsdt = parseFloat(newOrder.price) * parseFloat(newOrder.amount);
-                if (currentBal.usdt < orderSizeUsdt) {
-                    log(`⚠️ Insufficient USDT for buy order ${i+1}. Need $${orderSizeUsdt.toFixed(2)}, have $${currentBal.usdt.toFixed(2)}`, 'warn');
+                if (!currentBal || currentBal.usdt < orderSizeUsdt) {
+                    log(`⚠️ Insufficient/unknown USDT for buy order ${i+1}. Need $${orderSizeUsdt.toFixed(2)}, have $${currentBal ? currentBal.usdt.toFixed(2) : 'n/a'}`, 'warn');
                     await delay(delayPerOperation); // Still wait to maintain timing
                     continue;
                 }
@@ -780,8 +799,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
                 invalidateBalanceCache();
                 const currentBal = await checkBalances(bot);
                 
-                if (currentBal.l1x < parseFloat(newOrder.amount)) {
-                    log(`⚠️ Insufficient L1X for sell order ${i+1}. Need ${newOrder.amount}, have ${currentBal.l1x.toFixed(4)}`, 'warn');
+                if (!currentBal || currentBal.l1x < parseFloat(newOrder.amount)) {
+                    log(`⚠️ Insufficient/unknown L1X for sell order ${i+1}. Need ${newOrder.amount}, have ${currentBal ? currentBal.l1x.toFixed(4) : 'n/a'}`, 'warn');
                     await delay(delayPerOperation); // Still wait to maintain timing
                     continue;
                 }
