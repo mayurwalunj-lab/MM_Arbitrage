@@ -535,12 +535,25 @@ async function cancelPendingOrders(botA, botB) {
     } catch (e) {}
 }
 
+// ccxt's lbank.fetchBalance() calls /supplement/user_info.do, which returns
+// "Internal error" for this account (auth is fine — other signed calls work).
+// /supplement/user_info_account.do works and returns clean {asset,free,locked}.
+async function lbankSpotBalance(bot) {
+    const r = await bot.spotPrivatePostSupplementUserInfoAccount({});
+    const rows = (r && r.data && r.data.balances) || [];
+    const out = {};
+    for (const row of rows) {
+        out[String(row.asset || '').toUpperCase()] = { free: parseFloat(row.free) || 0, used: parseFloat(row.locked) || 0 };
+    }
+    return out;
+}
+
 async function checkBalances(bot, botName) {
     if (CONFIG.dryRun) return balances[botName];
     const now = Date.now();
     if (balanceCache[botName].data && (now - balanceCache[botName].timestamp) < BALANCE_CACHE_TTL) return balanceCache[botName].data;
     try {
-        const bal = await bot.fetchBalance();
+        const bal = await lbankSpotBalance(bot);
         const res = { usdt: bal['USDT'] ? bal['USDT'].free : 0, l1x: bal['L1X'] ? bal['L1X'].free : 0 };
         balanceCache[botName] = { data: res, timestamp: now };
         return res;

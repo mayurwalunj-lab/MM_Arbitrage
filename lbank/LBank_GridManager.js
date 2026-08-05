@@ -310,6 +310,20 @@ async function detectAndLogFilledOrders(openGridOrderIds) {
 // ============================================================
 // API FUNCTIONS
 // ============================================================
+// ccxt's lbank.fetchBalance() calls /supplement/user_info.do, which returns
+// "Internal error" for this account (auth is fine — other signed calls work).
+// /supplement/user_info_account.do works and returns clean {asset,free,locked}
+// rows, so read balances directly from it.
+async function lbankSpotBalance(bot) {
+    const r = await bot.spotPrivatePostSupplementUserInfoAccount({});
+    const rows = (r && r.data && r.data.balances) || [];
+    const out = {};
+    for (const row of rows) {
+        out[String(row.asset || '').toUpperCase()] = { free: parseFloat(row.free) || 0, used: parseFloat(row.locked) || 0 };
+    }
+    return out;
+}
+
 async function checkBalances(bot) {
     if (GRID_CONFIG.dryRun) {
         return { usdt: 10000, l1x: 1000 }; // Simulated balances
@@ -325,7 +339,7 @@ async function checkBalances(bot) {
     let lastErr;
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            const bal = await bot.fetchBalance();
+            const bal = await lbankSpotBalance(bot);
             const result = {
                 usdt: bal['USDT'] ? bal['USDT'].free : 0,
                 l1x: bal['L1X'] ? bal['L1X'].free : 0
