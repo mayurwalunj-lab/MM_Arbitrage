@@ -703,7 +703,7 @@ async function runLiveEngine() {
             let bandFloor = CONFIG.hardFloorPrice, bandResist = CONFIG.hardResistancePrice, bandMinAsk = CONFIG.minBestAskToTrade;
             if (priceBand.isEnabled()) {
                 try {
-                    const band = await priceBand.getBand(lastMid || (CONFIG.hardFloorPrice + CONFIG.hardResistancePrice) / 2);
+                    const band = await priceBand.getBand(lastMid); // 0/falsy => seed from the DEX, never a stale static mid (avoids false freeze)
                     bandFloor = band.floor; bandResist = band.resistance; bandMinAsk = band.minAsk;
                     if (band.moved || band.frozen) broadcastLog(`📊 BAND center $${band.center.toFixed(4)} [$${bandFloor.toFixed(4)}–$${bandResist.toFixed(4)}] DEX $${band.dexPrice ? band.dexPrice.toFixed(4) : 'n/a'}${band.frozen ? ' FROZEN(' + band.reason + ')' : ''}`, 'info');
                 } catch (e) { broadcastLog(`⚠️ band unavailable, using fixed box: ${String(e.message).slice(0, 60)}`, 'warn'); }
