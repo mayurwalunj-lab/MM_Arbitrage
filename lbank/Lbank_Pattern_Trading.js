@@ -701,10 +701,11 @@ async function runLiveEngine() {
             // 0. DYNAMIC BAND — follow the DEX (only if DYNAMIC_BAND=true; else the
             //    fixed CONFIG box, so behavior is unchanged when off).
             let bandFloor = CONFIG.hardFloorPrice, bandResist = CONFIG.hardResistancePrice, bandMinAsk = CONFIG.minBestAskToTrade;
+            let bandFrozen = false, bandReason = 'ok';
             if (priceBand.isEnabled()) {
                 try {
                     const band = await priceBand.getBand(lastMid); // 0/falsy => seed from the DEX, never a stale static mid (avoids false freeze)
-                    bandFloor = band.floor; bandResist = band.resistance; bandMinAsk = band.minAsk;
+                    bandFloor = band.floor; bandResist = band.resistance; bandMinAsk = band.minAsk; bandFrozen = !!band.frozen; bandReason = band.reason || 'ok';
                     if (band.moved || band.frozen) broadcastLog(`📊 BAND center $${band.center.toFixed(4)} [$${bandFloor.toFixed(4)}–$${bandResist.toFixed(4)}] DEX $${band.dexPrice ? band.dexPrice.toFixed(4) : 'n/a'}${band.frozen ? ' FROZEN(' + band.reason + ')' : ''}`, 'info');
                 } catch (e) { broadcastLog(`⚠️ band unavailable, using fixed box: ${String(e.message).slice(0, 60)}`, 'warn'); }
             }
@@ -732,26 +733,39 @@ async function runLiveEngine() {
                 lastMid = (bestBid + bestAsk) / 2;
             }
 
-            // 2. STRICT GATEKEEPER CHECK
-            const minAskLimit = Number(bandMinAsk);
-            if (bestAsk < minAskLimit) {
-                broadcastLog(`🛑 GATEKEEPER: Best Ask (${bestAsk.toFixed(4)}) < Min Limit (${minAskLimit}). Waiting.`, 'warn');
+            // 2. SAFETY GATES — stand down ONLY when the band is FROZEN (a big DEX
+            //    spike the treasury handles) or the market has crashed below the
+            //    absolute floor. Everything else trades for volume (step 3).
+            const _bandCfg = priceBand.isEnabled() ? priceBand.config() : null;
+            const fenceLo = _bandCfg ? _bandCfg.absMin : CONFIG.hardFloorPrice;
+            const fenceHi = _bandCfg ? _bandCfg.absMax : CONFIG.hardResistancePrice;
+            if (bandFrozen) {
+                broadcastLog(`❄️ Band frozen (${bandReason}) — standing down; treasury handles it.`, 'warn');
+                await delay(5000); continue;
+            }
+            if (bestAsk < fenceLo) {
+                broadcastLog(`🛑 GATEKEEPER: Best Ask (${bestAsk.toFixed(4)}) < floor ($${Number(fenceLo).toFixed(4)}). Waiting.`, 'warn');
                 await delay(5000); continue;
             }
 
-            // 3. DEFINE VALID TRADING BAND
-            let lowerBound = Math.max(bestBid + CONFIG.safeZoneBuffer, bandFloor);
-            let upperBound = Math.min(bestAsk - CONFIG.safeZoneBuffer, bandResist);
+            // 3. VALID TRADING ZONE — generate volume within the CURRENT MARKET
+            //    spread, bounded by the absolute safety fence. The tight band box no
+            //    longer gates volume: a buy-only bot can't hold price to a moving
+            //    box, so gating on it caused the recurring "No trade room" whenever
+            //    the (thin, jumpy) DEX and the CEX diverged. The GRID follows the
+            //    band center for price structure; the pattern bot just does volume.
+            let lowerBound = Math.max(bestBid + CONFIG.safeZoneBuffer, fenceLo);
+            let upperBound = Math.min(bestAsk - CONFIG.safeZoneBuffer, fenceHi);
 
             if (lowerBound >= upperBound) {
-                broadcastLog(`⚠️ No trade room. Spread: ${bestBid.toFixed(4)}-${bestAsk.toFixed(4)} vs Limits: ${bandFloor.toFixed(4)}-${bandResist.toFixed(4)}`, 'warn');
+                broadcastLog(`⚠️ No trade room. Spread ${bestBid.toFixed(4)}-${bestAsk.toFixed(4)} outside fence [$${Number(fenceLo).toFixed(2)}-$${Number(fenceHi).toFixed(2)}] or tighter than buffer.`, 'warn');
                 await delay(5000); continue;
             }
 
             // 4. NATURAL PRICE CALCULATION
             const currentMid = (bestBid + bestAsk) / 2;
             lastMid = currentMid;
-            updateMicroTrend(currentMid, bandFloor, bandResist);
+            updateMicroTrend(currentMid, lowerBound, upperBound);
 
             const now = Date.now();
             const progress = Math.max(0, Math.min(1, (now - microTrend.startTime) / (microTrend.endTime - microTrend.startTime)));
