@@ -54,8 +54,14 @@ const envAddr = (name) => (process.env[name] ? ethers.getAddress(process.env[nam
 function isTransientRpcError(e) {
   if (!e) return false;
   if (['SERVER_ERROR', 'TIMEOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ECONNREFUSED'].includes(e.code)) return true;
-  const m = String(e.shortMessage || e.message || '') + ' ' + String(e.info && e.info.responseStatus || '');
-  return /\b50[234]\b|bad gateway|gateway time|timeout|ETIMEDOUT|ECONNRESET|socket hang up|fetch failed|network error/i.test(m);
+  // JSON-RPC server / load-balancer / backend failures (e.g. -32001 "All backend
+  // attempts failed") — the upstream node pool failed the request; retry it.
+  const rpcCode = (e.error && typeof e.error.code === 'number') ? e.error.code : null;
+  if ([-32000, -32001, -32002, -32003, -32005, -32603].includes(rpcCode)) return true;
+  // scan every field a message might hide in, including the nested rpc error.
+  const m = [e.shortMessage, e.message, e.error && e.error.message, e.info && e.info.responseStatus]
+    .map((x) => String(x || '')).join(' ');
+  return /\b50[234]\b|bad gateway|gateway time|timeout|ETIMEDOUT|ECONNRESET|socket hang up|fetch failed|network error|all backend attempts failed|could not coalesce|too many request|rate lim/i.test(m);
 }
 
 // Retry a transient-failing RPC op with exponential backoff. Only retries
