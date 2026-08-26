@@ -283,12 +283,20 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
   const amountInHuman = side === 'sell' ? amountBase : amountBase * px;
   const amountIn = ethers.parseUnits(amountInHuman.toFixed(tokenIn.decimals), tokenIn.decimals);
 
+  // Allocate this swap's nonces as ONE local sequence instead of asking the node
+  // before each send. getNonce('pending') can lag the transactions already
+  // broadcast on this RPC — observed in practice — and if the swap then draws the
+  // approve's nonce it REPLACES it: the approve never lands and the swap reverts
+  // for having no allowance. Seeded from 'latest' because every send below awaits
+  // its receipt, so nothing of ours should be in flight when we start.
+  let nextNonce = await withRetry(() => wallet.getNonce('latest'), { attempts: 3, label: 'swap.nonceSeed', log });
+
   // approve router if needed
   const erc = new ethers.Contract(tokenIn.address, ERC20_ABI, wallet);
   const allowance = await erc.allowance(wallet.address, config.routerAddress);
   if (allowance < amountIn) {
     log(`approving ${tokenIn.symbol} to router...`);
-    const atx = await erc.approve(config.routerAddress, ethers.MaxUint256);
+    const atx = await erc.approve(config.routerAddress, ethers.MaxUint256, { nonce: nextNonce++ });
     await atx.wait();
   }
 
@@ -316,10 +324,11 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
   // broadcast doesn't re-estimate (and can't be retried into a double-send).
   const gasEst = await withRetry(() => router.exactInputSingle.estimateGas(params),
     { attempts: 4, label: 'swap.estimateGas', log });
-  // Pin the nonce so a retried broadcast reuses the SAME nonce — if the first
-  // send actually landed, the resubmit is rejected as a duplicate (not a second
-  // swap). This makes retrying the broadcast safe against transient 502s.
-  const nonce = await withRetry(() => wallet.getNonce('pending'), { attempts: 3, label: 'swap.nonce', log });
+  // Next in the local sequence — one past the approve if one was sent. Pinning it
+  // also makes a retried broadcast safe: the resubmit reuses the SAME nonce, so
+  // if the first send actually landed it is rejected as a duplicate rather than
+  // becoming a second swap.
+  const nonce = nextNonce++;
   const tx = await withRetry(() => router.exactInputSingle(params, { gasLimit: (gasEst * 12n) / 10n, nonce }),
     { attempts: 2, label: 'swap.send', log });
   return withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
