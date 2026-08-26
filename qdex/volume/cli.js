@@ -147,8 +147,51 @@ async function cmdExport() {
   console.log(`  private key : ${privateKey}\n`);
 }
 
+// Resolve rows the bot broadcast but could not confirm. Each one is a
+// transaction that may or may not have moved funds; leaving them unresolved
+// means the trade log does not match the chain.
+async function cmdReconcile(config) {
+  await db.init();
+  const { provider } = await withChain(config);
+  const [rows] = await db.query(
+    `SELECT id, tx_hash, wallet_address, pool_label, side, amount_in, amount_in_symbol
+     FROM qdex_volume_trades WHERE status = 'unconfirmed' AND tx_hash IS NOT NULL ORDER BY id`);
+  if (!rows.length) { console.log('\n  nothing to reconcile — no unconfirmed transactions\n'); return; }
+
+  console.log(`\n  ${rows.length} unconfirmed transaction(s):\n`);
+  let resolved = 0, stillPending = 0;
+  for (const r of rows) {
+    let rc = null;
+    try { rc = await provider.getTransactionReceipt(r.tx_hash); }
+    catch (e) { console.log(`  ${r.tx_hash}  RPC error: ${String(e.shortMessage || e.message).slice(0, 60)}`); continue; }
+
+    if (!rc) {
+      const tx = await provider.getTransaction(r.tx_hash).catch(() => null);
+      if (tx) { console.log(`  ${r.tx_hash}  STILL PENDING in the mempool — re-run later`); stillPending++; }
+      else {
+        // Never mined and no longer known to the node: it was dropped, so no
+        // funds moved. Safe to file as failed.
+        await db.query(`UPDATE qdex_volume_trades SET status='failed', reason=CONCAT(COALESCE(reason,''),' | reconciled: dropped, never mined') WHERE id=?`, [r.id]);
+        console.log(`  ${r.tx_hash}  DROPPED — never mined, recorded as failed`);
+        resolved++;
+      }
+      continue;
+    }
+    const ok = rc.status === 1;
+    await db.query(
+      `UPDATE qdex_volume_trades SET status=?, block_number=?, gas_used=?, reason=CONCAT(COALESCE(reason,''),' | reconciled') WHERE id=?`,
+      [ok ? 'executed' : 'failed', Number(rc.blockNumber), rc.gasUsed != null ? rc.gasUsed.toString() : null, r.id]);
+    console.log(`  ${r.tx_hash}  ${ok ? 'CONFIRMED' : 'REVERTED'} in block ${rc.blockNumber}  (${r.pool_label} ${r.side} ${r.amount_in} ${r.amount_in_symbol})`);
+    resolved++;
+  }
+  console.log(`\n  resolved ${resolved}, still pending ${stillPending}`);
+  if (!stillPending) console.log('  safe to resume:  npm run qdex:vol:resume\n');
+  else console.log('  re-run reconcile once the pending ones settle before resuming\n');
+}
+
 const COMMANDS = {
   epoch: cmdEpoch,
+  reconcile: cmdReconcile,
   'epoch:new': cmdEpochNew,
   fund: cmdFund,
   sweep: cmdSweep,

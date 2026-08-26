@@ -217,6 +217,36 @@ The harness probes each router once for which `exactInputSingle` shape it speaks
   empty — it means price sits outside every LP range. Such a pool can hold real
   reserves while being untradeable at the current price.
 
+## Failure modes
+
+| Scenario | What happens |
+|---|---|
+| **Swap reverts** | Caught, recorded `failed` with the revert reason, wallet moves on. `QVT_MAX_CONSECUTIVE_FAILURES` in a row trips the emergency stop. Funds never left the wallet. |
+| **Broadcast, then can't confirm** | The transaction may still be mined, so it is **not** recorded as failed. It is filed `unconfirmed` **with the tx hash**, and the bot stops immediately — trading on a possibly-stale balance is how you get a double spend. Resolve with `npm run qdex:vol:reconcile`. |
+| **Retried send after the first landed** | Impossible to double-spend: the nonce is pinned before the first attempt, so a resubmit is rejected by the node as a duplicate. |
+| **Transient RPC error (502, `-32001`)** | Retried with exponential backoff. Deliberately *not* counted as a transaction failure — the swap never ran. |
+| **RPC endpoint is simply down** | The retry streak is counted separately. `QVT_MAX_CONSECUTIVE_RPC_ERRORS` (default 25) trips the stop, with growing backoff meanwhile, so a dead endpoint surfaces instead of spinning silently. |
+| **Two bots started at once** | The second refuses to start and exits 1. Without this they would draw the same nonce for the same wallet and one transaction would replace the other. |
+| **Process crashed, lock left behind** | The lock records a PID; a lock whose process is gone is taken over automatically. A crash never needs manual cleanup. |
+| **Wallet out of gas mid-run** | Skipped with a reason, next wallet is tried. |
+| **Wallet out of gas at sweep time** | The parent tops it up first — `ensureSweepGas` prices the whole sweep (one leg per token, plus WL1X, plus the native drain) and funds the shortfall. Without this a wallet that burned its gas trading would have its token bags **stranded permanently**. |
+| **Wallet runs out of WL1X** | Peer transfer from the wallet with the largest surplus; a donor may never drop below its own floor. If the whole fleet is short, the parent backstops. If the parent is dry too, it says so and skips. |
+| **Keyfile lost** | Keys are recoverable from the database with `QVT_KEY_ENCRYPTION_KEY`. |
+| **Database lost** | Keys are recoverable from the keyfile mnemonic. |
+| **Both lost** | Funds are unrecoverable. Back up at least one. |
+
+### Reconciling
+
+```bash
+npm run qdex:vol:reconcile
+```
+
+For each `unconfirmed` row it fetches the receipt and settles it: mined and
+successful → `executed` with block and gas; mined and reverted → `failed`;
+dropped from the mempool and unknown to the node → `failed`, no funds moved.
+Anything still pending is reported and left alone. Once nothing is pending,
+`npm run qdex:vol:resume` clears the stop flag.
+
 ## Fee burn
 
 A buy-then-sell round trip pays the pool fee twice. At 100 tx/hr, 0.3 WL1X

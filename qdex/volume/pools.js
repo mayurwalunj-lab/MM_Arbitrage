@@ -212,7 +212,17 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   const tx = await lib.withRetry(
     () => c.exactInputSingle(paramsFor(variant, raw), { gasLimit: (gasEst * 12n) / 10n, nonce }),
     { attempts: 2, label: 'swap.send', log });
-  return lib.withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
+  try {
+    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
+  } catch (e) {
+    // The transaction WAS broadcast — we simply could not confirm it. It may yet
+    // be mined. Losing the hash here would leave funds moved with no record, so
+    // attach it and let the caller file the row as UNCONFIRMED rather than failed.
+    e.broadcastHash = tx.hash;
+    e.broadcastNonce = nonce;
+    e.unconfirmed = true;
+    throw e;
+  }
 }
 
 module.exports = { Q96, V3_POOL_ABI, loadMarket, price, priceFrom, maxSizeAtImpact, quote, quoteWithinImpact, executeSwap, ensureAllowance };

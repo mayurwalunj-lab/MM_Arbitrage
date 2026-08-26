@@ -118,9 +118,34 @@ async function rebalanceWallet({ provider, recipient, snapshots, signers, parent
   return { kind: 'backstop', amount };
 }
 
+// A wallet that spent all its native gas on trading cannot pay for its own
+// sweep — its token bags would be stranded with no way to move them. So before
+// sweeping, work out what the sweep will cost and have the parent top it up.
+// Without this, "money stuck" is a real outcome rather than a theoretical one.
+async function ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log }) {
+  const legs = Object.values(snapshot.tokens).filter((t) => t.raw > 0n).length
+    + (snapshot.wl1xRaw > 0n ? 1 : 0)
+    + 1; // the native drain itself
+  const fee = await provider.getFeeData();
+  const gasPrice = fee.maxFeePerGas ?? fee.gasPrice ?? ethers.parseUnits('1', 'gwei');
+  // ERC-20 transfers are ~65k gas; 2x headroom, plus the 21k native leg.
+  const needed = gasPrice * (BigInt(legs) * 130000n + 21000n);
+  if (snapshot.nativeRaw >= needed) return 0n;
+
+  const top = needed - snapshot.nativeRaw;
+  log(`w${signer.idx} needs ${ethers.formatEther(top)} more L1X to afford its own sweep (${legs} legs) — topping up from parent`);
+  let hash = null;
+  if (execute) hash = (await transferNative({ signer: parent, to: signer.address, amountWei: top, log }))?.hash;
+  await record({ kind: 'backstop', from: parent.address, to: signer.address, token: null, tokenSymbol: 'L1X',
+    amount: Number(ethers.formatEther(top)), txHash: hash, reason: 'gas for sweep' });
+  return top;
+}
+
 // ---- sweep: sub-wallet -> parent, IN KIND (no swaps) ----
 async function sweepWallet({ provider, signer, parent, snapshot, config, execute, record, log }) {
   const moved = [];
+  const toppedUp = await ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log });
+  if (toppedUp > 0n) snapshot = { ...snapshot, nativeRaw: snapshot.nativeRaw + toppedUp };
 
   // 1. every non-zero pool token, as-is
   for (const [addr, t] of Object.entries(snapshot.tokens)) {
@@ -195,4 +220,4 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
   }
 }
 
-module.exports = { transferToken, transferNative, nativeSweepReserve, fundWallets, rebalanceWallet, chooseDonor, sweepWallet, distributeInKind };
+module.exports = { transferToken, transferNative, nativeSweepReserve, ensureSweepGas, fundWallets, rebalanceWallet, chooseDonor, sweepWallet, distributeInKind };

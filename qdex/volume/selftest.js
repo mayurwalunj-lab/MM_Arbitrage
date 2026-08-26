@@ -9,6 +9,7 @@
 //   node qdex/volume/selftest.js
 
 const assert = require('assert');
+const path = require('path');
 const { ethers } = require('ethers');
 
 const crypto = require('./crypto');
@@ -110,6 +111,51 @@ test('session notional budget trips the stop', () => {
   s.recordSuccess(3); s.recordSuccess(3);
   assert.strictEqual(s.shouldStop(), true);
   assert.match(s.reason, /notional budget/);
+});
+
+test('a persistent RPC outage eventually trips the stop', () => {
+  const s = new guards.StopController({ maxConsecutiveFailures: 99, maxConsecutiveRpcErrors: 4, stopFile: null, maxSessionTx: 0, maxSessionNotionalWl1x: 0, maxRuntimeMin: 0 });
+  for (let i = 0; i < 3; i++) s.recordRpcError();
+  assert.strictEqual(s.stopped, false, 'must tolerate a short outage');
+  s.recordRpcError();
+  assert.strictEqual(s.stopped, true);
+  assert.match(s.reason, /RPC failures/);
+});
+
+test('RPC errors do not count as transaction failures', () => {
+  const s = new guards.StopController({ maxConsecutiveFailures: 2, maxConsecutiveRpcErrors: 0, stopFile: null, maxSessionTx: 0, maxSessionNotionalWl1x: 0, maxRuntimeMin: 0 });
+  for (let i = 0; i < 50; i++) s.recordRpcError();
+  assert.strictEqual(s.stopped, false, 'a swap that never ran is not a swap that failed');
+});
+
+// ---------------------------------------------------------------- instance lock
+const os = require('os');
+const fsx = require('fs');
+const lockPath = path.join(os.tmpdir(), `qvt-selftest-${process.pid}.LOCK`);
+
+test('the lock is taken when free and refused while held', () => {
+  fsx.rmSync(lockPath, { force: true });
+  assert.strictEqual(guards.acquireLock(lockPath).ok, true);
+  const second = guards.acquireLock(lockPath);
+  assert.strictEqual(second.ok, false, 'a live holder must block a second instance');
+  assert.match(second.reason, /still running/);
+  guards.releaseLock(lockPath);
+  assert.strictEqual(fsx.existsSync(lockPath), false, 'release must remove the file');
+});
+
+test('a lock left by a dead process is taken over, not honoured forever', () => {
+  // PID 2^22 - 1 is above every platform's pid_max, so it cannot be alive.
+  fsx.writeFileSync(lockPath, JSON.stringify({ pid: 4194303, startedAt: '2020-01-01T00:00:00Z' }));
+  const r = guards.acquireLock(lockPath);
+  assert.strictEqual(r.ok, true, 'a crashed run must not need manual cleanup');
+  guards.releaseLock(lockPath);
+});
+
+test('a corrupt lock file does not wedge the bot', () => {
+  fsx.writeFileSync(lockPath, 'not json at all');
+  assert.strictEqual(guards.acquireLock(lockPath).ok, true);
+  guards.releaseLock(lockPath);
+  fsx.rmSync(lockPath, { force: true });
 });
 
 // ---------------------------------------------------------------- side choice

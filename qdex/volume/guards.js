@@ -11,6 +11,38 @@
 
 const fs = require('fs');
 
+// Single-instance lock. Two bots sharing one epoch would draw the same nonce for
+// the same wallet at the same time: one transaction replaces the other, or both
+// fail. Nothing else in the design prevents that, so it is prevented here.
+// A lock whose PID is no longer alive is treated as stale and taken over — a
+// crashed process must not require manual cleanup before the bot can restart.
+function acquireLock(lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8');
+    const prev = JSON.parse(raw);
+    let alive = false;
+    try { process.kill(prev.pid, 0); alive = true; } catch { alive = false; }
+    if (alive) {
+      return { ok: false, holder: prev, reason: `pid ${prev.pid} is still running (started ${prev.startedAt})` };
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      // Unreadable or corrupt lock: safest to overwrite it, but say so.
+      if (e instanceof SyntaxError) { /* fall through and take the lock */ }
+      else return { ok: false, holder: null, reason: `cannot read lock file: ${e.message}` };
+    }
+  }
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), { mode: 0o600 });
+  return { ok: true };
+}
+
+function releaseLock(lockPath) {
+  try {
+    const prev = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    if (prev.pid === process.pid) fs.unlinkSync(lockPath);
+  } catch { /* nothing to release */ }
+}
+
 // Sliding-window limiter. A fixed bucket would allow 2x the cap across a window
 // boundary; this counts the trailing hour exactly.
 class RateLimiter {
@@ -39,6 +71,7 @@ class StopController {
     this.stopped = false;
     this.reason = null;
     this.consecutiveFailures = 0;
+    this.consecutiveRpcErrors = 0;
     this.startedAt = Date.now();
     this.txCount = 0;
     this.notionalWl1x = 0;
@@ -62,6 +95,7 @@ class StopController {
   }
   recordSuccess(notionalWl1x = 0) {
     this.consecutiveFailures = 0;
+    this.consecutiveRpcErrors = 0;
     this.txCount++;
     this.notionalWl1x += notionalWl1x;
   }
@@ -69,6 +103,17 @@ class StopController {
     this.consecutiveFailures++;
     if (this.consecutiveFailures >= this.config.maxConsecutiveFailures) {
       this.trip(`${this.consecutiveFailures} consecutive transaction failures`);
+    }
+  }
+  // Transient RPC errors are deliberately NOT counted as transaction failures —
+  // the swap was never the problem and retrying is correct. But an RPC that is
+  // simply down would otherwise spin forever without anyone being told, so a long
+  // unbroken streak trips the stop on its own.
+  recordRpcError() {
+    this.consecutiveRpcErrors++;
+    const limit = this.config.maxConsecutiveRpcErrors || 0;
+    if (limit > 0 && this.consecutiveRpcErrors >= limit) {
+      this.trip(`${this.consecutiveRpcErrors} consecutive RPC failures — the endpoint looks down`);
     }
   }
   // Checked before every trade. Returns true when the loop must exit.
@@ -142,4 +187,4 @@ function logUniform(lo, hi, rng = Math.random) {
   return Math.exp(randBetween(Math.log(lo), Math.log(hi), rng));
 }
 
-module.exports = { RateLimiter, StopController, AnchorBook, chooseSide, weightedPick, randBetween, logUniform };
+module.exports = { RateLimiter, StopController, AnchorBook, chooseSide, weightedPick, randBetween, logUniform, acquireLock, releaseLock };

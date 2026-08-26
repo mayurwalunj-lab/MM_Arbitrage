@@ -121,6 +121,8 @@ function getConfig() {
     maxSessionNotionalWl1x: envNum('QVT_MAX_SESSION_NOTIONAL_WL1X', 0),
     maxRuntimeMin: envNum('QVT_MAX_RUNTIME_MIN', 0),
     maxConsecutiveFailures: envNum('QVT_MAX_CONSECUTIVE_FAILURES', 5),
+    maxConsecutiveRpcErrors: envNum('QVT_MAX_CONSECUTIVE_RPC_ERRORS', 25),
+    lockFile: process.env.QVT_LOCK_FILE || require('path').join(__dirname, '.LOCK'),
     stopFile: process.env.QVT_STOP_FILE || require('path').join(__dirname, '.STOP'),
 
     // ---- identification: this is test activity and is labelled as such ----

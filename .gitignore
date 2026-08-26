@@ -14,6 +14,7 @@ arb/state/
 qdex/volume/.wallets*.json
 qdex/volume/.wallets*.bak
 qdex/volume/.STOP
+qdex/volume/.LOCK
 
 # Legacy per-project installs
 Market_Making_Bitmart/node_modules/

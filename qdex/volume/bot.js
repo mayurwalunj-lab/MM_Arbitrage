@@ -155,6 +155,17 @@ async function run() {
     process.exit(1);
   }
 
+  // Single-instance lock. Two bots on one epoch would draw the same nonce for the
+  // same wallet: one transaction replaces the other, or both revert.
+  const lock = guards.acquireLock(config.lockFile);
+  if (!lock.ok) {
+    console.error(`\nRefusing to start: another instance holds the lock — ${lock.reason}`);
+    console.error(`  lock file: ${config.lockFile}\n  If you are certain nothing is running, delete it.\n`);
+    process.exit(1);
+  }
+  const cleanup = () => guards.releaseLock(config.lockFile);
+  process.on('exit', cleanup);
+
   const signers = await epochMod.loadSigners({ config, epochId: epoch.id, provider });
   const parent = config.parentPrivateKey ? walletsMod.parentSigner(config, provider) : null;
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
@@ -391,10 +402,20 @@ async function run() {
             gasUsed: receipt?.gasUsed != null ? receipt.gasUsed.toString() : null, reason: sideReason });
           stop.recordSuccess(q.notionalWl1x);
         } catch (e) {
-          const msg = String(e.shortMessage || e.message).slice(0, 200);
-          log(`w${pad2(signer.idx)} ${market.cfg.label} FAILED ${msg}`);
-          await recordTrade({ ...row, status: 'failed', reason: msg });
-          stop.recordFailure();
+          const msg = String(e.shortMessage || e.message).slice(0, 180);
+          if (e.unconfirmed && e.broadcastHash) {
+            // Broadcast but unconfirmed: the swap may still be mined. Record it
+            // as `unconfirmed` WITH the hash so it can be reconciled, and stop —
+            // continuing to trade this wallet risks acting on a stale balance.
+            log(`w${pad2(signer.idx)} ${market.cfg.label} UNCONFIRMED ${e.broadcastHash} — ${msg}`);
+            await recordTrade({ ...row, status: 'unconfirmed', txHash: e.broadcastHash,
+              reason: `broadcast but unconfirmed (nonce ${e.broadcastNonce}): ${msg}` });
+            stop.trip(`unconfirmed transaction ${e.broadcastHash} — reconcile before resuming (npm run qdex:vol:reconcile)`);
+          } else {
+            log(`w${pad2(signer.idx)} ${market.cfg.label} FAILED ${msg}`);
+            await recordTrade({ ...row, status: 'failed', reason: msg });
+            stop.recordFailure();
+          }
         }
       }
 
@@ -406,7 +427,13 @@ async function run() {
       const msg = String(e.shortMessage || e.message).slice(0, 200);
       log(`iteration error: ${msg}`);
       await recordTrade({ ...base, status: 'failed', reason: msg });
-      if (!lib.isTransientRpcError(e)) stop.recordFailure();
+      if (lib.isTransientRpcError(e)) {
+        stop.recordRpcError();
+        // Back off so a dead endpoint is not hammered while the streak builds.
+        await sleep(Math.min(2000 * stop.consecutiveRpcErrors, 30000));
+      } else {
+        stop.recordFailure();
+      }
     }
 
     if (once) break;
@@ -417,6 +444,7 @@ async function run() {
   stop.removeSignalHandlers();
   log(`stopped after ${iterations} iterations — ${stop.txCount} trades, ${stop.notionalWl1x.toFixed(4)} WL1X notional` +
     (stop.reason ? ` | reason: ${stop.reason}` : ''));
+  guards.releaseLock(config.lockFile);
   await db.end().catch(() => {});
 }
 
