@@ -331,12 +331,38 @@ needs a WL1X reserve for backstop top-ups on any long run.
 
 ## Tables
 
+### Active vs retired — enforced by the database
+
+`qdex_volume_epochs.status` is `active`, `draining` or `retired`. **Rotation adds;
+it never replaces** — the old epoch's row and all ten of its wallets stay in the
+database permanently, so any past roster is still exportable:
+
+```bash
+npm run qdex:vol:export -- --epoch 3 --idx 7   # works long after epoch 3 retired
+```
+
+"Exactly one active epoch" is a **database constraint**, not just an application
+check. A generated column `active_lock` is `1` when `status='active'` and `NULL`
+otherwise, under a UNIQUE index — and since MySQL ignores NULLs in unique
+indexes, a second active row is impossible. It holds against direct SQL too, not
+only against this code, so `epoch:new --force` can no longer wedge the harness
+with two open epochs.
+
+To see wallet-level status without remembering to join:
+
+```sql
+SELECT * FROM qdex_volume_wallet_status WHERE is_active = 1;
+```
+
+A view rather than a duplicated column, so it cannot drift out of sync.
+
 | Table | Contents |
 |---|---|
-| `qdex_volume_epochs` | one row per roster generation; encrypted mnemonic |
+| `qdex_volume_epochs` | one row per roster generation; encrypted mnemonic; `status` + `active_lock` |
 | `qdex_volume_wallets` | the 10 wallets of an epoch; encrypted private key |
 | `qdex_volume_trades` | every attempt — executed, skipped or failed, with reason |
 | `qdex_volume_transfers` | fund / peer / backstop / sweep movements |
+| `qdex_volume_wallet_status` | view: every wallet with its epoch's status and `is_active` |
 
 ## Tests
 

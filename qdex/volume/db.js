@@ -129,6 +129,40 @@ async function init() {
   // MySQL has no ADD COLUMN IF NOT EXISTS, so a duplicate is simply ignored.
   try { await pool.query('ALTER TABLE qdex_volume_trades ADD COLUMN nonce BIGINT AFTER tx_hash'); }
   catch (e) { if (e.code !== 'ER_DUP_FIELDNAME') throw e; }
+
+  // Enforce "exactly one active epoch" IN THE DATABASE rather than only in
+  // application code. `active_lock` is 1 for an active epoch and NULL otherwise,
+  // and a UNIQUE index ignores NULLs — so any second active row is rejected by
+  // MySQL itself. Previously two concurrent `epoch:new --force` calls could leave
+  // the harness wedged with two open epochs.
+  try {
+    await pool.query(
+      `ALTER TABLE qdex_volume_epochs
+         ADD COLUMN active_lock TINYINT
+         GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN 1 ELSE NULL END) STORED`);
+  } catch (e) { if (e.code !== 'ER_DUP_FIELDNAME') throw e; }
+  try {
+    await pool.query('ALTER TABLE qdex_volume_epochs ADD UNIQUE KEY uniq_qvt_one_active (active_lock)');
+  } catch (e) {
+    // ER_DUP_KEYNAME = already applied. ER_DUP_ENTRY = existing data already has
+    // two active epochs; surface that rather than failing silently.
+    if (e.code === 'ER_DUP_ENTRY') {
+      console.error('WARNING: more than one epoch is already marked active — retire the stale ones, ' +
+        'then restart so the single-active constraint can be applied.');
+    } else if (e.code !== 'ER_DUP_KEYNAME') throw e;
+  }
+
+  // Wallet-level view of what is live. The wallets table has no status of its
+  // own, so without this you must remember to join to qdex_volume_epochs; it is
+  // easy to read a retired roster by mistake. A view cannot drift out of sync
+  // the way a duplicated status column would.
+  await pool.query(`
+    CREATE OR REPLACE VIEW qdex_volume_wallet_status AS
+      SELECT w.epoch_id, w.idx, w.address, e.status AS epoch_status,
+             (e.status = 'active') AS is_active,
+             e.expires_at, w.funded_at, w.swept_at, w.created_at
+      FROM qdex_volume_wallets w
+      JOIN qdex_volume_epochs e ON e.id = w.epoch_id`);
 }
 
 const q = async (sql, args) => { if (!pool) await init(); return pool.query(sql, args); };

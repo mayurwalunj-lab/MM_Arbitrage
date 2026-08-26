@@ -36,15 +36,32 @@ async function createEpoch({ config, chainId, parentAddress, force = false, log 
   const { mnemonic, wallets: derived } = wallets.generate(config);
   const expiresAt = new Date(Date.now() + config.epochDays * 86400000);
 
-  const epochId = await db.createEpoch({
-    chainId, parentAddress,
-    walletCount: config.walletCount,
-    derivationPath: config.derivationPath,
-    mnemonicEnc: crypto.wrap(mnemonic, { plaintext, secret: config.encryptionKey }),
-    testTag: config.testTag,
-    expiresAt,
-    note: 'generated offline'
-  });
+  let epochId;
+  try {
+    epochId = await db.createEpoch({
+      chainId, parentAddress,
+      walletCount: config.walletCount,
+      derivationPath: config.derivationPath,
+      mnemonicEnc: crypto.wrap(mnemonic, { plaintext, secret: config.encryptionKey }),
+      testTag: config.testTag,
+      expiresAt,
+      note: 'generated offline'
+    });
+  } catch (e) {
+    // The database enforces one active epoch via a unique index on active_lock,
+    // so --force cannot produce a second one. Translate the raw MySQL error into
+    // something that says what to do about it.
+    if (e.code === 'ER_DUP_ENTRY' && String(e.sqlMessage || '').includes('uniq_qvt_one_active')) {
+      throw new Error(
+        'an epoch is already active — the database allows only one at a time.\n' +
+        '  To replace it properly (sweeps funds back to the parent first):\n' +
+        '    npm run qdex:vol:epoch:rotate\n' +
+        '  To discard an UNFUNDED epoch instead, retire it first:\n' +
+        '    node -e "require(\'dotenv\').config({path:\'.env\'});const d=require(\'./qdex/volume/db\');' +
+        '(async()=>{await d.init();await d.setEpochStatus(<id>,\'retired\',\'discarded\');await d.end()})()"');
+    }
+    throw e;
+  }
 
   for (const w of derived) {
     await db.insertWallet({ epochId, idx: w.idx, address: w.address, privkeyEnc: crypto.wrap(w.privateKey, { plaintext, secret: config.encryptionKey }) });
