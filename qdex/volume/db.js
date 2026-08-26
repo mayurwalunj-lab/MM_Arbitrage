@@ -125,6 +125,30 @@ async function init() {
       INDEX idx_qvt_xf_kind (kind)
     )`);
 
+  // Pool definitions live here rather than in .env: they are data (addresses,
+  // labels, weights) that changes as pools are added or retired, not deployment
+  // configuration. The SAFETY ALLOW-LIST deliberately stays in .env — a row in
+  // this table must never be able to authorise live trading, since this database
+  // is served over HTTP by dashboard/Server.js.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qdex_volume_pools (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      label VARCHAR(32) NOT NULL,
+      address VARCHAR(64) NOT NULL,
+      token_address VARCHAR(64) NOT NULL,        -- the non-WL1X side
+      router_address VARCHAR(64) NOT NULL,       -- per-pool: QDex runs two factories
+      fee INT,
+      enabled TINYINT(1) NOT NULL DEFAULT 1,
+      weight DECIMAL(20,8),                      -- NULL = derive from TVL
+      max_impact_bps DECIMAL(20,8),              -- NULL = use the global cap
+      tvl_usd DECIMAL(30,8),                     -- last observed, informational
+      note VARCHAR(255),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_qvt_pool_addr (address),
+      INDEX idx_qvt_pool_enabled (enabled)
+    )`);
+
   // Additive migration for databases created before the write-ahead column.
   // MySQL has no ADD COLUMN IF NOT EXISTS, so a duplicate is simply ignored.
   try { await pool.query('ALTER TABLE qdex_volume_trades ADD COLUMN nonce BIGINT AFTER tx_hash'); }
@@ -192,6 +216,38 @@ async function setEpochStatus(id, status, note) {
     [status, retired, note ?? null, id]);
 }
 
+// ---- pools ----
+async function getPools({ includeDisabled = false } = {}) {
+  const [rows] = await q(
+    `SELECT id, label, address, token_address, router_address, fee, enabled, weight, max_impact_bps, tvl_usd, note
+     FROM qdex_volume_pools ${includeDisabled ? '' : 'WHERE enabled = 1'} ORDER BY id`);
+  return rows;
+}
+
+// Idempotent: re-running updates the existing row rather than erroring, so an
+// import can be repeated safely after editing the source.
+async function upsertPool(p) {
+  await q(
+    `INSERT INTO qdex_volume_pools (label, address, token_address, router_address, fee, enabled, weight, max_impact_bps, note)
+     VALUES (?,?,?,?,?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE label=VALUES(label), token_address=VALUES(token_address),
+       router_address=VALUES(router_address), fee=VALUES(fee), enabled=VALUES(enabled),
+       weight=VALUES(weight), max_impact_bps=VALUES(max_impact_bps), note=VALUES(note)`,
+    [p.label, p.address, p.token, p.router, p.fee ?? null, p.enabled === false ? 0 : 1,
+     p.weight ?? null, p.maxImpactBps ?? null, p.note ?? null]);
+}
+
+async function setPoolEnabled(labelOrAddress, enabled) {
+  const [r] = await q(
+    `UPDATE qdex_volume_pools SET enabled = ? WHERE LOWER(label) = LOWER(?) OR LOWER(address) = LOWER(?)`,
+    [enabled ? 1 : 0, labelOrAddress, labelOrAddress]);
+  return r.affectedRows;
+}
+
+async function setPoolTvl(address, tvlUsd) {
+  await q(`UPDATE qdex_volume_pools SET tvl_usd = ? WHERE LOWER(address) = LOWER(?)`, [tvlUsd, address]);
+}
+
 // ---- wallets ----
 async function insertWallet(w) {
   await q(`INSERT INTO qdex_volume_wallets (epoch_id, idx, address, privkey_enc) VALUES (?,?,?,?)`,
@@ -254,6 +310,7 @@ async function end() { if (pool) await pool.end(); pool = null; }
 module.exports = {
   dbConfig, init, end, query: q, updateTrade,
   createEpoch, getActiveEpoch, getEpoch, setEpochStatus,
+  getPools, upsertPool, setPoolEnabled, setPoolTvl,
   insertWallet, getWallets, markWallet,
   insertTrade, insertTransfer
 };

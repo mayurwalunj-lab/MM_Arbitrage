@@ -331,6 +331,35 @@ needs a WL1X reserve for backstop top-ups on any long run.
 
 ## Tables
 
+### Pools live in the database
+
+Pool definitions are rows in `qdex_volume_pools`, not `.env` — they are data that
+changes as pools are added or retired, and forty env lines was the wrong shape
+for it.
+
+```bash
+npm run qdex:vol:pools                    # list, with enabled + allow-listed status
+npm run qdex:vol:pools:import             # copy the QVT_POOL_* block from .env in
+npm run qdex:vol:pools:disable -- KAKA    # stop the bot picking it, keep the row
+npm run qdex:vol:pools:enable  -- KAKA
+```
+
+`.env` is only a fallback: if the table is empty or the database is unreachable,
+`QVT_POOL_*` is used instead and the run says which source it took. Once imported
+the env block is redundant and can be deleted.
+
+**The safety allow-list stays in `.env` on purpose.** `QVT_ALLOWED_POOLS` is what
+authorises live trading, and this database is served over HTTP by
+`dashboard/Server.js` — a row must never be able to switch trading on. So two
+things must both be true to trade a pool live:
+
+| | Where | Meaning |
+|---|---|---|
+| `enabled` | database | the bot may pick this pool |
+| allow-listed | `.env` | live transactions are permitted on it |
+
+`npm run qdex:vol:pools` shows both columns side by side.
+
 ### Active vs retired — enforced by the database
 
 `qdex_volume_epochs.status` is `active`, `draining` or `retired`. **Rotation adds;
@@ -362,6 +391,7 @@ A view rather than a duplicated column, so it cannot drift out of sync.
 | `qdex_volume_wallets` | the 10 wallets of an epoch; encrypted private key |
 | `qdex_volume_trades` | every attempt — executed, skipped or failed, with reason |
 | `qdex_volume_transfers` | fund / peer / backstop / sweep movements |
+| `qdex_volume_pools` | pool definitions: address, token, per-pool router, enabled, weight |
 | `qdex_volume_wallet_status` | view: every wallet with its epoch's status and `is_active` |
 
 ## Tests

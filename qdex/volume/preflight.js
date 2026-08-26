@@ -29,8 +29,11 @@ const bad = (s) => `  [FAIL] ${s}`;
 (async () => {
   const problems = [];
   const config = cfgMod.getConfig();
+  let poolSrc = { source: 'env' };
+  try { await db.init(); poolSrc = await cfgMod.hydratePools(config, db); } catch { /* .env fallback */ }
 
   console.log('\n=== 1. configuration ===');
+  console.log(ok(`pools loaded from ${poolSrc.source}${poolSrc.error ? ' (db error: ' + poolSrc.error + ')' : ''}`));
   try { cfgMod.validateConfig(config); console.log(ok(`${config.pools.length} pools, ${config.walletCount} wallets configured`)); }
   catch (e) { console.log(bad(e.message)); problems.push('config'); process.exitCode = 1; }
 

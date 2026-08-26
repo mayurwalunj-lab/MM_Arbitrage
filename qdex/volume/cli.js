@@ -223,9 +223,64 @@ async function cmdReconcile(config) {
   else console.log('  resolve the flagged rows by hand before resuming\n');
 }
 
+// ---- pools: definitions live in the database, the allow-list stays in .env ----
+async function cmdPools(config) {
+  await db.init();
+  const rows = await db.getPools({ includeDisabled: true });
+  if (!rows.length) {
+    console.log('\n  no pools in the database yet — import the .env definitions:');
+    console.log('    npm run qdex:vol:pools:import\n');
+    return;
+  }
+  const allowed = new Set(config.allowedPools);
+  console.log(`\n  ${rows.length} pool(s) in qdex_volume_pools\n`);
+  console.log('  id  label      on   allow-listed  address                                      router');
+  rows.forEach((r) => {
+    console.log('  ' + String(r.id).padEnd(4) + String(r.label).padEnd(11) +
+      (r.enabled ? 'yes' : 'NO ').padEnd(5) +
+      (allowed.has(String(r.address).toLowerCase()) ? 'yes' : 'no').padEnd(14) +
+      r.address + '  ' + String(r.router_address).slice(0, 12) + '…');
+  });
+  console.log('\n  "on" is whether the bot may pick this pool (database).');
+  console.log('  "allow-listed" is whether QVT_ALLOWED_POOLS in .env permits LIVE trading on it.');
+  console.log('  Both must be true to trade it live — the safety gate is deliberately not in the database.\n');
+}
+
+// Copy the QVT_POOL_n_* definitions from .env into the table. Idempotent, so it
+// can be re-run after editing .env without creating duplicates.
+async function cmdPoolsImport(config) {
+  await db.init();
+  const fromEnv = config.pools;
+  if (!fromEnv.length) throw new Error('no QVT_POOL_n_* entries in .env to import');
+  for (const p of fromEnv) {
+    await db.upsertPool({ label: p.label, address: p.address, token: p.token, router: p.router,
+      weight: Number.isFinite(p.weight) ? p.weight : null,
+      maxImpactBps: Number.isFinite(p.maxImpactBps) ? p.maxImpactBps : null,
+      note: 'imported from .env' });
+    log(`imported ${p.label}  ${p.address}`);
+  }
+  const rows = await db.getPools({ includeDisabled: true });
+  console.log(`\n  ${rows.length} pool(s) now in the database.`);
+  console.log('  The QVT_POOL_* block in .env is now redundant and can be deleted —');
+  console.log('  it is only used as a fallback when the table is empty.\n');
+}
+
+async function cmdPoolToggle(config, enabled) {
+  await db.init();
+  const target = argv[1];
+  if (!target || target.startsWith('--')) throw new Error(`usage: pools:${enabled ? 'enable' : 'disable'} <label|address>`);
+  const n = await db.setPoolEnabled(target, enabled);
+  if (!n) throw new Error(`no pool matching "${target}"`);
+  log(`${target} ${enabled ? 'enabled' : 'disabled'}`);
+}
+
 const COMMANDS = {
   epoch: cmdEpoch,
   reconcile: cmdReconcile,
+  pools: cmdPools,
+  'pools:import': cmdPoolsImport,
+  'pools:enable': (c) => cmdPoolToggle(c, true),
+  'pools:disable': (c) => cmdPoolToggle(c, false),
   'epoch:new': cmdEpochNew,
   fund: cmdFund,
   sweep: cmdSweep,
@@ -245,7 +300,14 @@ const COMMANDS = {
     process.exit(cmd ? 1 : 0);
   }
   const config = cfgMod.getConfig();
-  if (cmd !== 'keygen-secret') cfgMod.validateConfig(config);
+  if (cmd !== 'keygen-secret') {
+    // pools:import must read the .env definitions, so it is the one command that
+    // deliberately does NOT hydrate from the database first.
+    if (cmd !== 'pools:import') {
+      try { await db.init(); await cfgMod.hydratePools(config, db); } catch { /* .env fallback */ }
+    }
+    cfgMod.validateConfig(config);
+  }
   await COMMANDS[cmd](config);
   await db.end().catch(() => {});
 })().catch((e) => { console.error(`\nERROR: ${e.message}\n`); process.exit(1); });

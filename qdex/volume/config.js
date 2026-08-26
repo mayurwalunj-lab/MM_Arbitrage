@@ -141,12 +141,42 @@ function getConfig() {
   };
 }
 
+// Replace config.pools with the enabled rows from qdex_volume_pools.
+//
+// getConfig() stays synchronous (it is called everywhere), so pools are loaded
+// from .env first and this swaps them afterwards, once a DB connection exists.
+// The database wins when it has any enabled rows; .env is the fallback for a
+// fresh install or when the DB is unreachable. Returns where they came from so
+// callers can say which.
+async function hydratePools(config, db) {
+  try {
+    const rows = await db.getPools();
+    if (!rows.length) return { source: 'env', count: config.pools.length };
+    config.pools = rows.map((r, i) => ({
+      index: i + 1,
+      address: ethers.getAddress(r.address),
+      token: ethers.getAddress(r.token_address),
+      router: ethers.getAddress(r.router_address),
+      label: r.label,
+      maxImpactBps: r.max_impact_bps == null ? NaN : Number(r.max_impact_bps),
+      weight: r.weight == null ? NaN : Number(r.weight)
+    }));
+    return { source: 'database', count: config.pools.length };
+  } catch (e) {
+    // A missing table or an unreachable DB must not take the harness down —
+    // .env still describes a usable set.
+    return { source: 'env', count: config.pools.length, error: String(e.message).slice(0, 120) };
+  }
+}
+
 // Config errors that make the harness unrunnable at all (even dry-run).
 function validateConfig(c) {
   const missing = [];
   if (!c.rpcUrl) missing.push('QVT_RPC_URL (or QDEX_RPC_URL)');
   if (!c.wl1x) missing.push('QVT_WL1X (or QDEX_BASE_TOKEN)');
-  if (!c.pools.length) missing.push('QVT_POOL_COUNT + QVT_POOL_1_* (no pools configured)');
+  // Pools may legitimately be empty here: hydratePools() fills them from the
+  // database after this runs. Callers check for an empty set after hydration.
+  if (!c.pools.length && !c.poolsFromDb) missing.push('no pools configured — add rows to qdex_volume_pools (npm run qdex:vol:pools:import) or set QVT_POOL_COUNT + QVT_POOL_1_*');
   c.pools.forEach((p) => {
     if (!p.token) missing.push(`QVT_POOL_${p.index}_TOKEN`);
     if (!p.router) missing.push(`QVT_POOL_${p.index}_ROUTER`);
@@ -176,4 +206,4 @@ function executionGate(c, liveChainId) {
   return { ok: reasons.length === 0, reasons };
 }
 
-module.exports = { getConfig, validateConfig, executionGate, envNum, envBool, envAddr, envList, HARD_TX_PER_HOUR_CAP };
+module.exports = { getConfig, validateConfig, executionGate, hydratePools, envNum, envBool, envAddr, envList, HARD_TX_PER_HOUR_CAP };

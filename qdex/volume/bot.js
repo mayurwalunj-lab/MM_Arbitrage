@@ -116,7 +116,7 @@ function banner({ config, chainId, gate, execute, epoch, runId }) {
   console.log(`  test tag    : ${config.testTag}`);
   console.log(`  chain       : ${chainId}`);
   console.log(`  ${epochMod.summarise(epoch)}`);
-  console.log(`  pools       : ${config.pools.length} (${config.pools.map((p) => p.label).join(', ')})`);
+  console.log(`  pools       : ${config.pools.length} from ${config.poolSource || 'env'} (${config.pools.map((p) => p.label).join(', ')})`);
   console.log(`  rate limit  : ${config.maxTxPerHour}/hr (hard cap ${cfgMod.HARD_TX_PER_HOUR_CAP})`);
   console.log(`  impact cap  : ${config.maxImpactBps} bps    price band: ±${config.maxDeviationPct}%`);
   console.log(`  stop file   : ${config.stopFile}`);
@@ -145,6 +145,9 @@ async function run() {
   }
 
   await db.init();
+  const poolSrc = await cfgMod.hydratePools(config, db);
+  if (poolSrc.error) log(`WARNING: could not read pools from the database (${poolSrc.error}) — using .env`);
+  if (!config.pools.length) { console.error('No pools configured. Import them: npm run qdex:vol:pools:import'); process.exit(1); }
 
   const epoch = await epochMod.current();
   if (!epoch) {
@@ -152,6 +155,7 @@ async function run() {
     process.exit(1);
   }
 
+  config.poolSource = poolSrc.source;
   const runId = `${config.testTag}-e${epoch.id}-${Date.now().toString(36)}`;
   banner({ config, chainId, gate, execute, epoch, runId });
 
