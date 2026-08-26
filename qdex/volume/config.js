@@ -54,6 +54,9 @@ function loadPools() {
       token: envAddr(`QVT_POOL_${i}_TOKEN`),
       router: envAddr(`QVT_POOL_${i}_ROUTER`),
       label: process.env[`QVT_POOL_${i}_LABEL`] || `pool${i}`,
+      // .env-defined pools have no allow_live of their own; authorisation for
+      // them still comes from QVT_ALLOWED_POOLS.
+      allowLive: envList('QVT_ALLOWED_POOLS').map((a) => a.toLowerCase()).includes(address.toLowerCase()),
       // Optional per-pool overrides; fall back to the global values.
       maxImpactBps: envNum(`QVT_POOL_${i}_MAX_IMPACT_BPS`, NaN),
       weight: envNum(`QVT_POOL_${i}_WEIGHT`, NaN)
@@ -174,6 +177,7 @@ async function hydratePools(config, db) {
       token: ethers.getAddress(r.token_address),
       router: ethers.getAddress(r.router_address),
       label: r.label,
+      allowLive: !!r.allow_live,
       maxImpactBps: r.max_impact_bps == null ? NaN : Number(r.max_impact_bps),
       weight: r.weight == null ? NaN : Number(r.weight)
     }));
@@ -212,10 +216,19 @@ function executionGate(c, liveChainId) {
   else if (liveChainId != null && !c.allowedChainIds.includes(Number(liveChainId))) {
     reasons.push(`chain ${liveChainId} is not in QVT_ALLOWED_CHAIN_IDS (${c.allowedChainIds.join(',')})`);
   }
-  if (!c.allowedPools.length) reasons.push('QVT_ALLOWED_POOLS is empty — no pool is approved for execution');
-  else {
+  // Live authorisation per pool lives in the database (qdex_volume_pools.allow_live).
+  // QVT_ALLOWED_POOLS, if set, is an ADDITIONAL filter on top — useful for pinning
+  // a run to one pool without touching rows — but it is no longer the sole
+  // authority. Pools loaded from .env (the fallback path) have no allow_live of
+  // their own, so they still require the env list.
+  const notAuthorised = c.pools.filter((p) => !p.allowLive);
+  if (notAuthorised.length) {
+    reasons.push(`pools not authorised for live trading: ${notAuthorised.map((p) => p.label).join(', ')}` +
+      ` (npm run qdex:vol:pools:allow -- <label>)`);
+  }
+  if (c.allowedPools.length) {
     const bad = c.pools.filter((p) => !c.allowedPools.includes(p.address.toLowerCase()));
-    if (bad.length) reasons.push(`pools not allow-listed: ${bad.map((p) => p.label).join(', ')}`);
+    if (bad.length) reasons.push(`pools excluded by QVT_ALLOWED_POOLS: ${bad.map((p) => p.label).join(', ')}`);
   }
   if (!c.encryptionKey && !c.storePlaintextKeys) reasons.push('QVT_KEY_ENCRYPTION_KEY is not set');
   if (!c.parentPrivateKey) reasons.push('QVT_PARENT_PK is not set');

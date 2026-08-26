@@ -348,17 +348,25 @@ npm run qdex:vol:pools:enable  -- KAKA
 `QVT_POOL_*` is used instead and the run says which source it took. Once imported
 the env block is redundant and can be deleted.
 
-**The safety allow-list stays in `.env` on purpose.** `QVT_ALLOWED_POOLS` is what
-authorises live trading, and this database is served over HTTP by
-`dashboard/Server.js` — a row must never be able to switch trading on. So two
-things must both be true to trade a pool live:
+Two independent flags must both be set before a pool trades live:
 
-| | Where | Meaning |
+| Flag | Meaning | Command |
 |---|---|---|
-| `enabled` | database | the bot may pick this pool |
-| allow-listed | `.env` | live transactions are permitted on it |
+| `enabled` | the bot may pick this pool | `pools:enable` / `pools:disable` |
+| `allow_live` | real transactions permitted on it | `pools:allow` / `pools:deny` |
 
+Both live in `qdex_volume_pools`. **`allow_live` defaults to 0**, so adding or
+re-importing a pool never authorises it — that always takes a deliberate act.
 `npm run qdex:vol:pools` shows both columns side by side.
+
+`QVT_ALLOWED_POOLS` in `.env` still works and applies as an *additional*
+restriction when set, which is useful for pinning a run without touching rows.
+Leave it empty and the database governs.
+
+Note what this does and does not protect. Since `QVT_STORE_PLAINTEXT_KEYS` puts
+spendable keys in the same database, anyone with those credentials can trade
+directly regardless of any flag — the flags guard against mistakes, not against
+someone who already holds the keys.
 
 ### Active vs retired — enforced by the database
 

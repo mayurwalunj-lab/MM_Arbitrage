@@ -139,7 +139,8 @@ async function init() {
       token_address VARCHAR(64) NOT NULL,        -- the non-WL1X side
       router_address VARCHAR(64) NOT NULL,       -- per-pool: QDex runs two factories
       fee INT,
-      enabled TINYINT(1) NOT NULL DEFAULT 1,
+      enabled TINYINT(1) NOT NULL DEFAULT 1,     -- the bot may PICK this pool
+      allow_live TINYINT(1) NOT NULL DEFAULT 0,  -- real transactions permitted on it
       weight DECIMAL(20,8),                      -- NULL = derive from TVL
       max_impact_bps DECIMAL(20,8),              -- NULL = use the global cap
       tvl_usd DECIMAL(30,8),                     -- last observed, informational
@@ -155,6 +156,10 @@ async function init() {
   try { await pool.query('ALTER TABLE qdex_volume_trades ADD COLUMN nonce BIGINT AFTER tx_hash'); }
   catch (e) { if (e.code !== 'ER_DUP_FIELDNAME') throw e; }
   try { await pool.query('ALTER TABLE qdex_volume_trades ADD COLUMN cost_bps DECIMAL(20,8) AFTER impact_bps'); }
+  catch (e) { if (e.code !== 'ER_DUP_FIELDNAME') throw e; }
+  // allow_live defaults to 0 so an existing pool is never silently authorised by
+  // a schema upgrade — each must be opted in explicitly.
+  try { await pool.query('ALTER TABLE qdex_volume_pools ADD COLUMN allow_live TINYINT(1) NOT NULL DEFAULT 0 AFTER enabled'); }
   catch (e) { if (e.code !== 'ER_DUP_FIELDNAME') throw e; }
 
   // Enforce "exactly one active epoch" IN THE DATABASE rather than only in
@@ -222,7 +227,7 @@ async function setEpochStatus(id, status, note) {
 // ---- pools ----
 async function getPools({ includeDisabled = false } = {}) {
   const [rows] = await q(
-    `SELECT id, label, address, token_address, router_address, fee, enabled, weight, max_impact_bps, tvl_usd, note
+    `SELECT id, label, address, token_address, router_address, fee, enabled, allow_live, weight, max_impact_bps, tvl_usd, note
      FROM qdex_volume_pools ${includeDisabled ? '' : 'WHERE enabled = 1'} ORDER BY id`);
   return rows;
 }
@@ -231,19 +236,28 @@ async function getPools({ includeDisabled = false } = {}) {
 // import can be repeated safely after editing the source.
 async function upsertPool(p) {
   await q(
-    `INSERT INTO qdex_volume_pools (label, address, token_address, router_address, fee, enabled, weight, max_impact_bps, note)
-     VALUES (?,?,?,?,?,?,?,?,?)
+    `INSERT INTO qdex_volume_pools (label, address, token_address, router_address, fee, enabled, allow_live, weight, max_impact_bps, note)
+     VALUES (?,?,?,?,?,?,?,?,?,?)
      ON DUPLICATE KEY UPDATE label=VALUES(label), token_address=VALUES(token_address),
        router_address=VALUES(router_address), fee=VALUES(fee), enabled=VALUES(enabled),
        weight=VALUES(weight), max_impact_bps=VALUES(max_impact_bps), note=VALUES(note)`,
     [p.label, p.address, p.token, p.router, p.fee ?? null, p.enabled === false ? 0 : 1,
-     p.weight ?? null, p.maxImpactBps ?? null, p.note ?? null]);
+     p.allowLive ? 1 : 0, p.weight ?? null, p.maxImpactBps ?? null, p.note ?? null]);
+  // allow_live is deliberately NOT in the ON DUPLICATE list: re-importing pool
+  // definitions must never quietly re-authorise or de-authorise live trading.
 }
 
 async function setPoolEnabled(labelOrAddress, enabled) {
   const [r] = await q(
     `UPDATE qdex_volume_pools SET enabled = ? WHERE LOWER(label) = LOWER(?) OR LOWER(address) = LOWER(?)`,
     [enabled ? 1 : 0, labelOrAddress, labelOrAddress]);
+  return r.affectedRows;
+}
+
+async function setPoolAllowLive(labelOrAddress, allow) {
+  const [r] = await q(
+    `UPDATE qdex_volume_pools SET allow_live = ? WHERE LOWER(label) = LOWER(?) OR LOWER(address) = LOWER(?)`,
+    [allow ? 1 : 0, labelOrAddress, labelOrAddress]);
   return r.affectedRows;
 }
 
@@ -314,7 +328,7 @@ async function end() { if (pool) await pool.end(); pool = null; }
 module.exports = {
   dbConfig, init, end, query: q, updateTrade,
   createEpoch, getActiveEpoch, getEpoch, setEpochStatus,
-  getPools, upsertPool, setPoolEnabled, setPoolTvl,
+  getPools, upsertPool, setPoolEnabled, setPoolAllowLive, setPoolTvl,
   insertWallet, getWallets, markWallet,
   insertTrade, insertTransfer
 };

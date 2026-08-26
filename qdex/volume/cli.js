@@ -245,18 +245,23 @@ async function cmdPools(config) {
     console.log('    npm run qdex:vol:pools:import\n');
     return;
   }
-  const allowed = new Set(config.allowedPools);
+  const envFilter = new Set(config.allowedPools);
   console.log(`\n  ${rows.length} pool(s) in qdex_volume_pools\n`);
-  console.log('  id  label      on   allow-listed  address                                      router');
+  console.log('  id  label      enabled  live     address                                      router');
   rows.forEach((r) => {
     console.log('  ' + String(r.id).padEnd(4) + String(r.label).padEnd(11) +
-      (r.enabled ? 'yes' : 'NO ').padEnd(5) +
-      (allowed.has(String(r.address).toLowerCase()) ? 'yes' : 'no').padEnd(14) +
+      (r.enabled ? 'yes' : 'NO ').padEnd(9) +
+      (r.allow_live ? 'YES' : 'no ').padEnd(9) +
       r.address + '  ' + String(r.router_address).slice(0, 12) + '…');
   });
-  console.log('\n  "on" is whether the bot may pick this pool (database).');
-  console.log('  "allow-listed" is whether QVT_ALLOWED_POOLS in .env permits LIVE trading on it.');
-  console.log('  Both must be true to trade it live — the safety gate is deliberately not in the database.\n');
+  console.log('\n  enabled  the bot may pick this pool');
+  console.log('  live     real transactions are permitted on it  (pools:allow / pools:deny)');
+  console.log('  Both must be true to trade it live. New pools are never live by default.');
+  if (envFilter.size) {
+    console.log(`\n  QVT_ALLOWED_POOLS is also set (${envFilter.size} address(es)) and applies as an`);
+    console.log('  ADDITIONAL restriction on top of the database flag.');
+  }
+  console.log('');
 }
 
 // Copy the QVT_POOL_n_* definitions from .env into the table. Idempotent, so it
@@ -278,6 +283,16 @@ async function cmdPoolsImport(config) {
   console.log('  it is only used as a fallback when the table is empty.\n');
 }
 
+async function cmdPoolAllow(config, allow) {
+  await db.init();
+  const target = argv[1];
+  if (!target || target.startsWith('--')) throw new Error(`usage: pools:${allow ? 'allow' : 'deny'} <label|address>`);
+  const n = await db.setPoolAllowLive(target, allow);
+  if (!n) throw new Error(`no pool matching "${target}"`);
+  log(`${target} ${allow ? 'AUTHORISED for live trading' : 'de-authorised — dry-run only'}`);
+  if (allow) log('this permits real transactions on that pool; the bot must also have it enabled');
+}
+
 async function cmdPoolToggle(config, enabled) {
   await db.init();
   const target = argv[1];
@@ -294,6 +309,8 @@ const COMMANDS = {
   'pools:import': cmdPoolsImport,
   'pools:enable': (c) => cmdPoolToggle(c, true),
   'pools:disable': (c) => cmdPoolToggle(c, false),
+  'pools:allow': (c) => cmdPoolAllow(c, true),
+  'pools:deny': (c) => cmdPoolAllow(c, false),
   'epoch:new': cmdEpochNew,
   fund: cmdFund,
   sweep: cmdSweep,
