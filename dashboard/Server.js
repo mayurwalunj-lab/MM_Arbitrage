@@ -674,6 +674,8 @@ app.get('/api/arb/inventory', (req, res) => {
 // serves over HTTP with open CORS, so those two columns are NEVER selected here.
 // Every query below lists its columns explicitly — do not replace them with *.
 
+app.get('/volume', (req, res) => res.sendFile(path.join(__dirname, 'volume.html')));
+
 app.get('/api/qdex/volume/summary', (req, res) => {
     const pool = arbPool();
     const hours = Number(req.query.hours) || 24;

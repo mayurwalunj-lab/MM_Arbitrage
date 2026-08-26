@@ -394,23 +394,44 @@ async function run() {
         await recordTrade({ ...row, status: 'executed', reason: `dry-run; ${sideReason}` });
         stop.recordSuccess(q.notionalWl1x);
       } else {
+        // Write-ahead: the row exists BEFORE anything is broadcast, so a process
+        // killed mid-flight still leaves a trace that reconcile can settle.
+        // Without it, a kill -9 between broadcast and insert loses the trade
+        // entirely — funds moved, nothing recorded, nothing to reconcile against.
+        let walId = null;
         try {
-          const receipt = await poolsMod.executeSwap({ market: m, signer: signer.wallet, side, quote: q, config, log });
+          const receipt = await poolsMod.executeSwap({
+            market: m, signer: signer.wallet, side, quote: q, config, log,
+            onNonce: async ({ nonce }) => {
+              walId = await db.insertTrade({ ...row, epochId: epoch.id, runId, isDryRun: false,
+                status: 'broadcasting', nonce: Number(nonce), reason: sideReason });
+            },
+            onSent: async ({ hash }) => { if (walId) await db.updateTrade(walId, { txHash: hash }); }
+          });
           log(`${headline} | ${receipt?.hash || '(no hash)'}`);
-          await recordTrade({ ...row, status: 'executed', txHash: receipt?.hash ?? null,
+          const done = { status: 'executed', txHash: receipt?.hash ?? null,
             blockNumber: receipt?.blockNumber != null ? Number(receipt.blockNumber) : null,
-            gasUsed: receipt?.gasUsed != null ? receipt.gasUsed.toString() : null, reason: sideReason });
+            gasUsed: receipt?.gasUsed != null ? receipt.gasUsed.toString() : null };
+          if (walId) await db.updateTrade(walId, done);
+          else await recordTrade({ ...row, ...done, reason: sideReason });
           stop.recordSuccess(q.notionalWl1x);
         } catch (e) {
           const msg = String(e.shortMessage || e.message).slice(0, 180);
           if (e.unconfirmed && e.broadcastHash) {
-            // Broadcast but unconfirmed: the swap may still be mined. Record it
-            // as `unconfirmed` WITH the hash so it can be reconciled, and stop —
+            // Broadcast but unconfirmed: the swap may still be mined. Keep it as
+            // `unconfirmed` WITH the hash so it can be reconciled, and stop —
             // continuing to trade this wallet risks acting on a stale balance.
             log(`w${pad2(signer.idx)} ${market.cfg.label} UNCONFIRMED ${e.broadcastHash} — ${msg}`);
-            await recordTrade({ ...row, status: 'unconfirmed', txHash: e.broadcastHash,
-              reason: `broadcast but unconfirmed (nonce ${e.broadcastNonce}): ${msg}` });
+            const f = { status: 'unconfirmed', txHash: e.broadcastHash,
+              reason: `broadcast but unconfirmed (nonce ${e.broadcastNonce}): ${msg}`.slice(0, 250) };
+            if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
             stop.trip(`unconfirmed transaction ${e.broadcastHash} — reconcile before resuming (npm run qdex:vol:reconcile)`);
+          } else if (walId) {
+            // The write-ahead row exists, so the nonce may already be consumed.
+            // Never assume nothing happened — leave it for reconcile to settle.
+            log(`w${pad2(signer.idx)} ${market.cfg.label} FAILED after write-ahead — ${msg}`);
+            await db.updateTrade(walId, { status: 'unconfirmed', reason: `failed after broadcast point: ${msg}`.slice(0, 250) });
+            stop.trip(`transaction outcome unknown (nonce recorded) — run npm run qdex:vol:reconcile`);
           } else {
             log(`w${pad2(signer.idx)} ${market.cfg.label} FAILED ${msg}`);
             await recordTrade({ ...row, status: 'failed', reason: msg });

@@ -154,13 +154,46 @@ async function cmdReconcile(config) {
   await db.init();
   const { provider } = await withChain(config);
   const [rows] = await db.query(
-    `SELECT id, tx_hash, wallet_address, pool_label, side, amount_in, amount_in_symbol
-     FROM qdex_volume_trades WHERE status = 'unconfirmed' AND tx_hash IS NOT NULL ORDER BY id`);
-  if (!rows.length) { console.log('\n  nothing to reconcile — no unconfirmed transactions\n'); return; }
+    `SELECT id, tx_hash, nonce, wallet_address, pool_label, side, amount_in, amount_in_symbol
+     FROM qdex_volume_trades WHERE status IN ('unconfirmed','broadcasting') ORDER BY id`);
+  if (!rows.length) { console.log('\n  nothing to reconcile — no unresolved transactions\n'); return; }
 
-  console.log(`\n  ${rows.length} unconfirmed transaction(s):\n`);
-  let resolved = 0, stillPending = 0;
+  console.log(`\n  ${rows.length} unresolved transaction(s):\n`);
+  let resolved = 0, stillPending = 0, needsReview = 0;
   for (const r of rows) {
+    // No hash: the process died between recording intent and getting one back.
+    // The nonce still settles it — if the wallet's transaction count has not
+    // passed that nonce, the transaction was never mined and no funds moved.
+    if (!r.tx_hash) {
+      if (r.nonce == null || !r.wallet_address) {
+        console.log(`  row ${r.id}  no hash and no nonce — cannot resolve automatically`);
+        needsReview++; continue;
+      }
+      // This RPC errors (rather than returning 0) for an address it holds no
+      // state for — which is exactly a wallet whose very first transaction
+      // failed. Retry, then flag rather than guessing: reporting a wrong
+      // "no funds moved" would be worse than asking for a look.
+      let count = null;
+      try {
+        count = await lib.withRetry(() => provider.getTransactionCount(r.wallet_address, 'latest'),
+          { attempts: 3, label: 'reconcile.nonce' });
+      } catch (e) {
+        console.log(`  row ${r.id}  CANNOT READ NONCE for ${r.wallet_address} — ${String(e.shortMessage || e.message).slice(0, 70)}`);
+        console.log(`           if that address has no history at all, nothing was sent; verify on the explorer.`);
+        needsReview++; continue;
+      }
+      if (count <= Number(r.nonce)) {
+        await db.query(`UPDATE qdex_volume_trades SET status='failed', reason=CONCAT(COALESCE(reason,''),' | reconciled: nonce ',?,' never used, no funds moved') WHERE id=?`, [r.nonce, r.id]);
+        console.log(`  row ${r.id}  NEVER SENT — wallet nonce is ${count}, this needed ${r.nonce}. No funds moved.`);
+        resolved++;
+      } else {
+        console.log(`  row ${r.id}  NEEDS REVIEW — nonce ${r.nonce} was consumed by ${r.wallet_address}`);
+        console.log(`           a transaction from that wallet at that nonce was mined, but no hash was recorded.`);
+        console.log(`           check the wallet's history on the explorer, then set the row manually.`);
+        needsReview++;
+      }
+      continue;
+    }
     let rc = null;
     try { rc = await provider.getTransactionReceipt(r.tx_hash); }
     catch (e) { console.log(`  ${r.tx_hash}  RPC error: ${String(e.shortMessage || e.message).slice(0, 60)}`); continue; }
@@ -184,9 +217,10 @@ async function cmdReconcile(config) {
     console.log(`  ${r.tx_hash}  ${ok ? 'CONFIRMED' : 'REVERTED'} in block ${rc.blockNumber}  (${r.pool_label} ${r.side} ${r.amount_in} ${r.amount_in_symbol})`);
     resolved++;
   }
-  console.log(`\n  resolved ${resolved}, still pending ${stillPending}`);
-  if (!stillPending) console.log('  safe to resume:  npm run qdex:vol:resume\n');
-  else console.log('  re-run reconcile once the pending ones settle before resuming\n');
+  console.log(`\n  resolved ${resolved}, still pending ${stillPending}, needs manual review ${needsReview}`);
+  if (!stillPending && !needsReview) console.log('  safe to resume:  npm run qdex:vol:resume\n');
+  else if (stillPending) console.log('  re-run reconcile once the pending ones settle before resuming\n');
+  else console.log('  resolve the flagged rows by hand before resuming\n');
 }
 
 const COMMANDS = {

@@ -223,6 +223,7 @@ The harness probes each router once for which `exactInputSingle` shape it speaks
 |---|---|
 | **Swap reverts** | Caught, recorded `failed` with the revert reason, wallet moves on. `QVT_MAX_CONSECUTIVE_FAILURES` in a row trips the emergency stop. Funds never left the wallet. |
 | **Broadcast, then can't confirm** | The transaction may still be mined, so it is **not** recorded as failed. It is filed `unconfirmed` **with the tx hash**, and the bot stops immediately — trading on a possibly-stale balance is how you get a double spend. Resolve with `npm run qdex:vol:reconcile`. |
+| **Process killed mid-broadcast** | A `broadcasting` row carrying the **nonce** is written *before* anything is sent, so a `kill -9` still leaves a trace. Reconcile settles it from the nonce even with no hash: if the wallet's transaction count never passed that nonce, nothing was mined and no funds moved. |
 | **Retried send after the first landed** | Impossible to double-spend: the nonce is pinned before the first attempt, so a resubmit is rejected by the node as a duplicate. |
 | **Transient RPC error (502, `-32001`)** | Retried with exponential backoff. Deliberately *not* counted as a transaction failure — the swap never ran. |
 | **RPC endpoint is simply down** | The retry streak is counted separately. `QVT_MAX_CONSECUTIVE_RPC_ERRORS` (default 25) trips the stop, with growing backoff meanwhile, so a dead endpoint surfaces instead of spinning silently. |
@@ -241,11 +242,34 @@ The harness probes each router once for which `exactInputSingle` shape it speaks
 npm run qdex:vol:reconcile
 ```
 
-For each `unconfirmed` row it fetches the receipt and settles it: mined and
-successful → `executed` with block and gas; mined and reverted → `failed`;
-dropped from the mempool and unknown to the node → `failed`, no funds moved.
-Anything still pending is reported and left alone. Once nothing is pending,
-`npm run qdex:vol:resume` clears the stop flag.
+For a row **with a hash** it fetches the receipt: mined and successful →
+`executed` with block and gas; mined and reverted → `failed`; dropped from the
+mempool and unknown to the node → `failed`, no funds moved.
+
+For a row **with only a nonce** (killed before a hash came back) it compares the
+wallet's transaction count to the recorded nonce. Count still at or below the
+nonce → that nonce was never used, nothing was mined, safe to close as `failed`.
+Count past it → something *was* mined from that wallet at that nonce, so the row
+is flagged for manual review rather than guessed at. It never claims "no funds
+moved" without proving it.
+
+Anything still pending is reported and left alone. Once nothing is pending or
+flagged, `npm run qdex:vol:resume` clears the stop flag.
+
+## Web dashboard
+
+```bash
+npm run dashboard      # then open http://localhost:5002/volume
+```
+
+Tiles for attempts / executed / skipped / failed / volume / average size /
+average and max impact / buy-sell split / rate, plus per-pool breakdown, skip
+reasons, the epoch roster and recent trades. Filters for all / live / dry-run and
+24h / 7d / 30d; refreshes every 15s.
+
+The four API routes (`/api/qdex/volume/{summary,trades,epochs,transfers}`) select
+their columns explicitly and **never** include `privkey_enc` or `mnemonic_enc`.
+Keep it that way — this process serves the database over HTTP with open CORS.
 
 ## Fee burn
 

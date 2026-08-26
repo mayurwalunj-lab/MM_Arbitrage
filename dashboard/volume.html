@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QDex Volume Test Harness</title>
+<style>
+  :root { --bg:#0e1116; --card:#171c24; --line:#262d39; --txt:#e6e9ef; --mut:#8a93a3; --grn:#3fb950; --red:#f85149; --amb:#d29922; --acc:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:-apple-system,Segoe UI,Roboto,sans-serif; padding:24px; }
+  h1 { font-size:20px; font-weight:600; margin:0 0 4px; }
+  .sub { color:var(--mut); font-size:13px; margin-bottom:16px; }
+  .banner { background:#33301f; border:1px solid #5a4f22; color:var(--amb); border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .card .label { color:var(--mut); font-size:12px; }
+  .card .val { font-size:22px; font-weight:600; margin-top:4px; }
+  .card .val.sm { font-size:16px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; }
+  section h2 { font-size:15px; margin:0 0 12px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--mut); font-weight:500; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .pill { font-size:11px; padding:2px 7px; border-radius:10px; white-space:nowrap; }
+  .buy { background:#1f3326; color:var(--grn); } .sell { background:#33211f; color:var(--red); }
+  .dry { background:#33301f; color:var(--amb); } .live { background:#1f2a33; color:var(--acc); }
+  .ok { color:var(--grn); } .warn { color:var(--amb); } .bad { color:var(--red); }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  a { color:var(--acc); text-decoration:none; }
+  .topbar { display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px; }
+  .filter { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .filter button { background:var(--card); color:var(--mut); border:0; padding:8px 14px; font-size:13px; cursor:pointer; }
+  .filter button.on { background:#222934; color:var(--txt); }
+  .muted { color:var(--mut); }
+  .empty { color:var(--mut); font-size:13px; padding:12px 0; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div>
+    <h1>QDex volume test harness</h1>
+    <div class="sub">Randomised <strong>test</strong> trading across WL1X-paired pools. All activity is recorded as test activity.</div>
+  </div>
+  <div>
+    <div class="filter" id="modeFilter">
+      <button data-mode="all" class="on">All</button>
+      <button data-mode="live">Live</button>
+      <button data-mode="dry">Dry-run</button>
+    </div>
+    <div class="filter" style="margin-left:8px">
+      <button data-hours="24" class="on">24h</button>
+      <button data-hours="168">7d</button>
+      <button data-hours="720">30d</button>
+    </div>
+  </div>
+</div>
+
+<div class="banner">
+  This page shows test-generated activity, not organic user trading. Wallet keys are never served here.
+</div>
+
+<div class="grid" id="tiles"></div>
+
+<section>
+  <h2>By pool</h2>
+  <table id="poolTable"><thead><tr>
+    <th>Pool</th><th class="num">Executed</th><th class="num">Volume WL1X</th>
+    <th class="num">Avg impact</th><th class="num">Avg deviation</th>
+  </tr></thead><tbody></tbody></table>
+  <div class="empty" id="poolEmpty" style="display:none">No activity in this window.</div>
+</section>
+
+<section>
+  <h2>Skip reasons <span class="muted" style="font-weight:400">— the most useful signal when tuning limits</span></h2>
+  <table id="skipTable"><thead><tr><th class="num" style="width:70px">Count</th><th>Reason</th></tr></thead><tbody></tbody></table>
+  <div class="empty" id="skipEmpty" style="display:none">Nothing skipped.</div>
+</section>
+
+<section>
+  <h2>Epochs <span class="muted" style="font-weight:400">— wallet rosters, newest first</span></h2>
+  <table id="epochTable"><thead><tr>
+    <th>ID</th><th>Status</th><th class="num">Wallets</th><th>Parent</th><th>Created</th><th>Expires</th>
+  </tr></thead><tbody></tbody></table>
+</section>
+
+<section>
+  <h2>Recent trades</h2>
+  <table id="tradeTable"><thead><tr>
+    <th>Time</th><th>Epoch</th><th>Wallet</th><th>Pool</th><th>Side</th>
+    <th class="num">In</th><th class="num">Out</th><th class="num">Impact</th><th>Status</th><th>Tx</th>
+  </tr></thead><tbody></tbody></table>
+  <div class="empty" id="tradeEmpty" style="display:none">No trades recorded.</div>
+</section>
+
+<script>
+const API = '';
+let mode = 'all', hours = 24;
+
+const n = (v, dp = 4) => (v == null || v === '' ? '—' : Number(v).toFixed(dp));
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const short = (a) => a ? esc(a).slice(0, 8) + '…' + esc(a).slice(-4) : '—';
+const when = (t) => t ? new Date(t).toLocaleString() : '—';
+
+function tile(label, val, cls) {
+  return '<div class="card"><div class="label">' + esc(label) + '</div>' +
+         '<div class="val ' + (cls || '') + '">' + val + '</div></div>';
+}
+
+async function load() {
+  const [sum, eps, tr] = await Promise.all([
+    fetch(API + '/api/qdex/volume/summary?hours=' + hours + '&mode=' + mode).then(r => r.json()),
+    fetch(API + '/api/qdex/volume/epochs').then(r => r.json()),
+    fetch(API + '/api/qdex/volume/trades?limit=60&mode=' + mode).then(r => r.json())
+  ]);
+
+  const t = sum.totals || {};
+  const executed = Number(t.executed || 0), attempts = Number(t.attempts || 0);
+  const spanH = t.first_ts && t.last_ts ? (new Date(t.last_ts) - new Date(t.first_ts)) / 3600000 : 0;
+  document.getElementById('tiles').innerHTML =
+    tile('Attempts', attempts) +
+    tile('Executed', executed, 'ok') +
+    tile('Skipped', Number(t.skipped || 0), 'warn') +
+    tile('Failed', Number(t.failed || 0), Number(t.failed || 0) > 0 ? 'bad' : '') +
+    tile('Volume WL1X', n(t.volume_wl1x, 4)) +
+    tile('Avg size WL1X', n(t.avg_size_wl1x, 4)) +
+    tile('Avg impact', n(t.avg_impact_bps, 2) + ' bps', 'sm') +
+    tile('Max impact', n(t.max_impact_bps, 2) + ' bps', 'sm') +
+    tile('Buy / sell', Number(t.buys || 0) + ' / ' + Number(t.sells || 0), 'sm') +
+    tile('Rate', (spanH > 0.01 ? (executed / spanH).toFixed(1) : '—') + ' tx/hr', 'sm');
+
+  const pb = document.querySelector('#poolTable tbody');
+  pb.innerHTML = (sum.byPool || []).map(p =>
+    '<tr><td>' + esc(p.pool_label) + '</td><td class="num">' + Number(p.executed || 0) + '</td>' +
+    '<td class="num">' + n(p.volume_wl1x, 4) + '</td><td class="num">' + n(p.avg_impact_bps, 2) + ' bps</td>' +
+    '<td class="num">' + n(p.avg_deviation_pct, 3) + '%</td></tr>').join('');
+  document.getElementById('poolEmpty').style.display = (sum.byPool || []).length ? 'none' : 'block';
+
+  const sb = document.querySelector('#skipTable tbody');
+  sb.innerHTML = (sum.skipReasons || []).map(s =>
+    '<tr><td class="num">' + Number(s.n) + '</td><td class="muted">' + esc(s.reason) + '</td></tr>').join('');
+  document.getElementById('skipEmpty').style.display = (sum.skipReasons || []).length ? 'none' : 'block';
+
+  const eb = document.querySelector('#epochTable tbody');
+  eb.innerHTML = (eps.epochs || []).map(e => {
+    const expired = e.expires_at && new Date(e.expires_at) < new Date();
+    return '<tr><td>' + e.id + '</td><td>' + esc(e.status) +
+      (expired && e.status !== 'retired' ? ' <span class="pill dry">expired</span>' : '') + '</td>' +
+      '<td class="num">' + e.wallet_count + '</td><td class="mono">' + short(e.parent_address) + '</td>' +
+      '<td class="muted">' + when(e.created_at) + '</td><td class="muted">' + when(e.expires_at) + '</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">No epochs yet — run qdex:vol:epoch:new</td></tr>';
+
+  const tb = document.querySelector('#tradeTable tbody');
+  tb.innerHTML = (tr.trades || []).map(x => {
+    const st = x.status === 'executed' ? '<span class="ok">executed</span>'
+      : x.status === 'failed' ? '<span class="bad">failed</span>'
+      : x.status === 'unconfirmed' || x.status === 'broadcasting' ? '<span class="warn">' + esc(x.status) + '</span>'
+      : '<span class="muted">skipped</span>';
+    return '<tr><td class="muted">' + when(x.timestamp) + '</td><td>' + (x.epoch_id ?? '—') + '</td>' +
+      '<td class="mono">w' + String(x.wallet_idx ?? '?').padStart(2, '0') + '</td>' +
+      '<td>' + esc(x.pool_label) + '</td>' +
+      '<td>' + (x.side ? '<span class="pill ' + esc(x.side) + '">' + esc(x.side) + '</span>' : '—') + '</td>' +
+      '<td class="num">' + (x.amount_in ? n(x.amount_in, 4) + ' ' + esc(x.amount_in_symbol || '') : '—') + '</td>' +
+      '<td class="num">' + (x.amount_out ? n(x.amount_out, 4) + ' ' + esc(x.amount_out_symbol || '') : '—') + '</td>' +
+      '<td class="num">' + n(x.impact_bps, 2) + '</td>' +
+      '<td>' + st + ' ' + (x.is_dry_run ? '<span class="pill dry">dry</span>' : '<span class="pill live">live</span>') + '</td>' +
+      '<td class="mono">' + (x.tx_hash ? short(x.tx_hash) : '—') + '</td></tr>';
+  }).join('');
+  document.getElementById('tradeEmpty').style.display = (tr.trades || []).length ? 'none' : 'block';
+}
+
+document.querySelectorAll('#modeFilter button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#modeFilter button').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); mode = b.dataset.mode; load();
+});
+document.querySelectorAll('.filter button[data-hours]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.filter button[data-hours]').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); hours = Number(b.dataset.hours); load();
+});
+
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

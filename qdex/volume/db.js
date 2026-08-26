@@ -93,6 +93,7 @@ async function init() {
       deviation_pct DECIMAL(20,8),
       min_out DECIMAL(40,18),
       tx_hash VARCHAR(80),
+      nonce BIGINT,                                   -- write-ahead: set BEFORE broadcast
       block_number BIGINT,
       gas_used DECIMAL(40,0),
       reason VARCHAR(255),
@@ -123,6 +124,11 @@ async function init() {
       INDEX idx_qvt_xf_epoch (epoch_id),
       INDEX idx_qvt_xf_kind (kind)
     )`);
+
+  // Additive migration for databases created before the write-ahead column.
+  // MySQL has no ADD COLUMN IF NOT EXISTS, so a duplicate is simply ignored.
+  try { await pool.query('ALTER TABLE qdex_volume_trades ADD COLUMN nonce BIGINT AFTER tx_hash'); }
+  catch (e) { if (e.code !== 'ER_DUP_FIELDNAME') throw e; }
 }
 
 const q = async (sql, args) => { if (!pool) await init(); return pool.query(sql, args); };
@@ -169,19 +175,34 @@ async function markWallet(epochId, idx, field, balances) {
 
 // ---- activity ----
 async function insertTrade(t) {
-  await q(
+  const [r] = await q(
     `INSERT INTO qdex_volume_trades
       (timestamp, epoch_id, run_id, is_dry_run, status, wallet_idx, wallet_address, pool_address, pool_label,
        side, amount_in, amount_in_symbol, amount_out, amount_out_symbol, notional_wl1x, exec_price,
-       price_before, price_after, impact_bps, anchor_price, deviation_pct, min_out, tx_hash, block_number, gas_used, reason)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       price_before, price_after, impact_bps, anchor_price, deviation_pct, min_out, tx_hash, nonce, block_number, gas_used, reason)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [t.timestamp ?? new Date(), t.epochId ?? null, t.runId ?? null, t.isDryRun ? 1 : 0, t.status,
      t.walletIdx ?? null, t.walletAddress ?? null, t.poolAddress ?? null, t.poolLabel ?? null,
      t.side ?? null, t.amountIn ?? null, t.amountInSymbol ?? null, t.amountOut ?? null, t.amountOutSymbol ?? null,
      t.notionalWl1x ?? null, t.execPrice ?? null, t.priceBefore ?? null, t.priceAfter ?? null,
      t.impactBps ?? null, t.anchorPrice ?? null, t.deviationPct ?? null, t.minOut ?? null,
-     t.txHash ?? null, t.blockNumber ?? null, t.gasUsed ?? null, t.reason ? String(t.reason).slice(0, 250) : null]
+     t.txHash ?? null, t.nonce ?? null, t.blockNumber ?? null, t.gasUsed ?? null, t.reason ? String(t.reason).slice(0, 250) : null]
   );
+  return r.insertId;
+}
+
+// Update a row in place. Used by the write-ahead path: a row is written BEFORE
+// the transaction is broadcast, then amended once the outcome is known.
+async function updateTrade(id, f) {
+  const sets = [], args = [];
+  const map = { status: 'status', txHash: 'tx_hash', blockNumber: 'block_number', gasUsed: 'gas_used',
+    reason: 'reason', nonce: 'nonce', amountOut: 'amount_out', priceAfter: 'price_after' };
+  for (const [k, col] of Object.entries(map)) {
+    if (f[k] !== undefined) { sets.push(`${col} = ?`); args.push(f[k]); }
+  }
+  if (!sets.length) return;
+  args.push(id);
+  await q(`UPDATE qdex_volume_trades SET ${sets.join(', ')} WHERE id = ?`, args);
 }
 async function insertTransfer(x) {
   await q(
@@ -197,7 +218,7 @@ async function insertTransfer(x) {
 async function end() { if (pool) await pool.end(); pool = null; }
 
 module.exports = {
-  dbConfig, init, end, query: q,
+  dbConfig, init, end, query: q, updateTrade,
   createEpoch, getActiveEpoch, getEpoch, setEpochStatus,
   insertWallet, getWallets, markWallet,
   insertTrade, insertTransfer

@@ -176,7 +176,11 @@ async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log =
 // Execute one swap through THIS pool's router. Mirrors the hardening in
 // qdex/lib.js: retry the gas estimate (transient 502s surface as bogus reverts),
 // then pin the nonce so a retried broadcast can never become a second swap.
-async function executeSwap({ market, signer, side, quote: q, config, log = () => {} }) {
+// `onNonce` fires once the nonce is known and BEFORE anything is broadcast;
+// `onSent` fires the moment a hash exists, before the receipt. Together they let
+// the caller keep a write-ahead record, so a process killed mid-broadcast still
+// leaves a row that reconciliation can find.
+async function executeSwap({ market, signer, side, quote: q, config, log = () => {}, onNonce, onSent }) {
   const routerAddr = market.cfg.router;
   const tokenIn = q.tokenIn, tokenOut = q.tokenOut;
   const amountIn = ethers.parseUnits(q.amountInHuman.toFixed(tokenIn.decimals), tokenIn.decimals);
@@ -209,9 +213,13 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
 
   const c = routerContract(routerAddr, signer, variant);
   const nonce = await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'swap.nonce', log });
+  // Write-ahead point: the caller records its intent here. Everything after this
+  // line can move funds, so from now on a crash must still leave a trace.
+  if (onNonce) await onNonce({ nonce, variant });
   const tx = await lib.withRetry(
     () => c.exactInputSingle(paramsFor(variant, raw), { gasLimit: (gasEst * 12n) / 10n, nonce }),
     { attempts: 2, label: 'swap.send', log });
+  if (onSent) await onSent({ hash: tx.hash, nonce });
   try {
     return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
   } catch (e) {
