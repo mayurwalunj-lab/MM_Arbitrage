@@ -81,6 +81,18 @@ async function withRetry(fn, { attempts = 4, baseDelayMs = 800, label = 'rpc', l
   throw lastErr;
 }
 
+// Hard wall-clock timeout: races a promise against a timer so a single RPC op can
+// NEVER hang the loop, even when the underlying call swallows errors and polls
+// forever (e.g. tx.wait re-polling a receipt while the RPC keeps returning -32001).
+// Rejects with code TIMEOUT, which isTransientRpcError treats as retryable.
+function withTimeout(promise, ms, label) {
+  let t;
+  const timer = new Promise((_, rej) => {
+    t = setTimeout(() => rej(Object.assign(new Error(`${label} timed out after ${ms}ms`), { code: 'TIMEOUT' })), ms);
+  });
+  return Promise.race([Promise.resolve(promise), timer]).finally(() => clearTimeout(t));
+}
+
 function getConfig() {
   return {
     // network + contracts — all sourced from .env (see .env.example for values)
@@ -322,15 +334,17 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
   // (a) rides out transient 502s and (b) if it's a REAL revert, throws the true
   // reason instead of a null one. Then send once with an explicit gasLimit so the
   // broadcast doesn't re-estimate (and can't be retried into a double-send).
-  const gasEst = await withRetry(() => router.exactInputSingle.estimateGas(params),
+  const gasEst = await withRetry(() => withTimeout(router.exactInputSingle.estimateGas(params), 30000, 'estimateGas'),
     { attempts: 4, label: 'swap.estimateGas', log });
   // Pin the nonce so a retried broadcast reuses the SAME nonce — if the first
   // send actually landed, the resubmit is rejected as a duplicate (not a second
   // swap). This makes retrying the broadcast safe against transient 502s.
-  const nonce = await withRetry(() => wallet.getNonce('pending'), { attempts: 3, label: 'swap.nonce', log });
-  const tx = await withRetry(() => router.exactInputSingle(params, { gasLimit: (gasEst * 12n) / 10n, nonce }),
+  const nonce = await withRetry(() => withTimeout(wallet.getNonce('pending'), 20000, 'nonce'), { attempts: 3, label: 'swap.nonce', log });
+  const tx = await withRetry(() => withTimeout(router.exactInputSingle(params, { gasLimit: (gasEst * 12n) / 10n, nonce }), 40000, 'send'),
     { attempts: 2, label: 'swap.send', log });
-  return withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
+  // tx.wait gets BOTH an ethers-native 60s timeout AND an outer 70s hard wall — a
+  // -32001-looping receipt poll can no longer freeze the bot; it throws + retries.
+  return withRetry(() => withTimeout(tx.wait(1, 60000), 70000, 'wait'), { attempts: 3, label: 'swap.wait', log });
 }
 
 module.exports = {
