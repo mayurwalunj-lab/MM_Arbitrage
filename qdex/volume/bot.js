@@ -40,6 +40,12 @@ const guards = require('./guards');
 const argv = process.argv.slice(2);
 const wantExecute = argv.includes('--execute');
 const once = argv.includes('--once');
+// One-off narrowing without editing .env:
+//   --pool L1USD          only that pool (label or address, comma-separated)
+//   --wallets 2           only the first 2 wallets of the roster
+const flagVal = (name) => { const i = argv.indexOf(name); return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : null; };
+const cliPools = (flagVal('--pool') || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const cliWallets = Number(flagVal('--wallets'));
 
 const ts = () => new Date().toISOString();
 const log = (m) => console.log(`[${ts()}] ${m}`);
@@ -166,24 +172,40 @@ async function run() {
   const cleanup = () => guards.releaseLock(config.lockFile);
   process.on('exit', cleanup);
 
-  const signers = await epochMod.loadSigners({ config, epochId: epoch.id, provider });
+  const fullRoster = await epochMod.loadSigners({ config, epochId: epoch.id, provider });
+  const walletLimit = Number.isFinite(cliWallets) && cliWallets > 0 ? cliWallets : config.activeWallets;
+  const wsel = guards.applyWalletLimit(fullRoster, walletLimit);
+  const signers = wsel.signers;
+  if (wsel.limited) log(`using ${signers.length} of ${fullRoster.length} wallets: ${signers.map((s) => 'w' + pad2(s.idx)).join(', ')}`);
+  else if (walletLimit > 0 && walletLimit >= fullRoster.length) log(`QVT_ACTIVE_WALLETS=${walletLimit} >= roster size ${fullRoster.length} — using all of them`);
   const parent = config.parentPrivateKey ? walletsMod.parentSigner(config, provider) : null;
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
 
   // Load every market once to seed anchors and TVL weights.
-  const markets = [];
+  const allMarkets = [];
   for (const p of config.pools) {
     try {
       const m = await poolsMod.loadMarket({ provider, poolCfg: p, config, tokenMeta });
       m.tvlWl1x = await poolTvlWl1x({ provider, market: m, config });
-      markets.push(m);
+      allMarkets.push(m);
       log(`pool ${p.label.padEnd(8)} px=${poolsMod.price(m).toPrecision(6)} tvl=${m.tvlWl1x.toFixed(2)} WL1X ` +
         `maxBuy=${poolsMod.maxSizeAtImpact(m, config.maxImpactBps, 'buy').toFixed(4)} WL1X`);
     } catch (e) {
       log(`pool ${p.label}: FAILED to load (${String(e.shortMessage || e.message).slice(0, 90)}) — excluded`);
     }
   }
-  if (!markets.length) { console.error('No pools could be loaded.'); process.exit(1); }
+  if (!allMarkets.length) { console.error('No pools could be loaded.'); process.exit(1); }
+
+  // ---- narrow to the focused pools, falling back loudly if nothing matches ----
+  const focus = cliPools.length ? cliPools : config.focusPools;
+  const sel = guards.applyPoolFocus(allMarkets, focus);
+  const markets = sel.markets;
+  if (sel.fellBack) {
+    log(`WARNING: focus [${focus.join(', ')}] matched none of the loaded pools ` +
+        `(${allMarkets.map((m) => m.cfg.label).join(', ')}) — falling back to ALL ${markets.length} pools.`);
+  } else if (sel.focused) {
+    log(`focused on ${markets.length} pool(s): ${markets.map((m) => m.cfg.label).join(', ')}`);
+  }
 
   const anchors = new guards.AnchorBook(config);
   markets.forEach((m) => anchors.seedIfAbsent(m.address, poolsMod.price(m)));

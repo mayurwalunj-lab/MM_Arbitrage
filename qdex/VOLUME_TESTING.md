@@ -96,6 +96,31 @@ absorbs 40,000× *less*. So `QVT_MAX_IMPACT_BPS` is the real control and the siz
 is derived from each pool's own state at quote time. `QVT_MIN_TRADE_WL1X` and
 `QVT_MAX_TRADE_WL1X` are only outer clamps.
 
+### Narrowing a run: fewer pools, fewer wallets
+
+Start small. Both can be set per run or in `.env`:
+
+```bash
+npm run qdex:vol -- --pool L1USD --wallets 2      # one pool, two wallets
+npm run qdex:vol -- --pool L1USD,M1X --wallets 3  # several pools
+```
+
+```
+QVT_FOCUS_POOLS=L1USD           # labels or addresses, comma-separated; empty = all
+QVT_ACTIVE_WALLETS=2            # first N of the roster; empty or 0 = all
+```
+
+Flags win over the env values. `--wallets 2` uses `w00` and `w01` — the roster is
+still generated in full, so widening later needs no new wallets.
+
+**If the focus matches nothing** — a typo, or a pool that failed to load — the bot
+**falls back to every pool** and logs a warning. It will not sit idle because of a
+misspelling. A focus that matches *some* of its entries keeps only those, without
+falling back.
+
+This is the recommended shape for a first live run: one pool on the F1 router,
+two wallets, `QVT_MAX_SESSION_TX=1`.
+
 ### Pool weighting
 
 `QVT_POOL_WEIGHTING` controls how traffic is spread:

@@ -158,6 +158,74 @@ test('a corrupt lock file does not wedge the bot', () => {
   fsx.rmSync(lockPath, { force: true });
 });
 
+// ---------------------------------------------------------------- focus
+const mk = (label, address) => ({ cfg: { label }, address });
+const MKTS = [mk('L1USD', '0xAAA1'), mk('M1X', '0xBBB2'), mk('DRAU', '0xCCC3')];
+
+test('focus by label narrows to just that pool', () => {
+  const r = guards.applyPoolFocus(MKTS, ['l1usd']);
+  assert.strictEqual(r.markets.length, 1);
+  assert.strictEqual(r.markets[0].cfg.label, 'L1USD');
+  assert.strictEqual(r.focused, true);
+  assert.strictEqual(r.fellBack, false);
+});
+
+test('focus by address works and is case-insensitive', () => {
+  const r = guards.applyPoolFocus(MKTS, ['0xbbb2']);
+  assert.strictEqual(r.markets.length, 1);
+  assert.strictEqual(r.markets[0].cfg.label, 'M1X');
+});
+
+test('focus can name several pools', () => {
+  const r = guards.applyPoolFocus(MKTS, ['L1USD', '0xCCC3']);
+  assert.deepStrictEqual(r.markets.map((m) => m.cfg.label), ['L1USD', 'DRAU']);
+});
+
+test('a focus matching nothing falls back to ALL pools, not none', () => {
+  const r = guards.applyPoolFocus(MKTS, ['TYPO', '0xdeadbeef']);
+  assert.strictEqual(r.markets.length, 3, 'a typo must not leave the bot unable to trade');
+  assert.strictEqual(r.focused, false);
+  assert.strictEqual(r.fellBack, true);
+});
+
+test('a partially-matching focus keeps only what matched', () => {
+  const r = guards.applyPoolFocus(MKTS, ['L1USD', 'NOPE']);
+  assert.deepStrictEqual(r.markets.map((m) => m.cfg.label), ['L1USD']);
+  assert.strictEqual(r.fellBack, false);
+});
+
+test('no focus set leaves the list untouched', () => {
+  for (const f of [[], null, undefined]) {
+    const r = guards.applyPoolFocus(MKTS, f);
+    assert.strictEqual(r.markets.length, 3);
+    assert.strictEqual(r.focused, false);
+  }
+});
+
+// ---------------------------------------------------------------- wallet limit
+const ROSTER = [0, 1, 2, 3, 4].map((i) => ({ idx: i, address: '0x' + i }));
+
+test('wallet limit takes the first N', () => {
+  const r = guards.applyWalletLimit(ROSTER, 2);
+  assert.deepStrictEqual(r.signers.map((s) => s.idx), [0, 1]);
+  assert.strictEqual(r.limited, true);
+});
+
+test('a limit at or above the roster size uses everyone', () => {
+  for (const n of [5, 9]) {
+    const r = guards.applyWalletLimit(ROSTER, n);
+    assert.strictEqual(r.signers.length, 5);
+    assert.strictEqual(r.limited, false);
+  }
+});
+
+test('zero or nonsense limits never empty the roster', () => {
+  for (const n of [0, -3, NaN, null, undefined]) {
+    const r = guards.applyWalletLimit(ROSTER, n);
+    assert.strictEqual(r.signers.length, 5, `limit ${n} must not disable trading`);
+  }
+});
+
 // ---------------------------------------------------------------- side choice
 const sideCfg = { maxDeviationPct: 0.75, inventoryTargetPct: 50, biasStrength: 0.7 };
 

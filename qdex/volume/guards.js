@@ -168,6 +168,26 @@ function chooseSide({ wl1xValue, tokenValue, deviationPct, config, rng = Math.ra
   return { side, reason: `inventory ${(wl1xShare * 100).toFixed(0)}% WL1X (target ${config.inventoryTargetPct}%), p(buy)=${p.toFixed(2)}` };
 }
 
+// Narrow a loaded market list to the focused pools. A focus can name either the
+// pool label (L1USD) or its address, case-insensitively. Returning the FULL list
+// when nothing matches is deliberate: a typo in QVT_FOCUS_POOLS should not leave
+// the bot silently unable to trade anything. The caller warns on fallback.
+function applyPoolFocus(markets, focus) {
+  if (!focus || !focus.length) return { markets, focused: false, fellBack: false };
+  const want = new Set(focus.map((s) => String(s).trim().toLowerCase()).filter(Boolean));
+  const hit = markets.filter((m) =>
+    want.has(String(m.cfg.label).toLowerCase()) || want.has(String(m.address).toLowerCase()));
+  if (!hit.length) return { markets, focused: false, fellBack: true };
+  return { markets: hit, focused: true, fellBack: false };
+}
+
+// Same idea for wallets: take the first N of the roster, and fall back to the
+// whole roster rather than an empty set if N is nonsense.
+function applyWalletLimit(signers, n) {
+  if (!n || n <= 0 || n >= signers.length) return { signers, limited: false };
+  return { signers: signers.slice(0, n), limited: true };
+}
+
 // Weighted pick without replacement bias — used for pool selection so a $2M pool
 // gets proportionally more traffic than a $26K one.
 function weightedPick(items, weightOf, rng = Math.random) {
@@ -187,4 +207,4 @@ function logUniform(lo, hi, rng = Math.random) {
   return Math.exp(randBetween(Math.log(lo), Math.log(hi), rng));
 }
 
-module.exports = { RateLimiter, StopController, AnchorBook, chooseSide, weightedPick, randBetween, logUniform, acquireLock, releaseLock };
+module.exports = { RateLimiter, StopController, AnchorBook, chooseSide, weightedPick, randBetween, logUniform, acquireLock, releaseLock, applyPoolFocus, applyWalletLimit };

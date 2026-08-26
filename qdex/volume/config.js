@@ -115,6 +115,12 @@ function getConfig() {
     maxDelayMs: envNum('QVT_MAX_DELAY_MS', 60000),
     walletCooldownMs: envNum('QVT_WALLET_COOLDOWN_MS', 120000),
     poolWeighting: (process.env.QVT_POOL_WEIGHTING || 'sqrt').toLowerCase(),
+    // Narrow the run to specific pools (labels or addresses) and/or the first N
+    // wallets of the roster. If a focus is set but nothing matches — a typo, or a
+    // pool that failed to load — the bot falls back to the full set rather than
+    // silently doing nothing, and says so loudly.
+    focusPools: envList('QVT_FOCUS_POOLS').map((s) => s.toLowerCase()),
+    activeWallets: envNum('QVT_ACTIVE_WALLETS', 0),   // 0 = use the whole roster
 
     // ---- session budget + emergency stop ----
     maxSessionTx: envNum('QVT_MAX_SESSION_TX', 0),           // 0 = unlimited
