@@ -10,6 +10,12 @@
 //   node qdex/volume/report.js --hours 168     last week
 //   node qdex/volume/report.js --epoch 3       one specific epoch
 //   node qdex/volume/report.js --all           every epoch
+//   node qdex/volume/report.js --dry           simulations only
+//   node qdex/volume/report.js --mode all      live and dry-run together
+//
+// Defaults to LIVE ONLY. Dry runs explore every pool and produce far more rows
+// than real trading does; summing the two makes it look like pools are trading
+// live when they have never been touched.
 //
 // Skip reasons are printed deliberately: when tuning limits they are the most
 // informative output the harness produces.
@@ -33,13 +39,22 @@ const bar = (w = 74) => console.log('-'.repeat(w));
 
   const hours = Number(arg('--hours', 24));
   const epochArg = arg('--epoch');
+  // Dry-run and live rows must not be summed together. A dry run explores every
+  // pool and can rack up hundreds of simulated trades; presenting those beside a
+  // handful of real ones makes it look like the fleet is trading pools it has
+  // never touched. Default to LIVE so the report answers "what actually
+  // happened"; --dry or --mode all opt into the rest.
+  const mode = (arg('--mode') || (has('--dry') ? 'dry' : has('--live') ? 'live' : 'live')).toLowerCase();
   const where = [];
   const params = [];
+  if (mode === 'live') where.push('is_dry_run = 0');
+  else if (mode === 'dry') where.push('is_dry_run = 1');
   if (epochArg) { where.push('epoch_id = ?'); params.push(Number(epochArg)); }
   else if (!has('--all')) { where.push('timestamp >= DATE_SUB(NOW(), INTERVAL ? HOUR)'); params.push(hours); }
   const W = where.length ? 'WHERE ' + where.join(' AND ') : '';
 
-  const scope = epochArg ? `epoch ${epochArg}` : has('--all') ? 'all time' : `last ${hours}h`;
+  const scopeMode = mode === 'all' ? 'live + dry-run' : mode === 'dry' ? 'DRY-RUN only' : 'LIVE only';
+  const scope = (epochArg ? `epoch ${epochArg}` : has('--all') ? 'all time' : `last ${hours}h`) + `  ·  ${scopeMode}`;
   console.log(`\n${'='.repeat(74)}`);
   console.log(`  QDEX VOLUME TEST — ${scope}`);
   console.log('='.repeat(74));
@@ -120,16 +135,20 @@ const bar = (w = 74) => console.log('-'.repeat(w));
   // ---- epochs ----
   const [eps] = await db.query(`
     SELECT e.id, e.status, e.wallet_count, e.created_at, e.expires_at, e.retired_at,
-           (SELECT COUNT(*) FROM qdex_volume_trades t WHERE t.epoch_id = e.id AND t.status='executed') trades
+           (SELECT COUNT(*) FROM qdex_volume_trades t WHERE t.epoch_id = e.id AND t.status='executed' AND t.is_dry_run = 0) live_trades,
+           (SELECT COUNT(*) FROM qdex_volume_trades t WHERE t.epoch_id = e.id AND t.status='executed' AND t.is_dry_run = 1) dry_trades
     FROM qdex_volume_epochs e ORDER BY e.id DESC LIMIT 8`);
   if (eps.length) {
     console.log('\n  epochs');
     bar();
-    console.log(`  ${pad('id', 5)}${pad('status', 10)}${rpad('wallets', 8)}${rpad('trades', 8)}   created -> expires`);
-    eps.forEach((e) => console.log(`  ${pad(e.id, 5)}${pad(e.status, 10)}${rpad(e.wallet_count, 8)}${rpad(e.trades, 8)}   ` +
+    console.log(`  ${pad('id', 5)}${pad('status', 10)}${rpad('wallets', 8)}${rpad('live', 7)}${rpad('dry', 7)}   created -> expires`);
+    eps.forEach((e) => console.log(`  ${pad(e.id, 5)}${pad(e.status, 10)}${rpad(e.wallet_count, 8)}${rpad(e.live_trades, 7)}${rpad(e.dry_trades, 7)}   ` +
       `${e.created_at} -> ${e.expires_at || '-'}${e.retired_at ? '  (retired ' + e.retired_at + ')' : ''}`));
   }
 
+  if (mode !== 'all') {
+    console.log(`  showing ${scopeMode}. Use --mode all to include everything, --dry for simulations only.`);
+  }
   console.log('');
   await db.end().catch(() => {});
 })().catch((e) => { console.error(`FATAL: ${e.stack || e.message}`); process.exit(1); });
