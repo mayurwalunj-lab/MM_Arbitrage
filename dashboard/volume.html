@@ -45,9 +45,9 @@
   </div>
   <div>
     <div class="filter" id="modeFilter">
-      <button data-mode="all" class="on">All</button>
-      <button data-mode="live">Live</button>
+      <button data-mode="live" class="on">Live</button>
       <button data-mode="dry">Dry-run</button>
+      <button data-mode="all">All</button>
     </div>
     <div class="filter" style="margin-left:8px">
       <button data-hours="24" class="on">24h</button>
@@ -59,6 +59,10 @@
 
 <div class="banner">
   This page shows test-generated activity, not organic user trading. Wallet keys are never served here.
+</div>
+<div class="banner" id="modeNote" style="display:none">
+  Showing <strong>simulated</strong> rows alongside real ones. Dry runs explore every pool and vastly
+  outnumber live trades, so totals here do not describe what actually happened on chain.
 </div>
 
 <div class="grid" id="tiles"></div>
@@ -96,7 +100,7 @@
 
 <script>
 const API = '';
-let mode = 'all', hours = 24;
+let mode = 'live', hours = 24;
 
 // Pool prices here span many orders of magnitude (TAXX trades near 8e-5 per
 // WL1X, M1X near 2000), so a fixed decimal count renders real amounts as
@@ -127,6 +131,7 @@ async function load() {
     fetch(API + '/api/qdex/volume/trades?limit=60&mode=' + mode).then(r => r.json())
   ]);
 
+  document.getElementById('modeNote').style.display = (mode === 'live') ? 'none' : 'block';
   const t = sum.totals || {};
   const executed = Number(t.executed || 0), attempts = Number(t.attempts || 0);
   const spanH = t.first_ts && t.last_ts ? (new Date(t.last_ts) - new Date(t.first_ts)) / 3600000 : 0;
