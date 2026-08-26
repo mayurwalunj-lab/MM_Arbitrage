@@ -17,9 +17,18 @@ const guards = require('./guards');
 const pools = require('./pools');
 
 let passed = 0;
+const pending = [];
 const test = (name, fn) => {
-  try { fn(); console.log(`  ok    ${name}`); passed++; }
-  catch (e) { console.log(`  FAIL  ${name}\n        ${e.message}`); process.exitCode = 1; }
+  try {
+    const r = fn();
+    // Async tests return a promise; collect them so the summary waits.
+    if (r && typeof r.then === 'function') {
+      pending.push(r.then(() => { console.log(`  ok    ${name}`); passed++; })
+        .catch((e) => { console.log(`  FAIL  ${name}\n        ${e.message}`); process.exitCode = 1; }));
+      return;
+    }
+    console.log(`  ok    ${name}`); passed++;
+  } catch (e) { console.log(`  FAIL  ${name}\n        ${e.message}`); process.exitCode = 1; }
 };
 
 console.log('\nQDex volume harness — offline self-test\n');
@@ -397,6 +406,43 @@ test('a zero-liquidity pool quotes nothing rather than dividing by zero', () => 
   assert.strictEqual(pools.maxSizeAtImpact(dead, 25, 'buy'), 0);
 });
 
+// ---------------------------------------------------------------- nonce manager
+test('nonce manager hands out a strictly increasing sequence', async () => {
+  const { NonceManager } = require('./funding');
+  const nm = new NonceManager();
+  // A node whose pending count LAGS: it keeps answering 5 no matter how many
+  // transactions have been broadcast. This is what caused TRANSACTION_REPLACED.
+  const signer = { address: '0xAbC', getNonce: async () => 5 };
+  const got = [];
+  for (let i = 0; i < 4; i++) got.push(nm.take(signer));
+  return Promise.all(got).then((ns) => {
+    assert.deepStrictEqual(ns, [5, 6, 7, 8], 'each send must get its own nonce');
+  });
+});
+
+test('nonce manager keeps separate sequences per wallet', async () => {
+  const { NonceManager } = require('./funding');
+  const nm = new NonceManager();
+  const a = { address: '0xAAA', getNonce: async () => 10 };
+  const b = { address: '0xBBB', getNonce: async () => 99 };
+  assert.strictEqual(await nm.take(a), 10);
+  assert.strictEqual(await nm.take(b), 99);
+  assert.strictEqual(await nm.take(a), 11);
+  assert.strictEqual(await nm.take(b), 100);
+});
+
+test('reset re-reads the chain — a failed send invalidates the local count', async () => {
+  const { NonceManager } = require('./funding');
+  const nm = new NonceManager();
+  let chain = 3;
+  const signer = { address: '0xAbC', getNonce: async () => chain };
+  assert.strictEqual(await nm.take(signer), 3);
+  assert.strictEqual(await nm.take(signer), 4);
+  chain = 4;                 // only one of the two actually landed
+  nm.reset(signer);
+  assert.strictEqual(await nm.take(signer), 4, 'must resync rather than keep counting');
+});
+
 // ---------------------------------------------------------------- donor choice
 test('donor selection never drops a donor below its own floor', () => {
   const { chooseDonor } = require('./funding');
@@ -418,4 +464,6 @@ test('no donor is returned when everyone is at the floor', () => {
   assert.strictEqual(chooseDonor(snaps, '0xz', cfg), null);
 });
 
-console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ', all green'}\n`);
+Promise.all(pending).then(() => {
+  console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ', all green'}\n`);
+});

@@ -19,18 +19,66 @@ const { ERC20_ABI } = require('./wallets');
 
 const wei = (human, decimals) => ethers.parseUnits(Number(human).toFixed(decimals), decimals);
 
-async function transferToken({ signer, token, to, amountWei, log = () => {} }) {
-  const c = new ethers.Contract(token, ERC20_ABI, signer);
-  const gas = await lib.withRetry(() => c.transfer.estimateGas(to, amountWei), { attempts: 3, label: 'transfer.estimateGas', log });
-  const nonce = await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'transfer.nonce', log });
-  const tx = await c.transfer(to, amountWei, { gasLimit: (gas * 12n) / 10n, nonce });
-  return lib.withRetry(() => tx.wait(), { attempts: 3, label: 'transfer.wait', log });
+// Sequential nonce allocation for a batch of sends from one wallet.
+//
+// Asking the node for getNonce('pending') before every transfer looks correct
+// but is not: on a lagging RPC the pending count does not yet include the
+// transaction just broadcast, so two sends draw the SAME nonce and the second
+// replaces the first — surfacing as TRANSACTION_REPLACED with half the batch
+// silently missing. Funding ten wallets means twenty sends in a row, which is
+// exactly where that bites.
+//
+// So the nonce is fetched once per wallet and incremented locally. Any failure
+// re-syncs from the chain, since after an error the local count cannot be trusted.
+class NonceManager {
+  constructor() { this.next = new Map(); this.syncing = new Map(); }
+  async take(signer) {
+    const k = signer.address.toLowerCase();
+    if (!this.next.has(k)) {
+      // Share ONE in-flight sync per wallet. Without this, callers that arrive
+      // together all see an empty cache, all fetch, and all receive the same
+      // starting nonce — reintroducing the very collision this class prevents.
+      if (!this.syncing.has(k)) {
+        this.syncing.set(k, lib.withRetry(() => signer.getNonce('latest'), { attempts: 3, label: 'nonce.sync' })
+          .then((n) => { if (!this.next.has(k)) this.next.set(k, n); this.syncing.delete(k); },
+            (e) => { this.syncing.delete(k); throw e; }));
+      }
+      await this.syncing.get(k);
+    }
+    // Read-then-increment is atomic here: no await between the two lines, and
+    // JS runs this turn to completion before any other caller resumes.
+    const n = this.next.get(k);
+    this.next.set(k, n + 1);
+    return n;
+  }
+  // Drop the cached value so the next take() re-reads the chain.
+  reset(signer) { this.next.delete(signer.address.toLowerCase()); }
 }
 
-async function transferNative({ signer, to, amountWei, log = () => {} }) {
-  const nonce = await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'native.nonce', log });
-  const tx = await signer.sendTransaction({ to, value: amountWei, nonce });
-  return lib.withRetry(() => tx.wait(), { attempts: 3, label: 'native.wait', log });
+async function transferToken({ signer, token, to, amountWei, log = () => {}, nonces }) {
+  const c = new ethers.Contract(token, ERC20_ABI, signer);
+  const gas = await lib.withRetry(() => c.transfer.estimateGas(to, amountWei), { attempts: 3, label: 'transfer.estimateGas', log });
+  const nonce = nonces ? await nonces.take(signer)
+    : await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'transfer.nonce', log });
+  try {
+    const tx = await c.transfer(to, amountWei, { gasLimit: (gas * 12n) / 10n, nonce });
+    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'transfer.wait', log });
+  } catch (e) {
+    if (nonces) nonces.reset(signer);
+    throw e;
+  }
+}
+
+async function transferNative({ signer, to, amountWei, log = () => {}, nonces }) {
+  const nonce = nonces ? await nonces.take(signer)
+    : await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'native.nonce', log });
+  try {
+    const tx = await signer.sendTransaction({ to, value: amountWei, nonce });
+    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'native.wait', log });
+  } catch (e) {
+    if (nonces) nonces.reset(signer);
+    throw e;
+  }
 }
 
 // Cost of one plain native transfer, used to leave exactly enough behind when
@@ -44,6 +92,8 @@ async function nativeSweepReserve(provider) {
 // ---- fund: parent -> each sub-wallet, WL1X + native gas ----
 async function fundWallets({ provider, parent, signers, config, execute, record, log }) {
   const results = [];
+  // One tracker for the whole batch — twenty sequential sends from the parent.
+  const nonces = new NonceManager();
   for (const s of signers) {
     const bal = await provider.getBalance(s.address);
     const wl1x = new ethers.Contract(config.wl1x, ERC20_ABI, provider);
@@ -55,14 +105,14 @@ async function fundWallets({ provider, parent, signers, config, execute, record,
     if (needNative > 0n) {
       log(`fund w${String(s.idx).padStart(2, '0')} native ${ethers.formatEther(needNative)}`);
       let hash = null;
-      if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: needNative, log }))?.hash;
+      if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: needNative, log, nonces }))?.hash;
       await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
         amount: Number(ethers.formatEther(needNative)), txHash: hash });
     }
     if (needWl1x > 0n) {
       log(`fund w${String(s.idx).padStart(2, '0')} WL1X ${ethers.formatUnits(needWl1x, 18)}`);
       let hash = null;
-      if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: s.address, amountWei: needWl1x, log }))?.hash;
+      if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: s.address, amountWei: needWl1x, log, nonces }))?.hash;
       await record({ kind: 'fund', from: parent.address, to: s.address, token: config.wl1x, tokenSymbol: 'WL1X',
         amount: Number(ethers.formatUnits(needWl1x, 18)), txHash: hash });
     }
@@ -142,7 +192,7 @@ async function ensureSweepGas({ provider, signer, parent, snapshot, config, exec
 }
 
 // ---- sweep: sub-wallet -> parent, IN KIND (no swaps) ----
-async function sweepWallet({ provider, signer, parent, snapshot, config, execute, record, log }) {
+async function sweepWallet({ provider, signer, parent, snapshot, config, execute, record, log, nonces = new NonceManager() }) {
   const moved = [];
   const toppedUp = await ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log });
   if (toppedUp > 0n) snapshot = { ...snapshot, nativeRaw: snapshot.nativeRaw + toppedUp };
@@ -152,7 +202,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
     if (!(t.raw > 0n)) continue;
     log(`sweep w${signer.idx} ${t.human} ${t.symbol}`);
     let hash = null;
-    if (execute) hash = (await transferToken({ signer: signer.wallet, token: addr, to: parent.address, amountWei: t.raw, log }))?.hash;
+    if (execute) hash = (await transferToken({ signer: signer.wallet, token: addr, to: parent.address, amountWei: t.raw, log, nonces }))?.hash;
     await record({ kind: 'sweep', from: signer.address, to: parent.address, token: addr, tokenSymbol: t.symbol, amount: t.human, txHash: hash });
     moved.push({ symbol: t.symbol, amount: t.human });
   }
@@ -161,7 +211,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
   if (snapshot.wl1xRaw > 0n) {
     log(`sweep w${signer.idx} ${snapshot.wl1x} WL1X`);
     let hash = null;
-    if (execute) hash = (await transferToken({ signer: signer.wallet, token: config.wl1x, to: parent.address, amountWei: snapshot.wl1xRaw, log }))?.hash;
+    if (execute) hash = (await transferToken({ signer: signer.wallet, token: config.wl1x, to: parent.address, amountWei: snapshot.wl1xRaw, log, nonces }))?.hash;
     await record({ kind: 'sweep', from: signer.address, to: parent.address, token: config.wl1x, tokenSymbol: 'WL1X', amount: snapshot.wl1x, txHash: hash });
     moved.push({ symbol: 'WL1X', amount: snapshot.wl1x });
   }
@@ -173,7 +223,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
     const human = Number(ethers.formatEther(send));
     log(`sweep w${signer.idx} ${human.toFixed(6)} L1X (gas dust left behind: ${ethers.formatEther(reserve)})`);
     let hash = null;
-    if (execute) hash = (await transferNative({ signer: signer.wallet, to: parent.address, amountWei: send, log }))?.hash;
+    if (execute) hash = (await transferNative({ signer: signer.wallet, to: parent.address, amountWei: send, log, nonces }))?.hash;
     await record({ kind: 'sweep', from: signer.address, to: parent.address, token: null, tokenSymbol: 'L1X', amount: human, txHash: hash });
     moved.push({ symbol: 'L1X', amount: human });
   }
@@ -184,6 +234,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
 // roster. This is why epoch 2+ starts pre-balanced — the new wallets inherit
 // the previous epoch's token bags and can trade either direction immediately. ----
 async function distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record, log }) {
+  const nonces = new NonceManager();
   const n = signers.length;
   const keep = 1 - config.parentReservePct / 100;
 
@@ -203,7 +254,7 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
     log(`distribute ${human} ${a.symbol} to each of ${n} wallets`);
     for (const s of signers) {
       let hash = null;
-      if (execute) hash = (await transferToken({ signer: parent, token: a.address, to: s.address, amountWei: share, log }))?.hash;
+      if (execute) hash = (await transferToken({ signer: parent, token: a.address, to: s.address, amountWei: share, log, nonces }))?.hash;
       await record({ kind: 'fund', from: parent.address, to: s.address, token: a.address, tokenSymbol: a.symbol, amount: human, txHash: hash, reason: 'in-kind distribution' });
     }
   }
@@ -214,10 +265,10 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
     const need = wei(config.fundGasNative, 18) - have;
     if (need <= 0n) continue;
     let hash = null;
-    if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: need, log }))?.hash;
+    if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: need, log, nonces }))?.hash;
     await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
       amount: Number(ethers.formatEther(need)), txHash: hash, reason: 'gas' });
   }
 }
 
-module.exports = { transferToken, transferNative, nativeSweepReserve, ensureSweepGas, fundWallets, rebalanceWallet, chooseDonor, sweepWallet, distributeInKind };
+module.exports = { NonceManager, transferToken, transferNative, nativeSweepReserve, ensureSweepGas, fundWallets, rebalanceWallet, chooseDonor, sweepWallet, distributeInKind };
