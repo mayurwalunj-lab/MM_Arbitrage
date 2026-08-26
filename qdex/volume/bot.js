@@ -420,13 +420,17 @@ async function run() {
         priceBefore: q.priceBefore, priceAfter: q.priceAfter, impactBps: q.impactBps,
         anchorPrice: anchor, deviationPct: devPct, minOut: q.minOutHuman
       };
-      const headline = `w${pad2(signer.idx)} ${market.cfg.label.padEnd(7)} ${side.toUpperCase().padEnd(4)} ` +
+      // Built lazily: executeSwap replaces q's analytic figures with the
+      // simulated ones, so a string frozen beforehand reports the curve's
+      // prediction rather than what the pool paid.
+      const headline = () => `w${pad2(signer.idx)} ${market.cfg.label.padEnd(7)} ${side.toUpperCase().padEnd(4)} ` +
         `${q.amountInHuman.toPrecision(6)} ${q.tokenIn.symbol} -> ${q.amountOutHuman.toPrecision(6)} ${q.tokenOut.symbol} ` +
-        `| ${q.priceBefore.toPrecision(6)}>${q.priceAfter.toPrecision(6)} ${(side === 'buy' ? '-' : '+')}${q.impactBps.toFixed(1)}bps`;
+        `| ${q.priceBefore.toPrecision(6)}>${q.priceAfter.toPrecision(6)} ${(side === 'buy' ? '-' : '+')}${q.impactBps.toFixed(1)}bps` +
+        `${q.effectiveCostBps != null ? ` cost ${q.effectiveCostBps.toFixed(0)}bps` : ''}`;
 
       if (!execute) {
         sim.applyTrade(signer.address, m.quote.address, side, q.amountInHuman, q.amountOutHuman);
-        log(`${headline} [DRY]`);
+        log(`${headline()} [DRY]`);
         await recordTrade({ ...row, status: 'executed', reason: `dry-run; ${sideReason}` });
         stop.recordSuccess(q.notionalWl1x);
       } else {
@@ -444,7 +448,7 @@ async function run() {
             },
             onSent: async ({ hash }) => { if (walId) await db.updateTrade(walId, { txHash: hash }); }
           });
-          log(`${headline} | ${receipt?.hash || '(no hash)'}`);
+          log(`${headline()} | ${receipt?.hash || '(no hash)'}`);
           // executeSwap replaces q's analytic figures with what the simulation
           // actually returned. `row` was built before that, so the corrected
           // numbers have to be written back or the log records the curve's
