@@ -36,6 +36,7 @@ const walletsMod = require('./wallets');
 const poolsMod = require('./pools');
 const funding = require('./funding');
 const guards = require('./guards');
+const { NonceManager } = require('./nonces');
 
 const argv = process.argv.slice(2);
 const wantExecute = argv.includes('--execute');
@@ -222,6 +223,10 @@ async function run() {
   const limiter = new guards.RateLimiter(config.maxTxPerHour);
   const stop = new guards.StopController(config, log);
   stop.installSignalHandlers();
+  // ONE nonce tracker for the whole run. The bot is single-threaded, so a
+  // single instance safely covers every send from every wallet: approvals,
+  // swaps, peer transfers and backstops alike.
+  const nonces = new NonceManager();
   const sim = new SimLedger();
   // Dry-run against an unfunded roster: assume the fleet has been funded so the
   // run demonstrates real behaviour instead of ten identical "out of gas" skips.
@@ -340,7 +345,7 @@ async function run() {
           others.push(execute ? rs : sim.overlay(rs));
         }
         const moved = parent
-          ? await funding.rebalanceWallet({ provider, recipient: snap, snapshots: others, signers, parent, config, execute, record: recordTransfer, log })
+          ? await funding.rebalanceWallet({ provider, recipient: snap, snapshots: others, signers, parent, config, execute, record: recordTransfer, log, nonces })
           : null;
         if (moved && !execute) {
           sim.applyWl1x(signer.address, moved.amount);
@@ -432,7 +437,7 @@ async function run() {
         let walId = null;
         try {
           const receipt = await poolsMod.executeSwap({
-            market: m, signer: signer.wallet, side, quote: q, config, log,
+            market: m, signer: signer.wallet, side, quote: q, config, log, nonces,
             onNonce: async ({ nonce }) => {
               walId = await db.insertTrade({ ...row, epochId: epoch.id, runId, isDryRun: false,
                 status: 'broadcasting', nonce: Number(nonce), reason: sideReason });

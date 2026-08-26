@@ -16,50 +16,14 @@
 const { ethers } = require('ethers');
 const lib = require('../lib');
 const { ERC20_ABI } = require('./wallets');
+const { NonceManager } = require('./nonces');
 
 const wei = (human, decimals) => ethers.parseUnits(Number(human).toFixed(decimals), decimals);
-
-// Sequential nonce allocation for a batch of sends from one wallet.
-//
-// Asking the node for getNonce('pending') before every transfer looks correct
-// but is not: on a lagging RPC the pending count does not yet include the
-// transaction just broadcast, so two sends draw the SAME nonce and the second
-// replaces the first — surfacing as TRANSACTION_REPLACED with half the batch
-// silently missing. Funding ten wallets means twenty sends in a row, which is
-// exactly where that bites.
-//
-// So the nonce is fetched once per wallet and incremented locally. Any failure
-// re-syncs from the chain, since after an error the local count cannot be trusted.
-class NonceManager {
-  constructor() { this.next = new Map(); this.syncing = new Map(); }
-  async take(signer) {
-    const k = signer.address.toLowerCase();
-    if (!this.next.has(k)) {
-      // Share ONE in-flight sync per wallet. Without this, callers that arrive
-      // together all see an empty cache, all fetch, and all receive the same
-      // starting nonce — reintroducing the very collision this class prevents.
-      if (!this.syncing.has(k)) {
-        this.syncing.set(k, lib.withRetry(() => signer.getNonce('latest'), { attempts: 3, label: 'nonce.sync' })
-          .then((n) => { if (!this.next.has(k)) this.next.set(k, n); this.syncing.delete(k); },
-            (e) => { this.syncing.delete(k); throw e; }));
-      }
-      await this.syncing.get(k);
-    }
-    // Read-then-increment is atomic here: no await between the two lines, and
-    // JS runs this turn to completion before any other caller resumes.
-    const n = this.next.get(k);
-    this.next.set(k, n + 1);
-    return n;
-  }
-  // Drop the cached value so the next take() re-reads the chain.
-  reset(signer) { this.next.delete(signer.address.toLowerCase()); }
-}
 
 async function transferToken({ signer, token, to, amountWei, log = () => {}, nonces }) {
   const c = new ethers.Contract(token, ERC20_ABI, signer);
   const gas = await lib.withRetry(() => c.transfer.estimateGas(to, amountWei), { attempts: 3, label: 'transfer.estimateGas', log });
-  const nonce = nonces ? await nonces.take(signer)
-    : await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'transfer.nonce', log });
+  const nonce = await NonceManager.nonceFor(nonces, signer, 'transfer.nonce');
   try {
     const tx = await c.transfer(to, amountWei, { gasLimit: (gas * 12n) / 10n, nonce });
     return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'transfer.wait', log });
@@ -70,8 +34,7 @@ async function transferToken({ signer, token, to, amountWei, log = () => {}, non
 }
 
 async function transferNative({ signer, to, amountWei, log = () => {}, nonces }) {
-  const nonce = nonces ? await nonces.take(signer)
-    : await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'native.nonce', log });
+  const nonce = await NonceManager.nonceFor(nonces, signer, 'native.nonce');
   try {
     const tx = await signer.sendTransaction({ to, value: amountWei, nonce });
     return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'native.wait', log });
@@ -134,7 +97,7 @@ function chooseDonor(snapshots, recipientAddress, config) {
   return candidates[0] || null;
 }
 
-async function rebalanceWallet({ provider, recipient, snapshots, signers, parent, config, execute, record, log }) {
+async function rebalanceWallet({ provider, recipient, snapshots, signers, parent, config, execute, record, log, nonces }) {
   const need = Math.max(config.walletFloorWl1x * 2 - recipient.wl1x, config.minTransferWl1x);
   const donor = chooseDonor(snapshots, recipient.address, config);
 
@@ -144,7 +107,7 @@ async function rebalanceWallet({ provider, recipient, snapshots, signers, parent
     const from = signers.find((x) => x.address === donor.s.address);
     log(`XFER w${from.idx} -> ${recipient.address.slice(0, 10)}… ${amount.toFixed(4)} WL1X (below floor ${config.walletFloorWl1x})`);
     let hash = null;
-    if (execute) hash = (await transferToken({ signer: from.wallet, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log }))?.hash;
+    if (execute) hash = (await transferToken({ signer: from.wallet, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log, nonces }))?.hash;
     await record({ kind: 'peer', from: donor.s.address, to: recipient.address, token: config.wl1x,
       tokenSymbol: 'WL1X', amount, txHash: hash, reason: 'below floor' });
     return { kind: 'peer', amount };
@@ -162,7 +125,7 @@ async function rebalanceWallet({ provider, recipient, snapshots, signers, parent
   const amount = Math.min(available, need);
   log(`BACKSTOP parent -> ${recipient.address.slice(0, 10)}… ${amount.toFixed(4)} WL1X (fleet-wide shortage)`);
   let hash = null;
-  if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log }))?.hash;
+  if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log, nonces }))?.hash;
   await record({ kind: 'backstop', from: parent.address, to: recipient.address, token: config.wl1x,
     tokenSymbol: 'WL1X', amount, txHash: hash, reason: 'fleet-wide shortage' });
   return { kind: 'backstop', amount };

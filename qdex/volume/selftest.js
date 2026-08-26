@@ -443,6 +443,34 @@ test('reset re-reads the chain — a failed send invalidates the local count', a
   assert.strictEqual(await nm.take(signer), 4, 'must resync rather than keep counting');
 });
 
+test('approve and swap from one wallet never share a nonce', async () => {
+  const { NonceManager } = require('./nonces');
+  const nm = new NonceManager();
+  // A wallet's FIRST trade is approve() then exactInputSingle() back to back.
+  // This node reports 12 forever, as a lagging RPC does.
+  const w = { address: '0xTrader', getNonce: async () => 12 };
+  const approveNonce = await NonceManager.nonceFor(nm, w, 'approve');
+  const swapNonce = await NonceManager.nonceFor(nm, w, 'swap');
+  assert.notStrictEqual(approveNonce, swapNonce,
+    'the swap must not replace the approve — it would then revert for no allowance');
+  assert.deepStrictEqual([approveNonce, swapNonce], [12, 13]);
+});
+
+test('nonceFor without a tracker falls back to querying the node', async () => {
+  const { NonceManager } = require('./nonces');
+  const w = { address: '0xTrader', getNonce: async (tag) => (tag === 'pending' ? 7 : 0) };
+  assert.strictEqual(await NonceManager.nonceFor(null, w, 'x'), 7);
+});
+
+test('one tracker keeps ten trading wallets independent', async () => {
+  const { NonceManager } = require('./nonces');
+  const nm = new NonceManager();
+  const fleet = Array.from({ length: 10 }, (_, i) => ({ address: '0xW' + i, getNonce: async () => i * 100 }));
+  // Two rounds of trades across the fleet, as the bot's round-robin would do.
+  for (const w of fleet) assert.strictEqual(await nm.take(w), fleet.indexOf(w) * 100);
+  for (const w of fleet) assert.strictEqual(await nm.take(w), fleet.indexOf(w) * 100 + 1);
+});
+
 // ---------------------------------------------------------------- donor choice
 test('donor selection never drops a donor below its own floor', () => {
   const { chooseDonor } = require('./funding');

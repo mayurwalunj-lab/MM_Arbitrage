@@ -14,6 +14,7 @@
 const { ethers } = require('ethers');
 const lib = require('../lib');
 const { ERC20_ABI } = require('./wallets');
+const { NonceManager } = require('./nonces');
 
 const Q96 = 2 ** 96;
 
@@ -164,13 +165,23 @@ function paramsFor(variant, p) {
   return variant === 'v02' ? base : { ...base, deadline: p.deadline };
 }
 
-async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log = () => {} }) {
+async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log = () => {}, nonces }) {
   const erc = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
   const have = await lib.withRetry(() => erc.allowance(signer.address, spender), { attempts: 3, label: 'allowance', log });
   if (have >= amountWei) return null;
   log(`approving ${tokenAddress} to router ${spender}`);
-  const tx = await erc.approve(spender, ethers.MaxUint256);
-  return lib.withRetry(() => tx.wait(), { attempts: 3, label: 'approve.wait', log });
+  // The approve is immediately followed by the swap from the same wallet. Left
+  // to itself ethers reads the node's pending count, which lags — so the swap
+  // would draw this same nonce, replace the approve, and then revert for having
+  // no allowance. Every wallet's FIRST trade goes through here.
+  const nonce = await NonceManager.nonceFor(nonces, signer, 'approve.nonce');
+  try {
+    const tx = await erc.approve(spender, ethers.MaxUint256, { nonce });
+    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'approve.wait', log });
+  } catch (e) {
+    if (nonces) nonces.reset(signer);
+    throw e;
+  }
 }
 
 // Execute one swap through THIS pool's router. Mirrors the hardening in
@@ -180,13 +191,13 @@ async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log =
 // `onSent` fires the moment a hash exists, before the receipt. Together they let
 // the caller keep a write-ahead record, so a process killed mid-broadcast still
 // leaves a row that reconciliation can find.
-async function executeSwap({ market, signer, side, quote: q, config, log = () => {}, onNonce, onSent }) {
+async function executeSwap({ market, signer, side, quote: q, config, log = () => {}, onNonce, onSent, nonces }) {
   const routerAddr = market.cfg.router;
   const tokenIn = q.tokenIn, tokenOut = q.tokenOut;
   const amountIn = ethers.parseUnits(q.amountInHuman.toFixed(tokenIn.decimals), tokenIn.decimals);
   const minOut = ethers.parseUnits(Math.max(q.minOutHuman, 0).toFixed(tokenOut.decimals), tokenOut.decimals);
 
-  await ensureAllowance({ tokenAddress: tokenIn.address, signer, spender: routerAddr, amountWei: amountIn, log });
+  await ensureAllowance({ tokenAddress: tokenIn.address, signer, spender: routerAddr, amountWei: amountIn, log, nonces });
 
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const raw = { tokenIn: tokenIn.address, tokenOut: tokenOut.address, fee: market.fee,
@@ -212,7 +223,7 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   routerVariant.set(routerAddr.toLowerCase(), variant);
 
   const c = routerContract(routerAddr, signer, variant);
-  const nonce = await lib.withRetry(() => signer.getNonce('pending'), { attempts: 3, label: 'swap.nonce', log });
+  const nonce = await NonceManager.nonceFor(nonces, signer, 'swap.nonce');
   // Write-ahead point: the caller records its intent here. Everything after this
   // line can move funds, so from now on a crash must still leave a trace.
   if (onNonce) await onNonce({ nonce, variant });
@@ -226,6 +237,7 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
     // The transaction WAS broadcast — we simply could not confirm it. It may yet
     // be mined. Losing the hash here would leave funds moved with no record, so
     // attach it and let the caller file the row as UNCONFIRMED rather than failed.
+    if (nonces) nonces.reset(signer);
     e.broadcastHash = tx.hash;
     e.broadcastNonce = nonce;
     e.unconfirmed = true;
