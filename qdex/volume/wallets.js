@@ -75,7 +75,7 @@ function signersFromRows(rows, provider) {
   return rows.map((r) => ({
     idx: r.idx,
     address: r.address,
-    wallet: new ethers.Wallet(crypto.decrypt(r.privkey_enc), provider)
+    wallet: new ethers.Wallet(crypto.unwrap(r.privkey_enc), provider)
   }));
 }
 function signersFromMnemonic(mnemonic, config, provider) {

@@ -82,6 +82,9 @@ function getConfig() {
     derivationPath: process.env.QVT_DERIVATION_PATH || "m/44'/60'/0'/0",
     keyfile: process.env.QVT_KEYFILE || require('path').join(__dirname, '.wallets.json'),
     encryptionKey: process.env.QVT_KEY_ENCRYPTION_KEY || '',
+    // Explicit opt-in: store wallet private keys UNENCRYPTED in MySQL. Anyone
+    // with database access then holds spendable keys. Off unless deliberately set.
+    storePlaintextKeys: envBool('QVT_STORE_PLAINTEXT_KEYS', false),
 
     // ---- epoch rotation ----
     epochDays: envNum('QVT_EPOCH_DAYS', 7),
@@ -168,7 +171,7 @@ function executionGate(c, liveChainId) {
     const bad = c.pools.filter((p) => !c.allowedPools.includes(p.address.toLowerCase()));
     if (bad.length) reasons.push(`pools not allow-listed: ${bad.map((p) => p.label).join(', ')}`);
   }
-  if (!c.encryptionKey) reasons.push('QVT_KEY_ENCRYPTION_KEY is not set');
+  if (!c.encryptionKey && !c.storePlaintextKeys) reasons.push('QVT_KEY_ENCRYPTION_KEY is not set');
   if (!c.parentPrivateKey) reasons.push('QVT_PARENT_PK is not set');
   return { ok: reasons.length === 0, reasons };
 }

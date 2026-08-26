@@ -182,6 +182,27 @@ npm run qdex:vol:export -- --epoch 3 --idx 7
 > HTTP with open CORS. `privkey_enc` and `mnemonic_enc` must never be exposed
 > through any dashboard route.
 
+### Plaintext key storage
+
+`QVT_STORE_PLAINTEXT_KEYS=true` stores private keys unencrypted, as `plain:0x…`.
+
+Understand what this trades away. `mm_production` is reached as `root` over the
+public internet and is shared with Bitmart, LBank, arb and the peg MM; anything
+holding those credentials then holds spendable keys. And `dashboard/Server.js`
+serves that same database over HTTP with `cors()` fully open — **one `SELECT *`
+in a future route publishes every key** to anyone who can reach the port. The
+existing volume routes name their columns explicitly and exclude `privkey_enc`
+and `mnemonic_enc`; keep it that way.
+
+Encryption costs nothing operationally — `qdex:vol:export` returns the plaintext
+key either way — so the only thing plaintext buys is direct readability from a
+SQL client.
+
+The `plain:` prefix makes each row self-describing, so `unwrap()` reads either
+format and the two can coexist. Flipping the setting affects **new epochs only**;
+existing wallets keep working under whichever mode created them. To convert an
+existing roster, sweep it, delete the epoch and keyfile, and run `epoch:new`.
+
 The parent wallet is **not** generated — supply it via `QVT_PARENT_PK`.
 
 ## Epoch rotation

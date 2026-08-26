@@ -36,7 +36,12 @@ const bad = (s) => `  [FAIL] ${s}`;
 
   console.log(ok(`sizing: impact cap ${config.maxImpactBps}bps, WL1X clamps ${config.minTradeWl1x}–${config.maxTradeWl1x}`));
   console.log(ok(`rate: ${config.maxTxPerHour}/hr, delay ${config.minDelayMs}–${config.maxDelayMs}ms, cooldown ${config.walletCooldownMs}ms`));
-  console.log(config.encryptionKey ? ok('QVT_KEY_ENCRYPTION_KEY is set') : bad('QVT_KEY_ENCRYPTION_KEY is NOT set — wallet keys cannot be stored'));
+  if (config.storePlaintextKeys) {
+    console.log(warn('QVT_STORE_PLAINTEXT_KEYS=true — private keys are stored UNENCRYPTED in MySQL'));
+    console.log('         anyone with database access holds spendable keys for these wallets');
+  } else {
+    console.log(config.encryptionKey ? ok('QVT_KEY_ENCRYPTION_KEY is set (keys encrypted at rest)') : bad('QVT_KEY_ENCRYPTION_KEY is NOT set — wallet keys cannot be stored'));
+  }
 
   console.log('\n=== 2. network ===');
   const provider = lib.getProvider({ rpcUrl: config.rpcUrl, chainId: config.chainId });

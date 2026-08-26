@@ -55,6 +55,37 @@ test('a passphrase secret is stretched, a short one refused', () => {
   assert.throws(() => crypto.encrypt('x', 'short'), /too short/);
 });
 
+// ---------------------------------------------------------- storage format
+test('wrap/unwrap round-trips in encrypted mode', () => {
+  const pk = ethers.Wallet.createRandom().privateKey;
+  const blob = crypto.wrap(pk, { plaintext: false, secret: SECRET });
+  assert.ok(blob.startsWith('v1:'), 'encrypted blobs carry the version prefix');
+  assert.strictEqual(crypto.unwrap(blob, SECRET), pk);
+});
+
+test('wrap/unwrap round-trips in plaintext mode', () => {
+  const pk = ethers.Wallet.createRandom().privateKey;
+  const blob = crypto.wrap(pk, { plaintext: true });
+  assert.strictEqual(blob, 'plain:' + pk);
+  assert.strictEqual(crypto.unwrap(blob), pk);
+});
+
+test('unwrap reads plaintext rows without needing a secret at all', () => {
+  const pk = ethers.Wallet.createRandom().privateKey;
+  assert.strictEqual(crypto.unwrap(crypto.wrap(pk, { plaintext: true }), undefined), pk);
+});
+
+test('encrypted and plaintext rosters can coexist', () => {
+  // Switching QVT_STORE_PLAINTEXT_KEYS must never orphan wallets written under
+  // the other mode — the prefix is what makes each row self-describing.
+  const a = ethers.Wallet.createRandom().privateKey;
+  const b = ethers.Wallet.createRandom().privateKey;
+  const rows = [crypto.wrap(a, { plaintext: false, secret: SECRET }), crypto.wrap(b, { plaintext: true })];
+  assert.deepStrictEqual(rows.map((r) => crypto.unwrap(r, SECRET)), [a, b]);
+  assert.strictEqual(crypto.isPlaintext(rows[0]), false);
+  assert.strictEqual(crypto.isPlaintext(rows[1]), true);
+});
+
 // ---------------------------------------------------------------- HD wallets
 test('the same mnemonic always derives the same 10 addresses', () => {
   const m = ethers.Wallet.createRandom().mnemonic.phrase;

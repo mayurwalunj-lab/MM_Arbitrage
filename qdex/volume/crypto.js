@@ -60,4 +60,30 @@ function decrypt(blob, secret = process.env.QVT_KEY_ENCRYPTION_KEY) {
 // Generate a fresh secret for a first-time operator to paste into .env.
 const newSecret = () => crypto.randomBytes(KEY_BYTES).toString('hex');
 
-module.exports = { encrypt, decrypt, deriveKey, newSecret, VERSION };
+// ---------------------------------------------------------------------------
+// Storage format dispatch.
+//
+// QVT_STORE_PLAINTEXT_KEYS=true stores keys unencrypted, prefixed "plain:" so a
+// row is self-describing about how it was written. That prefix is what lets an
+// encrypted roster and a plaintext one coexist — unwrap() reads either, so
+// switching the setting never orphans wallets created under the old mode.
+//
+// Plaintext means anyone with database access holds spendable keys, and this
+// database is shared and is served over HTTP by dashboard/Server.js. Never add a
+// route that selects privkey_enc or mnemonic_enc.
+const PLAIN_PREFIX = 'plain:';
+
+function wrap(value, { plaintext = false, secret } = {}) {
+  if (plaintext) return PLAIN_PREFIX + String(value);
+  return encrypt(value, secret);
+}
+
+function unwrap(blob, secret) {
+  const s = String(blob);
+  if (s.startsWith(PLAIN_PREFIX)) return s.slice(PLAIN_PREFIX.length);
+  return decrypt(s, secret);
+}
+
+const isPlaintext = (blob) => String(blob).startsWith(PLAIN_PREFIX);
+
+module.exports = { encrypt, decrypt, deriveKey, newSecret, wrap, unwrap, isPlaintext, VERSION, PLAIN_PREFIX };

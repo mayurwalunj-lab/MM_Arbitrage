@@ -18,9 +18,15 @@ const wallets = require('./wallets');
 // Generate a roster, persist it (encrypted in MySQL + mnemonic in the keyfile)
 // and open the epoch. No chain interaction at all — an address is pure math.
 async function createEpoch({ config, chainId, parentAddress, force = false, log = () => {} }) {
-  if (!config.encryptionKey) {
+  const plaintext = !!config.storePlaintextKeys;
+  if (!config.encryptionKey && !plaintext) {
     throw new Error('QVT_KEY_ENCRYPTION_KEY not set — refusing to generate wallets whose keys cannot be encrypted.\n' +
-      `  Generate one with:  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`);
+      '  Generate one with:  npm run qdex:vol:secret\n' +
+      '  (or set QVT_STORE_PLAINTEXT_KEYS=true to store keys unencrypted — see VOLUME_TESTING.md)');
+  }
+  if (plaintext) {
+    log('WARNING: QVT_STORE_PLAINTEXT_KEYS=true — private keys will be stored UNENCRYPTED in MySQL.');
+    log('         Anyone with database access will hold spendable keys for these wallets.');
   }
   const open = await db.getActiveEpoch();
   if (open.length && !force) {
@@ -34,14 +40,14 @@ async function createEpoch({ config, chainId, parentAddress, force = false, log 
     chainId, parentAddress,
     walletCount: config.walletCount,
     derivationPath: config.derivationPath,
-    mnemonicEnc: crypto.encrypt(mnemonic),
+    mnemonicEnc: crypto.wrap(mnemonic, { plaintext, secret: config.encryptionKey }),
     testTag: config.testTag,
     expiresAt,
     note: 'generated offline'
   });
 
   for (const w of derived) {
-    await db.insertWallet({ epochId, idx: w.idx, address: w.address, privkeyEnc: crypto.encrypt(w.privateKey) });
+    await db.insertWallet({ epochId, idx: w.idx, address: w.address, privkeyEnc: crypto.wrap(w.privateKey, { plaintext, secret: config.encryptionKey }) });
   }
 
   wallets.writeKeyfile(config, {
@@ -98,7 +104,7 @@ async function exportKey({ epochId, idx }) {
   const row = rows.find((r) => Number(r.idx) === Number(idx));
   if (!row) throw new Error(`no wallet idx ${idx} in epoch ${epochId}`);
   if (!row.privkey_enc) throw new Error('no encrypted key stored for that wallet');
-  const pk = crypto.decrypt(row.privkey_enc);
+  const pk = crypto.unwrap(row.privkey_enc);
   if (new ethers.Wallet(pk).address.toLowerCase() !== row.address.toLowerCase()) {
     throw new Error('decrypted key does not match the stored address — data corruption');
   }

@@ -120,6 +120,7 @@ function banner({ config, chainId, gate, execute, epoch, runId }) {
   console.log(`  rate limit  : ${config.maxTxPerHour}/hr (hard cap ${cfgMod.HARD_TX_PER_HOUR_CAP})`);
   console.log(`  impact cap  : ${config.maxImpactBps} bps    price band: ±${config.maxDeviationPct}%`);
   console.log(`  stop file   : ${config.stopFile}`);
+  if (config.storePlaintextKeys) console.log('  key storage : PLAINTEXT in MySQL (QVT_STORE_PLAINTEXT_KEYS=true)');
   if (!execute) {
     console.log('  --- not executing because ---');
     gate.reasons.forEach((r) => console.log(`      · ${r}`));
