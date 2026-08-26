@@ -131,6 +131,13 @@ function banner({ config, chainId, gate, execute, epoch, runId }) {
 // ---------------------------------------------------------------- main cycle
 async function run() {
   const config = cfgMod.getConfig();
+
+  // Connect and load pools from the database BEFORE validating. Pool definitions
+  // live in qdex_volume_pools, so .env legitimately has none — validating first
+  // would reject a perfectly good config for having "no pools".
+  await db.init();
+  const poolSrc = await cfgMod.hydratePools(config, db);
+
   try { cfgMod.validateConfig(config); }
   catch (e) { console.error(`CONFIG ERROR: ${e.message}`); process.exit(1); }
 
@@ -144,10 +151,7 @@ async function run() {
     log('--execute requested but the safety gate is CLOSED — running as a dry-run instead.');
   }
 
-  await db.init();
-  const poolSrc = await cfgMod.hydratePools(config, db);
   if (poolSrc.error) log(`WARNING: could not read pools from the database (${poolSrc.error}) — using .env`);
-  if (!config.pools.length) { console.error('No pools configured. Import them: npm run qdex:vol:pools:import'); process.exit(1); }
 
   const epoch = await epochMod.current();
   if (!epoch) {
