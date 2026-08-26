@@ -129,6 +129,47 @@ const bad = (s) => `  [FAIL] ${s}`;
     } catch (e) { console.log(bad(`  ${p.label}: ${String(e.shortMessage || e.message).slice(0, 80)}`)); }
   }
 
+  // The analytic curve is not what QDex actually pays, so measure the real cost
+  // by simulating against the router. This is what the first live swap needed
+  // and did not have: at 0.02 WL1X the L1USD pool charges ~978bps, so a minOut
+  // derived from the curve sits above anything the pool will pay and the swap
+  // reverts. Needs a funded wallet to simulate from.
+  console.log('\n=== 7b. real execution cost (simulated against the router) ===');
+  if (!signers.length) console.log(warn('no roster — cannot simulate'));
+  else {
+    // eth_call executes the real transferFrom, so only a wallet that has already
+    // approved the router can be simulated. Find one; if none has, say so rather
+    // than reporting every pool as "would revert".
+    const wl1x = new ethers.Contract(config.wl1x, walletsMod.ERC20_ABI, provider);
+    let sim = null;
+    for (const s of signers) {
+      const routers = [...new Set(config.pools.map((p) => p.router))];
+      const allowances = await Promise.all(routers.map((r) => wl1x.allowance(s.address, r).catch(() => 0n)));
+      if (allowances.some((a) => a > 0n)) { sim = s; break; }
+    }
+    if (!sim) {
+      console.log(warn('no wallet has approved a router yet — cost cannot be simulated until the first trade'));
+      console.log('         the bot approves before it simulates, so this resolves itself on the first swap');
+    } else {
+    console.log(`  simulating from w${String(sim.idx).padStart(2, '0')}; cap is QVT_MAX_COST_BPS=${config.maxCostBps || 'off'}`);
+    console.log('  pool       size WL1X    out            cost      verdict');
+    for (const p of config.pools) {
+      try {
+        const m = await poolsMod.loadMarket({ provider, poolCfg: p, config, tokenMeta });
+        for (const size of [config.minTradeWl1x, Math.sqrt(config.minTradeWl1x * config.maxTradeWl1x), config.maxTradeWl1x]) {
+          const q = await poolsMod.quoteOnChain({ market: m, signer: sim.wallet, side: 'buy', sizeWl1x: size, config });
+          if (!q) { console.log(`  ${p.label.padEnd(10)} ${size.toFixed(4).padStart(9)}    (would revert)`); continue; }
+          const over = config.maxCostBps > 0 && q.effectiveCostBps > config.maxCostBps;
+          console.log(`  ${p.label.padEnd(10)} ${size.toFixed(4).padStart(9)}  ${q.amountOutHuman.toPrecision(6).padStart(13)}  ` +
+            `${q.effectiveCostBps.toFixed(0).padStart(6)}bps   ${over ? 'SKIPPED — over cap' : 'ok'}`);
+        }
+      } catch (e) { console.log(bad(`  ${p.label}: ${String(e.shortMessage || e.message).slice(0, 60)}`)); }
+    }
+    console.log('  If the minimum size is over the cap, raise QVT_MIN_TRADE_WL1X — small');
+    console.log('  trades on these pools are disproportionately expensive.');
+    }
+  }
+
   console.log('\n=== 8. sizing sanity ===');
   // The wallet float should comfortably outlast the inventory random walk, or
   // the fleet spends its time transferring instead of trading.

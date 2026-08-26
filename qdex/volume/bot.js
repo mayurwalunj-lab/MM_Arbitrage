@@ -453,7 +453,22 @@ async function run() {
           stop.recordSuccess(q.notionalWl1x);
         } catch (e) {
           const msg = String(e.shortMessage || e.message).slice(0, 180);
-          if (e.unconfirmed && e.broadcastHash) {
+          if (e.preflightRejected) {
+            // Rejected by the simulation BEFORE anything was broadcast: nothing
+            // was sent, no nonce consumed, no gas spent. A skip, not a failure.
+            log(`w${pad2(signer.idx)} ${market.cfg.label} SKIP  ${msg}`);
+            const f = { status: 'skipped', reason: msg };
+            if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
+          } else if (e.revertedOnChain) {
+            // Mined and reverted: definite, nothing in flight, no reconcile
+            // needed. Counts as a normal failure so the breaker can act on a
+            // run of them, rather than halting the bot on the first one.
+            log(`w${pad2(signer.idx)} ${market.cfg.label} REVERTED ${e.broadcastHash} — ${msg}`);
+            const f = { status: 'failed', txHash: e.broadcastHash, blockNumber: e.blockNumber,
+              gasUsed: e.gasUsed, reason: `reverted on chain: ${msg}`.slice(0, 250) };
+            if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
+            stop.recordFailure();
+          } else if (e.unconfirmed && e.broadcastHash) {
             // Broadcast but unconfirmed: the swap may still be mined. Keep it as
             // `unconfirmed` WITH the hash so it can be reconciled, and stop —
             // continuing to trade this wallet risks acting on a stale balance.

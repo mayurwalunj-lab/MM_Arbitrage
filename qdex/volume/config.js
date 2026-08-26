@@ -100,6 +100,13 @@ function getConfig() {
 
     // ---- sizing: impact cap is primary, WL1X bounds are outer clamps ----
     maxImpactBps: envNum('QVT_MAX_IMPACT_BPS', 25),
+    // Ceiling on the REALISED cost of a swap (fee + slippage + whatever else the
+    // router deducts), measured by simulating it. Distinct from maxImpactBps,
+    // which bounds how far the POOL PRICE moves. On QDex the realised cost is far
+    // higher than the price impact — measured at ~78bps for 2 WL1X and ~978bps
+    // for 0.02 WL1X on the L1USD pool — so this is what stops the fleet bleeding
+    // on trades that are too small to be worth making. 0 disables the check.
+    maxCostBps: envNum('QVT_MAX_COST_BPS', 150),
     minTradeWl1x: envNum('QVT_MIN_TRADE_WL1X', 0.05),
     maxTradeWl1x: envNum('QVT_MAX_TRADE_WL1X', 1.0),
     maxPoolFractionBps: envNum('QVT_MAX_POOL_FRACTION_BPS', 50),

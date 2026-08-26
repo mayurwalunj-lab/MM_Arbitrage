@@ -156,6 +156,67 @@ function quoteWithinImpact({ market, side, sizeWl1x, maxImpactBps, minWl1x, slip
 // Probe cache: which exactInputSingle shape does each router speak?
 const routerVariant = new Map();
 
+// Ask the ROUTER what a swap actually returns, by simulating it with eth_call.
+//
+// The analytic quote() above is single-range V3 math and does not match what
+// QDex actually pays. Measured on the WL1X/L1USD pool, every swap loses a fixed
+// ~0.037 of the output token on top of the curve — invisible at 2 WL1X, but 19%
+// of a 0.01 WL1X trade. Setting amountOutMinimum from the analytic number puts
+// the floor ABOVE what the pool will ever pay, and the swap reverts on slippage.
+// That is exactly how the first live swap failed.
+//
+// estimateGas cannot substitute for this: on this RPC it does not simulate at
+// all — it returns a canned value even for impossible parameters — so it catches
+// nothing. eth_call does simulate correctly, including the caller's balance.
+//
+// Returns null when the swap would revert outright (insufficient balance, no
+// liquidity, expired), which is itself the answer: do not send it.
+async function quoteOnChain({ market, signer, side, sizeWl1x, config, log = () => {} }) {
+  const px = price(market);
+  if (!(px > 0) || !(sizeWl1x > 0)) return null;
+  const tokenIn = side === 'buy' ? market.base : market.quote;
+  const tokenOut = side === 'buy' ? market.quote : market.base;
+  const amountInHuman = side === 'buy' ? sizeWl1x : sizeWl1x * px;
+  const amountIn = ethers.parseUnits(amountInHuman.toFixed(tokenIn.decimals), tokenIn.decimals);
+
+  const routerAddr = market.cfg.router;
+  const known = routerVariant.get(routerAddr.toLowerCase());
+  const order = known ? [known] : ['deadline', 'v02'];
+  const raw = { tokenIn: tokenIn.address, tokenOut: tokenOut.address, fee: market.fee,
+    recipient: signer.address, deadline: Math.floor(Date.now() / 1000) + config.deadlineSeconds,
+    amountIn, amountOutMinimum: 0n };
+
+  for (const v of order) {
+    try {
+      const c = routerContract(routerAddr, signer, v);
+      // amountOutMinimum 0 so the simulation reports the true output rather than
+      // reverting against a floor we are trying to compute.
+      const outWei = await c.exactInputSingle.staticCall(paramsFor(v, raw), { from: signer.address });
+      routerVariant.set(routerAddr.toLowerCase(), v);
+      const amountOutHuman = Number(ethers.formatUnits(outWei, tokenOut.decimals));
+      if (!(amountOutHuman > 0)) return null;
+      const execPrice = side === 'buy' ? amountOutHuman / sizeWl1x : amountInHuman / amountOutHuman;
+      return {
+        side, sizeWl1x, tokenIn, tokenOut, variant: v,
+        amountInHuman, amountOutHuman,
+        minOutHuman: amountOutHuman * (1 - config.slippageBps / 10000),
+        priceBefore: px, execPrice,
+        // Realised cost against the pool's marginal price, fee and everything
+        // else the router does included. This is the honest impact number.
+        effectiveCostBps: Math.abs((execPrice - px) / px) * 10000,
+        notionalWl1x: side === 'buy' ? sizeWl1x : amountOutHuman
+      };
+    } catch (e) {
+      if (lib.isTransientRpcError(e)) throw e;
+      if (v === order[order.length - 1]) {
+        log(`quoteOnChain: ${market.cfg.label} ${side} ${sizeWl1x} would revert (${String(e.shortMessage || e.message).slice(0, 60)})`);
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
 function routerContract(address, signer, variant) {
   return new ethers.Contract(address, variant === 'v02' ? ROUTER_02_ABI : ROUTER_DEADLINE_ABI, signer);
 }
@@ -195,7 +256,34 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   const routerAddr = market.cfg.router;
   const tokenIn = q.tokenIn, tokenOut = q.tokenOut;
   const amountIn = ethers.parseUnits(q.amountInHuman.toFixed(tokenIn.decimals), tokenIn.decimals);
-  const minOut = ethers.parseUnits(Math.max(q.minOutHuman, 0).toFixed(tokenOut.decimals), tokenOut.decimals);
+
+  // minOut MUST come from a simulation of the real router, never from the
+  // analytic curve. QDex pays measurably less than single-range V3 math predicts
+  // (a fixed deduction plus the fee), so an analytic floor sits above what the
+  // pool will ever pay and the swap reverts on slippage. That is how the first
+  // live swap failed.
+  //
+  // This has to happen AFTER ensureAllowance above: eth_call executes the real
+  // transferFrom, so a wallet that has not yet approved cannot be simulated at
+  // all. Approve first, then simulate, then broadcast.
+  const sim = await quoteOnChain({ market, signer, side, sizeWl1x: q.sizeWl1x, config, log });
+  if (!sim) {
+    const err = new Error('simulation says this swap would revert — not broadcasting');
+    err.preflightRejected = true;
+    throw err;
+  }
+  if (config.maxCostBps > 0 && sim.effectiveCostBps > config.maxCostBps) {
+    const err = new Error(`execution cost ${sim.effectiveCostBps.toFixed(0)}bps exceeds QVT_MAX_COST_BPS ${config.maxCostBps}`);
+    err.preflightRejected = true;
+    throw err;
+  }
+  log(`simulated: ${sim.amountOutHuman.toPrecision(6)} ${tokenOut.symbol}, cost ${sim.effectiveCostBps.toFixed(0)}bps`);
+  // Hand the real numbers back so the caller records what actually happened
+  // rather than what the curve predicted.
+  q.amountOutHuman = sim.amountOutHuman;
+  q.execPrice = sim.execPrice;
+  q.effectiveCostBps = sim.effectiveCostBps;
+  const minOut = ethers.parseUnits(Math.max(sim.minOutHuman, 0).toFixed(tokenOut.decimals), tokenOut.decimals);
 
   await ensureAllowance({ tokenAddress: tokenIn.address, signer, spender: routerAddr, amountWei: amountIn, log, nonces });
 
@@ -234,10 +322,21 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   try {
     return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
   } catch (e) {
-    // The transaction WAS broadcast — we simply could not confirm it. It may yet
-    // be mined. Losing the hash here would leave funds moved with no record, so
-    // attach it and let the caller file the row as UNCONFIRMED rather than failed.
     if (nonces) nonces.reset(signer);
+    // Distinguish two very different outcomes that both throw from wait():
+    //   MINED AND REVERTED — a definite failure. The nonce was consumed and gas
+    //     was spent, but no funds moved. Nothing to reconcile.
+    //   NOT CONFIRMED      — it may still be mined later, so it must be recorded
+    //     with its hash and reconciled before trading resumes.
+    // Treating a plain revert as "unconfirmed" halts the bot for no reason.
+    const rc = e.receipt || (e.error && e.error.receipt);
+    if (rc && Number(rc.status) === 0) {
+      e.revertedOnChain = true;
+      e.broadcastHash = tx.hash;
+      e.blockNumber = rc.blockNumber != null ? Number(rc.blockNumber) : null;
+      e.gasUsed = rc.gasUsed != null ? rc.gasUsed.toString() : null;
+      throw e;
+    }
     e.broadcastHash = tx.hash;
     e.broadcastNonce = nonce;
     e.unconfirmed = true;
@@ -245,4 +344,4 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   }
 }
 
-module.exports = { Q96, V3_POOL_ABI, loadMarket, price, priceFrom, maxSizeAtImpact, quote, quoteWithinImpact, executeSwap, ensureAllowance };
+module.exports = { Q96, V3_POOL_ABI, loadMarket, price, priceFrom, maxSizeAtImpact, quote, quoteWithinImpact, quoteOnChain, executeSwap, ensureAllowance };
