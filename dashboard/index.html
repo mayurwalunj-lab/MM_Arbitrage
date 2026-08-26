@@ -310,6 +310,10 @@
             <span>Live Analytics</span>
         </div>
         <div class="db-select-wrapper">
+            <!-- The QDex venues live on their own pages: this dashboard reads the
+                 bitmart_/lbank_ tables, which have nothing to do with them. -->
+            <a href="/volume" style="margin-right:14px;font-size:13px;color:#6b46ff;text-decoration:none;font-weight:600;">QDex Volume →</a>
+            <a href="/arb" style="margin-right:14px;font-size:13px;color:#6b46ff;text-decoration:none;font-weight:600;">Arb →</a>
             <select id="databaseFilter" onchange="onDatabaseChange()" class="header-select">
                 <option value="bitmart" selected>BitMart</option>
                 <option value="lbank">LBank</option>
