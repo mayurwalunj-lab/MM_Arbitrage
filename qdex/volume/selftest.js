@@ -471,6 +471,22 @@ test('one tracker keeps ten trading wallets independent', async () => {
   for (const w of fleet) assert.strictEqual(await nm.take(w), fleet.indexOf(w) * 100 + 1);
 });
 
+// ------------------------------------------------- swap step ordering
+test('executeSwap approves BEFORE it simulates', () => {
+  // eth_call runs the real transferFrom, so simulating an unapproved wallet
+  // always reverts. With the order inverted, every wallet is permanently unable
+  // to make its first trade on a pool — and any wallet that already has an
+  // allowance still works, which disguises it as an intermittent fault.
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'pools.js'), 'utf8');
+  const body = src.slice(src.indexOf('async function executeSwap('));
+  const approveAt = body.indexOf('await ensureAllowance(');
+  const simAt = body.indexOf('await quoteOnChain(');
+  const sendAt = body.indexOf('c.exactInputSingle(paramsFor(');
+  assert.ok(approveAt > 0 && simAt > 0 && sendAt > 0, 'all three steps must be present');
+  assert.ok(approveAt < simAt, 'ensureAllowance must run before quoteOnChain');
+  assert.ok(simAt < sendAt, 'the simulation must run before the broadcast');
+});
+
 // ---------------------------------------------------------------- donor choice
 test('donor selection never drops a donor below its own floor', () => {
   const { chooseDonor } = require('./funding');

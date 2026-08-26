@@ -445,9 +445,16 @@ async function run() {
             onSent: async ({ hash }) => { if (walId) await db.updateTrade(walId, { txHash: hash }); }
           });
           log(`${headline} | ${receipt?.hash || '(no hash)'}`);
+          // executeSwap replaces q's analytic figures with what the simulation
+          // actually returned. `row` was built before that, so the corrected
+          // numbers have to be written back or the log records the curve's
+          // prediction — inflating reported volume and mis-stating exec price.
           const done = { status: 'executed', txHash: receipt?.hash ?? null,
             blockNumber: receipt?.blockNumber != null ? Number(receipt.blockNumber) : null,
-            gasUsed: receipt?.gasUsed != null ? receipt.gasUsed.toString() : null };
+            gasUsed: receipt?.gasUsed != null ? receipt.gasUsed.toString() : null,
+            amountOut: q.amountOutHuman, execPrice: q.execPrice,
+            costBps: q.effectiveCostBps ?? null,
+            notionalWl1x: q.notionalWl1x };
           if (walId) await db.updateTrade(walId, done);
           else await recordTrade({ ...row, ...done, reason: sideReason });
           stop.recordSuccess(q.notionalWl1x);

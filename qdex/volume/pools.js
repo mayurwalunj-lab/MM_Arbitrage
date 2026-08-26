@@ -257,15 +257,19 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   const tokenIn = q.tokenIn, tokenOut = q.tokenOut;
   const amountIn = ethers.parseUnits(q.amountInHuman.toFixed(tokenIn.decimals), tokenIn.decimals);
 
+  // APPROVE FIRST. eth_call below executes the real transferFrom, so a wallet
+  // that has not yet approved the router cannot be simulated at all — its
+  // simulation reverts and the trade is skipped. Getting this order wrong means
+  // every wallet is permanently unable to make its FIRST trade on a pool, while
+  // any wallet that happens to already have an allowance works fine, which makes
+  // it look like an intermittent fault rather than a hard ordering bug.
+  await ensureAllowance({ tokenAddress: tokenIn.address, signer, spender: routerAddr, amountWei: amountIn, log, nonces });
+
   // minOut MUST come from a simulation of the real router, never from the
-  // analytic curve. QDex pays measurably less than single-range V3 math predicts
-  // (a fixed deduction plus the fee), so an analytic floor sits above what the
-  // pool will ever pay and the swap reverts on slippage. That is how the first
-  // live swap failed.
-  //
-  // This has to happen AFTER ensureAllowance above: eth_call executes the real
-  // transferFrom, so a wallet that has not yet approved cannot be simulated at
-  // all. Approve first, then simulate, then broadcast.
+  // analytic curve. QDex's router skims a protocol fee (measured ~47bps, paid to
+  // a collector address) on top of the 0.3% pool fee, and neither appears in the
+  // V3 curve — so an analytic floor sits above what the pool will ever pay and
+  // the swap reverts on slippage. That is how the first live swap failed.
   const sim = await quoteOnChain({ market, signer, side, sizeWl1x: q.sizeWl1x, config, log });
   if (!sim) {
     const err = new Error('simulation says this swap would revert — not broadcasting');
@@ -284,8 +288,6 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   q.execPrice = sim.execPrice;
   q.effectiveCostBps = sim.effectiveCostBps;
   const minOut = ethers.parseUnits(Math.max(sim.minOutHuman, 0).toFixed(tokenOut.decimals), tokenOut.decimals);
-
-  await ensureAllowance({ tokenAddress: tokenIn.address, signer, spender: routerAddr, amountWei: amountIn, log, nonces });
 
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const raw = { tokenIn: tokenIn.address, tokenOut: tokenOut.address, fee: market.fee,
