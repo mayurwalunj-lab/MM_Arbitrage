@@ -65,6 +65,7 @@
     "qdex:vol:sweep": "node qdex/volume/cli.js sweep",
     "qdex:vol:export": "node qdex/volume/cli.js export",
     "qdex:vol:reconcile": "node qdex/volume/cli.js reconcile",
+    "qdex:vol:dashboard": "node dashboard/volume_server.js",
     "qdex:vol:pools": "node qdex/volume/cli.js pools",
     "qdex:vol:pools:import": "node qdex/volume/cli.js pools:import",
     "qdex:vol:pools:enable": "node qdex/volume/cli.js pools:enable",

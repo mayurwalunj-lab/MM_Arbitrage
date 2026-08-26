@@ -1,14 +1,16 @@
 module.exports = {
   apps: [
     {
-      // Web dashboard. Serves three separate views off different tables:
-      //   /         bitmart_* / lbank_*   the CEX bots
-      //   /arb      dex_trades, treasury_sells
-      //   /volume   qdex_volume_*         the volume test harness
-      // The landing page knows nothing about QDex, so it reads $0 while the
-      // harness is trading — /volume is the one to watch for this service.
-      name: 'Server',
-      script: 'dashboard/Server.js',
+      // QDex volume dashboard ONLY — serves dashboard/volume.html and the
+      // qdex_volume_* API routes, nothing else.
+      //
+      // Deliberately not dashboard/Server.js: that process also serves the
+      // Bitmart/LBank and arb views off unrelated tables, and its landing page
+      // shows $0 while this harness is trading. Running the volume page on its
+      // own port keeps this branch to one dashboard without stripping views out
+      // of a shared file and breaking them elsewhere.
+      name: 'qdex_volume_dashboard',
+      script: 'dashboard/volume_server.js',
       cwd: __dirname,
       restart_delay: 5000,
       max_restarts: 50
