@@ -129,7 +129,15 @@ function getProvider(config) {
   // staticNetwork stops ethers' background eth_chainId polling — that background
   // call is what 502s and throws an UNHANDLED rejection that kills the process.
   const opts = { staticNetwork: network || true };
-  const mk = (u) => new ethers.JsonRpcProvider(u, network, opts);
+  // Hard per-request timeout: a hung RPC connection (no response) would otherwise
+  // freeze an await forever — that's what stalled the poll loop for 83 min. With a
+  // timeout the call throws (code TIMEOUT), which withRetry treats as transient and
+  // retries, so the bot never freezes on a single dead request.
+  const mk = (u) => {
+    const fr = new ethers.FetchRequest(u);
+    fr.timeout = 30000; // 30s
+    return new ethers.JsonRpcProvider(fr, network, opts);
+  };
   if (urls.length <= 1) return mk(urls[0] || config.rpcUrl);
   // Multiple endpoints: first healthy one wins (quorum 1 = no cross-checking).
   return new ethers.FallbackProvider(
