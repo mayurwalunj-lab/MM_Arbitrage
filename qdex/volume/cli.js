@@ -25,6 +25,12 @@ const epochMod = require('./epoch');
 const walletsMod = require('./wallets');
 const funding = require('./funding');
 const cryptoMod = require('./crypto');
+const { NonceManager } = require('./nonces');
+
+// ONE tracker per CLI invocation. fund, sweep and rotate all issue long runs of
+// transactions from the parent; a tracker per wallet or per call would let the
+// parent's nonces collide across them.
+const nonces = new NonceManager();
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -93,7 +99,7 @@ async function cmdFund(config) {
   const signers = await epochMod.loadSigners({ config, epochId: e.id, provider });
   const parent = walletsMod.parentSigner(config, provider);
   log(`funding ${signers.length} wallets from ${parent.address} — ${execute ? 'LIVE' : 'DRY-RUN'}`);
-  await funding.fundWallets({ provider, parent, signers, config, execute, record: mkRecord(e.id, execute), log });
+  await funding.fundWallets({ provider, parent, signers, config, execute, record: mkRecord(e.id, execute), log, nonces });
   if (execute) for (const s of signers) await db.markWallet(e.id, s.idx, 'funded');
   log('fund complete');
 }
@@ -108,11 +114,14 @@ async function cmdSweep(config) {
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
   const record = mkRecord(e.id, execute);
 
-  await db.setEpochStatus(e.id, 'draining', 'sweep started');
+  // Only mutate state when actually sweeping. A dry run that marks the epoch
+  // 'draining' leaves the bot refusing to trade until someone notices and
+  // reverses it by hand — simulation must never change what is stored.
+  if (execute) await db.setEpochStatus(e.id, 'draining', 'sweep started');
   log(`sweeping ${signers.length} wallets to ${parent.address} IN KIND (no swaps) — ${execute ? 'LIVE' : 'DRY-RUN'}`);
   for (const s of signers) {
     const snap = await walletsMod.snapshot({ provider, address: s.address, config, tokenMeta });
-    const moved = await funding.sweepWallet({ provider, signer: s, parent, snapshot: snap, config, execute, record, log });
+    const moved = await funding.sweepWallet({ provider, signer: s, parent, snapshot: snap, config, execute, record, log, nonces });
     if (execute) await db.markWallet(e.id, s.idx, 'swept', moved);
   }
   log('sweep complete');
@@ -122,8 +131,12 @@ async function cmdSweep(config) {
 async function cmdRotate(config) {
   const e = await cmdSweep(config);
   const { provider, chainId, execute } = await withChain(config);
-  await db.setEpochStatus(e.id, 'retired', 'rotated');
-  log(`epoch ${e.id} retired`);
+  if (execute) {
+    await db.setEpochStatus(e.id, 'retired', 'rotated');
+    log(`epoch ${e.id} retired`);
+  } else {
+    log(`[DRY] would retire epoch ${e.id} — epoch status left untouched`);
+  }
 
   const parent = walletsMod.parentSigner(config, provider);
   const res = await epochMod.createEpoch({ config, chainId, parentAddress: parent.address, force: true, log });
@@ -131,7 +144,7 @@ async function cmdRotate(config) {
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
 
   log(`distributing parent holdings across the new roster IN KIND — ${execute ? 'LIVE' : 'DRY-RUN'}`);
-  await funding.distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record: mkRecord(res.epochId, execute), log });
+  await funding.distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record: mkRecord(res.epochId, execute), log, nonces });
   if (execute) for (const s of signers) await db.markWallet(res.epochId, s.idx, 'funded');
   log(`rotation complete — epoch ${res.epochId} is now active`);
 }

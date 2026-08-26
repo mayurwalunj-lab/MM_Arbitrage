@@ -53,10 +53,8 @@ async function nativeSweepReserve(provider) {
 }
 
 // ---- fund: parent -> each sub-wallet, WL1X + native gas ----
-async function fundWallets({ provider, parent, signers, config, execute, record, log }) {
+async function fundWallets({ provider, parent, signers, config, execute, record, log, nonces = new NonceManager() }) {
   const results = [];
-  // One tracker for the whole batch — twenty sequential sends from the parent.
-  const nonces = new NonceManager();
   for (const s of signers) {
     const bal = await provider.getBalance(s.address);
     const wl1x = new ethers.Contract(config.wl1x, ERC20_ABI, provider);
@@ -135,7 +133,7 @@ async function rebalanceWallet({ provider, recipient, snapshots, signers, parent
 // sweep — its token bags would be stranded with no way to move them. So before
 // sweeping, work out what the sweep will cost and have the parent top it up.
 // Without this, "money stuck" is a real outcome rather than a theoretical one.
-async function ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log }) {
+async function ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log, nonces }) {
   const legs = Object.values(snapshot.tokens).filter((t) => t.raw > 0n).length
     + (snapshot.wl1xRaw > 0n ? 1 : 0)
     + 1; // the native drain itself
@@ -148,16 +146,16 @@ async function ensureSweepGas({ provider, signer, parent, snapshot, config, exec
   const top = needed - snapshot.nativeRaw;
   log(`w${signer.idx} needs ${ethers.formatEther(top)} more L1X to afford its own sweep (${legs} legs) — topping up from parent`);
   let hash = null;
-  if (execute) hash = (await transferNative({ signer: parent, to: signer.address, amountWei: top, log }))?.hash;
+  if (execute) hash = (await transferNative({ signer: parent, to: signer.address, amountWei: top, log, nonces }))?.hash;
   await record({ kind: 'backstop', from: parent.address, to: signer.address, token: null, tokenSymbol: 'L1X',
     amount: Number(ethers.formatEther(top)), txHash: hash, reason: 'gas for sweep' });
   return top;
 }
 
 // ---- sweep: sub-wallet -> parent, IN KIND (no swaps) ----
-async function sweepWallet({ provider, signer, parent, snapshot, config, execute, record, log, nonces = new NonceManager() }) {
+async function sweepWallet({ provider, signer, parent, snapshot, config, execute, record, log, nonces }) {
   const moved = [];
-  const toppedUp = await ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log });
+  const toppedUp = await ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log, nonces });
   if (toppedUp > 0n) snapshot = { ...snapshot, nativeRaw: snapshot.nativeRaw + toppedUp };
 
   // 1. every non-zero pool token, as-is
@@ -196,8 +194,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
 // ---- distribute in kind: parent splits everything it holds across the new
 // roster. This is why epoch 2+ starts pre-balanced — the new wallets inherit
 // the previous epoch's token bags and can trade either direction immediately. ----
-async function distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record, log }) {
-  const nonces = new NonceManager();
+async function distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record, log, nonces = new NonceManager() }) {
   const n = signers.length;
   const keep = 1 - config.parentReservePct / 100;
 
