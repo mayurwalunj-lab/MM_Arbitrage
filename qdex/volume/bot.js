@@ -464,7 +464,17 @@ async function run() {
           stop.recordSuccess(q.notionalWl1x);
         } catch (e) {
           const msg = String(e.shortMessage || e.message).slice(0, 180);
-          if (e.preflightRejected) {
+          if (e.timedOut) {
+            // The node never answered. A hash may or may not exist, and the
+            // transaction may still land — the write-ahead row holds the nonce,
+            // so reconcile can settle it from that. Stop rather than trade on a
+            // balance that might be about to change underneath us.
+            log(`w${pad2(signer.idx)} ${market.cfg.label} TIMEOUT — ${msg}`);
+            const f = { status: 'unconfirmed', txHash: e.broadcastHash ?? null,
+              reason: `timed out, outcome unknown: ${msg}`.slice(0, 250) };
+            if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
+            stop.trip('transaction timed out — run npm run qdex:vol:reconcile before resuming');
+          } else if (e.preflightRejected) {
             // Rejected by the simulation BEFORE anything was broadcast: nothing
             // was sent, no nonce consumed, no gas spent. A skip, not a failure.
             log(`w${pad2(signer.idx)} ${market.cfg.label} SKIP  ${msg}`);

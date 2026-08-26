@@ -112,6 +112,9 @@ function getConfig() {
     maxPoolFractionBps: envNum('QVT_MAX_POOL_FRACTION_BPS', 50),
     slippageBps: envNum('QVT_SLIPPAGE_BPS', 100),
     deadlineSeconds: envNum('QVT_DEADLINE_SECONDS', 600),
+    // Hard bound on every broadcast and every wait. Without it a transaction the
+    // node silently drops leaves the bot polling forever with nothing in flight.
+    txTimeoutMs: envNum('QVT_TX_TIMEOUT_MS', 120000),
 
     // ---- price guard: keep each pool near where the session found it ----
     maxDeviationPct: envNum('QVT_MAX_DEVIATION_PCT', 0.75),

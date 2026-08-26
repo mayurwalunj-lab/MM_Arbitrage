@@ -61,4 +61,36 @@ class NonceManager {
   }
 }
 
-module.exports = { NonceManager };
+// Every send path must be bounded. ethers' tx.wait() polls indefinitely by
+// default, so a transaction the node never accepted — observed here: an approve
+// whose pending nonce stayed at 0 while the chain kept producing blocks — hangs
+// the bot forever with nothing in flight to recover. Twenty minutes of silence
+// with no error is worse than a failure, because nothing trips and no operator
+// is told.
+//
+// Two bounds are needed, not one: the BROADCAST itself can hang before a hash
+// exists, and the WAIT can hang after it.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      e.timedOut = true;
+      reject(e);
+    }, ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+// tx.wait(confirmations, timeoutMs) is bounded by ethers itself, but it throws a
+// generic error; wrap it so the caller can tell a timeout from a revert.
+async function waitFor(tx, ms, label = 'tx.wait') {
+  try {
+    return await tx.wait(1, ms);
+  } catch (e) {
+    if (/timeout|timed out/i.test(String(e.message))) e.timedOut = true;
+    throw e;
+  }
+}
+
+module.exports = { NonceManager, withTimeout, waitFor };

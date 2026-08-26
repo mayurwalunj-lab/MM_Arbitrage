@@ -471,6 +471,44 @@ test('one tracker keeps ten trading wallets independent', async () => {
   for (const w of fleet) assert.strictEqual(await nm.take(w), fleet.indexOf(w) * 100 + 1);
 });
 
+// ---------------------------------------------------------------- timeouts
+test('withTimeout rejects a promise that never settles', async () => {
+  const { withTimeout } = require('./nonces');
+  const never = new Promise(() => {});   // exactly what a hung RPC call looks like
+  try {
+    await withTimeout(never, 40, 'stuck.send');
+    assert.fail('should have timed out');
+  } catch (e) {
+    assert.strictEqual(e.timedOut, true, 'must be flagged as a timeout, not a generic error');
+    assert.match(e.message, /stuck\.send timed out/);
+  }
+});
+
+test('withTimeout passes a value through when it settles in time', async () => {
+  const { withTimeout } = require('./nonces');
+  assert.strictEqual(await withTimeout(Promise.resolve('ok'), 1000, 'fast'), 'ok');
+});
+
+test('withTimeout preserves the original error rather than masking it', async () => {
+  const { withTimeout } = require('./nonces');
+  try {
+    await withTimeout(Promise.reject(new Error('execution reverted')), 1000, 'x');
+    assert.fail('should have rejected');
+  } catch (e) {
+    assert.match(e.message, /execution reverted/);
+    assert.notStrictEqual(e.timedOut, true, 'a revert is not a timeout');
+  }
+});
+
+test('every send path is bounded — no bare tx.wait() remains', () => {
+  const fs = require('fs');
+  for (const f of ['pools.js', 'funding.js']) {
+    const src = fs.readFileSync(require('path').join(__dirname, f), 'utf8');
+    assert.ok(!/\.wait\(\)/.test(src),
+      `${f} still calls .wait() with no timeout — a dropped transaction hangs the bot forever`);
+  }
+});
+
 // ------------------------------------------------- swap step ordering
 test('executeSwap approves BEFORE it simulates', () => {
   // eth_call runs the real transferFrom, so simulating an unapproved wallet

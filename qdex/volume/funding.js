@@ -16,28 +16,28 @@
 const { ethers } = require('ethers');
 const lib = require('../lib');
 const { ERC20_ABI } = require('./wallets');
-const { NonceManager } = require('./nonces');
+const { NonceManager, withTimeout, waitFor } = require('./nonces');
 
 const wei = (human, decimals) => ethers.parseUnits(Number(human).toFixed(decimals), decimals);
 
-async function transferToken({ signer, token, to, amountWei, log = () => {}, nonces }) {
+async function transferToken({ signer, token, to, amountWei, log = () => {}, nonces, timeoutMs = 120000 }) {
   const c = new ethers.Contract(token, ERC20_ABI, signer);
   const gas = await lib.withRetry(() => c.transfer.estimateGas(to, amountWei), { attempts: 3, label: 'transfer.estimateGas', log });
   const nonce = await NonceManager.nonceFor(nonces, signer, 'transfer.nonce');
   try {
-    const tx = await c.transfer(to, amountWei, { gasLimit: (gas * 12n) / 10n, nonce });
-    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'transfer.wait', log });
+    const tx = await withTimeout(c.transfer(to, amountWei, { gasLimit: (gas * 12n) / 10n, nonce }), timeoutMs, 'transfer.send');
+    return await waitFor(tx, timeoutMs, 'transfer.wait');
   } catch (e) {
     if (nonces) nonces.reset(signer);
     throw e;
   }
 }
 
-async function transferNative({ signer, to, amountWei, log = () => {}, nonces }) {
+async function transferNative({ signer, to, amountWei, log = () => {}, nonces, timeoutMs = 120000 }) {
   const nonce = await NonceManager.nonceFor(nonces, signer, 'native.nonce');
   try {
-    const tx = await signer.sendTransaction({ to, value: amountWei, nonce });
-    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'native.wait', log });
+    const tx = await withTimeout(signer.sendTransaction({ to, value: amountWei, nonce }), timeoutMs, 'native.send');
+    return await waitFor(tx, timeoutMs, 'native.wait');
   } catch (e) {
     if (nonces) nonces.reset(signer);
     throw e;
@@ -66,14 +66,14 @@ async function fundWallets({ provider, parent, signers, config, execute, record,
     if (needNative > 0n) {
       log(`fund w${String(s.idx).padStart(2, '0')} native ${ethers.formatEther(needNative)}`);
       let hash = null;
-      if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: needNative, log, nonces }))?.hash;
+      if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: needNative, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
       await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
         amount: Number(ethers.formatEther(needNative)), txHash: hash });
     }
     if (needWl1x > 0n) {
       log(`fund w${String(s.idx).padStart(2, '0')} WL1X ${ethers.formatUnits(needWl1x, 18)}`);
       let hash = null;
-      if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: s.address, amountWei: needWl1x, log, nonces }))?.hash;
+      if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: s.address, amountWei: needWl1x, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
       await record({ kind: 'fund', from: parent.address, to: s.address, token: config.wl1x, tokenSymbol: 'WL1X',
         amount: Number(ethers.formatUnits(needWl1x, 18)), txHash: hash });
     }
@@ -105,7 +105,7 @@ async function rebalanceWallet({ provider, recipient, snapshots, signers, parent
     const from = signers.find((x) => x.address === donor.s.address);
     log(`XFER w${from.idx} -> ${recipient.address.slice(0, 10)}… ${amount.toFixed(4)} WL1X (below floor ${config.walletFloorWl1x})`);
     let hash = null;
-    if (execute) hash = (await transferToken({ signer: from.wallet, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log, nonces }))?.hash;
+    if (execute) hash = (await transferToken({ signer: from.wallet, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
     await record({ kind: 'peer', from: donor.s.address, to: recipient.address, token: config.wl1x,
       tokenSymbol: 'WL1X', amount, txHash: hash, reason: 'below floor' });
     return { kind: 'peer', amount };
@@ -123,7 +123,7 @@ async function rebalanceWallet({ provider, recipient, snapshots, signers, parent
   const amount = Math.min(available, need);
   log(`BACKSTOP parent -> ${recipient.address.slice(0, 10)}… ${amount.toFixed(4)} WL1X (fleet-wide shortage)`);
   let hash = null;
-  if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log, nonces }))?.hash;
+  if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: recipient.address, amountWei: wei(amount, 18), log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
   await record({ kind: 'backstop', from: parent.address, to: recipient.address, token: config.wl1x,
     tokenSymbol: 'WL1X', amount, txHash: hash, reason: 'fleet-wide shortage' });
   return { kind: 'backstop', amount };
@@ -146,7 +146,7 @@ async function ensureSweepGas({ provider, signer, parent, snapshot, config, exec
   const top = needed - snapshot.nativeRaw;
   log(`w${signer.idx} needs ${ethers.formatEther(top)} more L1X to afford its own sweep (${legs} legs) — topping up from parent`);
   let hash = null;
-  if (execute) hash = (await transferNative({ signer: parent, to: signer.address, amountWei: top, log, nonces }))?.hash;
+  if (execute) hash = (await transferNative({ signer: parent, to: signer.address, amountWei: top, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
   await record({ kind: 'backstop', from: parent.address, to: signer.address, token: null, tokenSymbol: 'L1X',
     amount: Number(ethers.formatEther(top)), txHash: hash, reason: 'gas for sweep' });
   return top;
@@ -163,7 +163,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
     if (!(t.raw > 0n)) continue;
     log(`sweep w${signer.idx} ${t.human} ${t.symbol}`);
     let hash = null;
-    if (execute) hash = (await transferToken({ signer: signer.wallet, token: addr, to: parent.address, amountWei: t.raw, log, nonces }))?.hash;
+    if (execute) hash = (await transferToken({ signer: signer.wallet, token: addr, to: parent.address, amountWei: t.raw, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
     await record({ kind: 'sweep', from: signer.address, to: parent.address, token: addr, tokenSymbol: t.symbol, amount: t.human, txHash: hash });
     moved.push({ symbol: t.symbol, amount: t.human });
   }
@@ -172,7 +172,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
   if (snapshot.wl1xRaw > 0n) {
     log(`sweep w${signer.idx} ${snapshot.wl1x} WL1X`);
     let hash = null;
-    if (execute) hash = (await transferToken({ signer: signer.wallet, token: config.wl1x, to: parent.address, amountWei: snapshot.wl1xRaw, log, nonces }))?.hash;
+    if (execute) hash = (await transferToken({ signer: signer.wallet, token: config.wl1x, to: parent.address, amountWei: snapshot.wl1xRaw, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
     await record({ kind: 'sweep', from: signer.address, to: parent.address, token: config.wl1x, tokenSymbol: 'WL1X', amount: snapshot.wl1x, txHash: hash });
     moved.push({ symbol: 'WL1X', amount: snapshot.wl1x });
   }
@@ -184,7 +184,7 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
     const human = Number(ethers.formatEther(send));
     log(`sweep w${signer.idx} ${human.toFixed(6)} L1X (gas dust left behind: ${ethers.formatEther(reserve)})`);
     let hash = null;
-    if (execute) hash = (await transferNative({ signer: signer.wallet, to: parent.address, amountWei: send, log, nonces }))?.hash;
+    if (execute) hash = (await transferNative({ signer: signer.wallet, to: parent.address, amountWei: send, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
     await record({ kind: 'sweep', from: signer.address, to: parent.address, token: null, tokenSymbol: 'L1X', amount: human, txHash: hash });
     moved.push({ symbol: 'L1X', amount: human });
   }
@@ -214,7 +214,7 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
     log(`distribute ${human} ${a.symbol} to each of ${n} wallets`);
     for (const s of signers) {
       let hash = null;
-      if (execute) hash = (await transferToken({ signer: parent, token: a.address, to: s.address, amountWei: share, log, nonces }))?.hash;
+      if (execute) hash = (await transferToken({ signer: parent, token: a.address, to: s.address, amountWei: share, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
       await record({ kind: 'fund', from: parent.address, to: s.address, token: a.address, tokenSymbol: a.symbol, amount: human, txHash: hash, reason: 'in-kind distribution' });
     }
   }
@@ -225,7 +225,7 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
     const need = wei(config.fundGasNative, 18) - have;
     if (need <= 0n) continue;
     let hash = null;
-    if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: need, log, nonces }))?.hash;
+    if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: need, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
     await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
       amount: Number(ethers.formatEther(need)), txHash: hash, reason: 'gas' });
   }

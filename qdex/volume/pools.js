@@ -14,7 +14,7 @@
 const { ethers } = require('ethers');
 const lib = require('../lib');
 const { ERC20_ABI } = require('./wallets');
-const { NonceManager } = require('./nonces');
+const { NonceManager, withTimeout, waitFor } = require('./nonces');
 
 const Q96 = 2 ** 96;
 
@@ -226,7 +226,7 @@ function paramsFor(variant, p) {
   return variant === 'v02' ? base : { ...base, deadline: p.deadline };
 }
 
-async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log = () => {}, nonces }) {
+async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log = () => {}, nonces, config }) {
   const erc = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
   const have = await lib.withRetry(() => erc.allowance(signer.address, spender), { attempts: 3, label: 'allowance', log });
   if (have >= amountWei) return null;
@@ -236,9 +236,10 @@ async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log =
   // would draw this same nonce, replace the approve, and then revert for having
   // no allowance. Every wallet's FIRST trade goes through here.
   const nonce = await NonceManager.nonceFor(nonces, signer, 'approve.nonce');
+  const timeout = (config && config.txTimeoutMs) || 120000;
   try {
-    const tx = await erc.approve(spender, ethers.MaxUint256, { nonce });
-    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'approve.wait', log });
+    const tx = await withTimeout(erc.approve(spender, ethers.MaxUint256, { nonce }), timeout, 'approve.send');
+    return await waitFor(tx, timeout, 'approve.wait');
   } catch (e) {
     if (nonces) nonces.reset(signer);
     throw e;
@@ -263,7 +264,7 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   // every wallet is permanently unable to make its FIRST trade on a pool, while
   // any wallet that happens to already have an allowance works fine, which makes
   // it look like an intermittent fault rather than a hard ordering bug.
-  await ensureAllowance({ tokenAddress: tokenIn.address, signer, spender: routerAddr, amountWei: amountIn, log, nonces });
+  await ensureAllowance({ tokenAddress: tokenIn.address, signer, spender: routerAddr, amountWei: amountIn, log, nonces, config });
 
   // minOut MUST come from a simulation of the real router, never from the
   // analytic curve. QDex's router skims a protocol fee (measured ~47bps, paid to
@@ -318,11 +319,12 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
   // line can move funds, so from now on a crash must still leave a trace.
   if (onNonce) await onNonce({ nonce, variant });
   const tx = await lib.withRetry(
-    () => c.exactInputSingle(paramsFor(variant, raw), { gasLimit: (gasEst * 12n) / 10n, nonce }),
+    () => withTimeout(c.exactInputSingle(paramsFor(variant, raw), { gasLimit: (gasEst * 12n) / 10n, nonce }),
+      config.txTimeoutMs, 'swap.send'),
     { attempts: 2, label: 'swap.send', log });
   if (onSent) await onSent({ hash: tx.hash, nonce });
   try {
-    return await lib.withRetry(() => tx.wait(), { attempts: 3, label: 'swap.wait', log });
+    return await waitFor(tx, config.txTimeoutMs, 'swap.wait');
   } catch (e) {
     if (nonces) nonces.reset(signer);
     // Distinguish two very different outcomes that both throw from wait():
