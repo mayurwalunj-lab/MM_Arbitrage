@@ -93,4 +93,35 @@ async function waitFor(tx, ms, label = 'tx.wait') {
   }
 }
 
-module.exports = { NonceManager, withTimeout, waitFor };
+// After a timeout the outcome is genuinely unknown: the transaction may have
+// been dropped, or it may be sitting in a mempool about to land. Retrying blind
+// would double-spend in the second case, so establish which happened first.
+//
+// The nonce decides it. A nonce is consumed exactly once, so:
+//   pending count still at or below it  -> nothing was accepted, safe to retry
+//   count has passed it                 -> something WAS mined at that nonce
+//
+// Checking `latest` alone is not enough — a transaction can be accepted into the
+// mempool (raising `pending`) without being mined yet. Both must be clear before
+// declaring nothing was sent.
+async function resolveAfterTimeout({ provider, address, nonce, hash, attempts = 5, delayMs = 6000, log = () => {} }) {
+  for (let i = 1; i <= attempts; i++) {
+    if (hash) {
+      const rc = await provider.getTransactionReceipt(hash).catch(() => null);
+      if (rc) return { outcome: 'landed', receipt: rc };
+    }
+    const [latest, pending] = await Promise.all([
+      provider.getTransactionCount(address, 'latest').catch(() => null),
+      provider.getTransactionCount(address, 'pending').catch(() => null)
+    ]);
+    if (latest != null && pending != null) {
+      if (latest > nonce) return { outcome: 'landed', receipt: null };   // mined, hash unknown
+      if (pending <= nonce) return { outcome: 'not-sent', latest, pending };
+    }
+    log(`resolving timeout: nonce ${nonce} still unresolved (latest ${latest}, pending ${pending}) — recheck ${i}/${attempts}`);
+    if (i < attempts) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return { outcome: 'unknown' };
+}
+
+module.exports = { NonceManager, withTimeout, waitFor, resolveAfterTimeout };

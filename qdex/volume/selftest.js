@@ -509,6 +509,57 @@ test('every send path is bounded — no bare tx.wait() remains', () => {
   }
 });
 
+// ------------------------------------------------- timeout recovery
+const mkProvider = (seq) => {
+  let i = 0;
+  return {
+    getTransactionCount: async (_a, tag) => { const s = seq[Math.min(i, seq.length - 1)]; if (tag === 'pending') i++; return s[tag === 'pending' ? 'pending' : 'latest']; },
+    getTransactionReceipt: async () => null
+  };
+};
+
+test('timeout resolves to not-sent when the nonce was never consumed', async () => {
+  const { resolveAfterTimeout } = require('./nonces');
+  // Exactly the w09 case: nonce 0 requested, chain still at 0 on both counts.
+  const provider = mkProvider([{ latest: 0, pending: 0 }]);
+  const r = await resolveAfterTimeout({ provider, address: '0xW', nonce: 0, attempts: 2, delayMs: 1 });
+  assert.strictEqual(r.outcome, 'not-sent', 'nothing was accepted — safe to continue');
+});
+
+test('timeout resolves to landed when the nonce was consumed', async () => {
+  const { resolveAfterTimeout } = require('./nonces');
+  const provider = mkProvider([{ latest: 6, pending: 6 }]);
+  const r = await resolveAfterTimeout({ provider, address: '0xW', nonce: 5, attempts: 2, delayMs: 1 });
+  assert.strictEqual(r.outcome, 'landed', 'nonce 5 was used — must NOT retry');
+});
+
+test('a transaction merely pending is not declared not-sent', async () => {
+  const { resolveAfterTimeout } = require('./nonces');
+  // Accepted into the mempool (pending ahead) but not yet mined. Retrying here
+  // would double-spend, so it must not resolve to not-sent.
+  const provider = mkProvider([{ latest: 5, pending: 6 }]);
+  const r = await resolveAfterTimeout({ provider, address: '0xW', nonce: 5, attempts: 2, delayMs: 1 });
+  assert.notStrictEqual(r.outcome, 'not-sent', 'a queued transaction must never look like nothing was sent');
+});
+
+test('an unreadable node gives up as unknown rather than guessing', async () => {
+  const { resolveAfterTimeout } = require('./nonces');
+  const provider = { getTransactionCount: async () => { throw new Error('rpc down'); }, getTransactionReceipt: async () => null };
+  const r = await resolveAfterTimeout({ provider, address: '0xW', nonce: 3, attempts: 2, delayMs: 1 });
+  assert.strictEqual(r.outcome, 'unknown', 'never assume when the chain cannot be read');
+});
+
+test('a receipt found by hash short-circuits to landed', async () => {
+  const { resolveAfterTimeout } = require('./nonces');
+  const provider = {
+    getTransactionCount: async () => 0,
+    getTransactionReceipt: async () => ({ status: 1, blockNumber: 999, gasUsed: 21000n })
+  };
+  const r = await resolveAfterTimeout({ provider, address: '0xW', nonce: 0, hash: '0xabc', attempts: 2, delayMs: 1 });
+  assert.strictEqual(r.outcome, 'landed');
+  assert.strictEqual(r.receipt.blockNumber, 999);
+});
+
 // ------------------------------------------------- swap step ordering
 test('executeSwap approves BEFORE it simulates', () => {
   // eth_call runs the real transferFrom, so simulating an unapproved wallet

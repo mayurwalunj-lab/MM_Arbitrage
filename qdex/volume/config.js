@@ -115,6 +115,12 @@ function getConfig() {
     // Hard bound on every broadcast and every wait. Without it a transaction the
     // node silently drops leaves the bot polling forever with nothing in flight.
     txTimeoutMs: envNum('QVT_TX_TIMEOUT_MS', 120000),
+    // After a timeout, establish from the nonce whether anything was actually
+    // accepted, then carry on rather than halting the session. Only a genuinely
+    // undecidable outcome stops the bot — retrying blind could double-spend.
+    timeoutRecovery: envBool('QVT_TIMEOUT_RECOVERY', true),
+    timeoutRecheckAttempts: envNum('QVT_TIMEOUT_RECHECK_ATTEMPTS', 5),
+    timeoutRecheckMs: envNum('QVT_TIMEOUT_RECHECK_MS', 6000),
 
     // ---- price guard: keep each pool near where the session found it ----
     maxDeviationPct: envNum('QVT_MAX_DEVIATION_PCT', 0.75),

@@ -36,7 +36,7 @@ const walletsMod = require('./wallets');
 const poolsMod = require('./pools');
 const funding = require('./funding');
 const guards = require('./guards');
-const { NonceManager } = require('./nonces');
+const { NonceManager, resolveAfterTimeout } = require('./nonces');
 
 const argv = process.argv.slice(2);
 const wantExecute = argv.includes('--execute');
@@ -465,15 +465,41 @@ async function run() {
         } catch (e) {
           const msg = String(e.shortMessage || e.message).slice(0, 180);
           if (e.timedOut) {
-            // The node never answered. A hash may or may not exist, and the
-            // transaction may still land — the write-ahead row holds the nonce,
-            // so reconcile can settle it from that. Stop rather than trade on a
-            // balance that might be about to change underneath us.
+            // The node never answered. Retrying blind could double-spend if the
+            // transaction is merely slow, so resolve it from the nonce first and
+            // only stop when the outcome is genuinely undecidable.
             log(`w${pad2(signer.idx)} ${market.cfg.label} TIMEOUT — ${msg}`);
-            const f = { status: 'unconfirmed', txHash: e.broadcastHash ?? null,
-              reason: `timed out, outcome unknown: ${msg}`.slice(0, 250) };
-            if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
-            stop.trip('transaction timed out — run npm run qdex:vol:reconcile before resuming');
+            const res = config.timeoutRecovery && e.broadcastNonce != null
+              ? await resolveAfterTimeout({ provider, address: signer.address, nonce: e.broadcastNonce,
+                  hash: e.broadcastHash, attempts: config.timeoutRecheckAttempts,
+                  delayMs: config.timeoutRecheckMs, log })
+              : { outcome: 'unknown' };
+
+            if (res.outcome === 'not-sent') {
+              // Nothing was accepted: no nonce consumed, no funds moved. Record
+              // it and carry on — one lost iteration, not a lost session.
+              log(`w${pad2(signer.idx)} resolved: nonce ${e.broadcastNonce} never used, nothing sent — continuing`);
+              const f = { status: 'failed', reason: `timed out, confirmed not sent: ${msg}`.slice(0, 250) };
+              if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
+              stop.recordFailure();
+            } else if (res.outcome === 'landed') {
+              const okOnChain = !res.receipt || Number(res.receipt.status) === 1;
+              log(`w${pad2(signer.idx)} resolved: transaction DID land${res.receipt ? ` in block ${res.receipt.blockNumber}` : ' (hash unknown)'} — continuing`);
+              const f = { status: okOnChain ? 'executed' : 'failed',
+                txHash: e.broadcastHash ?? null,
+                blockNumber: res.receipt?.blockNumber != null ? Number(res.receipt.blockNumber) : null,
+                gasUsed: res.receipt?.gasUsed != null ? res.receipt.gasUsed.toString() : null,
+                reason: `timed out but landed: ${msg}`.slice(0, 250) };
+              if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
+              if (okOnChain) stop.recordSuccess(q.notionalWl1x); else stop.recordFailure();
+            } else {
+              // Still undecidable after rechecking. This is the only case that
+              // halts: continuing risks acting on a balance about to change.
+              const f = { status: 'unconfirmed', txHash: e.broadcastHash ?? null, nonce: e.broadcastNonce ?? null,
+                reason: `timed out, outcome undetermined: ${msg}`.slice(0, 250) };
+              if (walId) await db.updateTrade(walId, f); else await recordTrade({ ...row, ...f });
+              stop.trip('transaction outcome undetermined after timeout — run npm run qdex:vol:reconcile');
+            }
           } else if (e.preflightRejected) {
             // Rejected by the simulation BEFORE anything was broadcast: nothing
             // was sent, no nonce consumed, no gas spent. A skip, not a failure.

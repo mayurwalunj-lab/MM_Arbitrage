@@ -327,6 +327,9 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
     return await waitFor(tx, config.txTimeoutMs, 'swap.wait');
   } catch (e) {
     if (nonces) nonces.reset(signer);
+    // Always surface the nonce: after a timeout it is the only thing that can
+    // decide whether the transaction was accepted.
+    e.broadcastNonce = nonce;
     // Distinguish two very different outcomes that both throw from wait():
     //   MINED AND REVERTED — a definite failure. The nonce was consumed and gas
     //     was spent, but no funds moved. Nothing to reconcile.
