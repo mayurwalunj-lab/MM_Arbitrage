@@ -667,6 +667,120 @@ app.get('/api/arb/inventory', (req, res) => {
     );
 });
 
+// --- 5b. QDEX VOLUME TEST HARNESS (qdex/volume) ---
+//
+// Read-only views over qdex_volume_*. SECURITY: qdex_volume_wallets.privkey_enc
+// and qdex_volume_epochs.mnemonic_enc hold encrypted wallet keys. This process
+// serves over HTTP with open CORS, so those two columns are NEVER selected here.
+// Every query below lists its columns explicitly — do not replace them with *.
+
+app.get('/api/qdex/volume/summary', (req, res) => {
+    const pool = arbPool();
+    const hours = Number(req.query.hours) || 24;
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT COUNT(*) attempts,
+                SUM(status='executed') executed,
+                SUM(status='skipped')  skipped,
+                SUM(status='failed')   failed,
+                COALESCE(SUM(CASE WHEN status='executed' THEN notional_wl1x END),0) volume_wl1x,
+                AVG(CASE WHEN status='executed' THEN notional_wl1x END) avg_size_wl1x,
+                AVG(CASE WHEN status='executed' THEN impact_bps END)    avg_impact_bps,
+                MAX(CASE WHEN status='executed' THEN impact_bps END)    max_impact_bps,
+                SUM(CASE WHEN status='executed' AND side='buy'  THEN 1 ELSE 0 END) buys,
+                SUM(CASE WHEN status='executed' AND side='sell' THEN 1 ELSE 0 END) sells,
+                MIN(timestamp) first_ts, MAX(timestamp) last_ts
+         FROM qdex_volume_trades
+         WHERE timestamp > NOW() - INTERVAL ? HOUR AND ${flt}`,
+        [hours],
+        (err, totals) => {
+            if (err) return res.status(500).json({ error: err.message });
+            pool.query(
+                `SELECT pool_label, COUNT(*) attempts, SUM(status='executed') executed,
+                        COALESCE(SUM(CASE WHEN status='executed' THEN notional_wl1x END),0) volume_wl1x,
+                        AVG(CASE WHEN status='executed' THEN impact_bps END) avg_impact_bps,
+                        AVG(deviation_pct) avg_deviation_pct
+                 FROM qdex_volume_trades
+                 WHERE timestamp > NOW() - INTERVAL ? HOUR AND ${flt}
+                 GROUP BY pool_label ORDER BY volume_wl1x DESC`,
+                [hours],
+                (e2, byPool) => {
+                    if (e2) return res.status(500).json({ error: e2.message });
+                    pool.query(
+                        `SELECT reason, COUNT(*) n FROM qdex_volume_trades
+                         WHERE timestamp > NOW() - INTERVAL ? HOUR AND status='skipped'
+                         GROUP BY reason ORDER BY n DESC LIMIT 10`,
+                        [hours],
+                        (e3, skips) => {
+                            if (e3) return res.status(500).json({ error: e3.message });
+                            res.json({ totals: totals[0] || {}, byPool, skipReasons: skips });
+                        }
+                    );
+                }
+            );
+        }
+    );
+});
+
+app.get('/api/qdex/volume/trades', (req, res) => {
+    const pool = arbPool();
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT id, timestamp, epoch_id, run_id, status, is_dry_run, is_test_activity,
+                wallet_idx, wallet_address, pool_label, side,
+                amount_in, amount_in_symbol, amount_out, amount_out_symbol,
+                notional_wl1x, exec_price, price_before, price_after, impact_bps,
+                deviation_pct, tx_hash, block_number, gas_used, reason
+         FROM qdex_volume_trades WHERE ${flt} ORDER BY id DESC LIMIT ?`,
+        [limit],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ trades: rows });
+        }
+    );
+});
+
+app.get('/api/qdex/volume/epochs', (req, res) => {
+    const pool = arbPool();
+    // Explicit column list — mnemonic_enc is deliberately excluded.
+    pool.query(
+        `SELECT id, status, chain_id, parent_address, wallet_count, derivation_path,
+                test_tag, is_test_activity, created_at, expires_at, retired_at, note
+         FROM qdex_volume_epochs ORDER BY id DESC LIMIT 20`,
+        (err, epochs) => {
+            if (err) return res.status(500).json({ error: err.message });
+            // privkey_enc deliberately excluded.
+            pool.query(
+                `SELECT epoch_id, idx, address, funded_at, swept_at
+                 FROM qdex_volume_wallets ORDER BY epoch_id DESC, idx ASC LIMIT 200`,
+                (e2, wallets) => {
+                    if (e2) return res.status(500).json({ error: e2.message });
+                    res.json({ epochs, wallets });
+                }
+            );
+        }
+    );
+});
+
+app.get('/api/qdex/volume/transfers', (req, res) => {
+    const pool = arbPool();
+    const hours = Number(req.query.hours) || 168;
+    const flt = modeFilter(req.query.mode);
+    pool.query(
+        `SELECT id, timestamp, epoch_id, kind, from_address, to_address,
+                token_symbol, amount, tx_hash, status, is_dry_run, reason
+         FROM qdex_volume_transfers
+         WHERE timestamp > NOW() - INTERVAL ? HOUR AND ${flt}
+         ORDER BY id DESC LIMIT 300`,
+        [hours],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ transfers: rows });
+        }
+    );
+});
+
 // --- 6. START SERVER ---
 const PORT = parseInt(process.env.DASHBOARD_PORT) || 5002;
 app.listen(PORT, () => {

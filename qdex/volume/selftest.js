@@ -1,0 +1,276 @@
+#!/usr/bin/env node
+
+'use strict';
+
+// Offline self-test for the QDex volume harness. Exercises the crypto round
+// trip, the rate limiter, the stop controller, side selection and the V3 sizing
+// / quoting math against a synthetic pool. Touches no network and no database.
+//
+//   node qdex/volume/selftest.js
+
+const assert = require('assert');
+const { ethers } = require('ethers');
+
+const crypto = require('./crypto');
+const guards = require('./guards');
+const pools = require('./pools');
+
+let passed = 0;
+const test = (name, fn) => {
+  try { fn(); console.log(`  ok    ${name}`); passed++; }
+  catch (e) { console.log(`  FAIL  ${name}\n        ${e.message}`); process.exitCode = 1; }
+};
+
+console.log('\nQDex volume harness — offline self-test\n');
+
+// ---------------------------------------------------------------- crypto
+const SECRET = crypto.newSecret();
+
+test('encrypt/decrypt round-trips a private key', () => {
+  const pk = ethers.Wallet.createRandom().privateKey;
+  assert.strictEqual(crypto.decrypt(crypto.encrypt(pk, SECRET), SECRET), pk);
+});
+
+test('ciphertext differs every time (random IV)', () => {
+  const pk = ethers.Wallet.createRandom().privateKey;
+  assert.notStrictEqual(crypto.encrypt(pk, SECRET), crypto.encrypt(pk, SECRET));
+});
+
+test('wrong secret fails loudly instead of returning garbage', () => {
+  const blob = crypto.encrypt('hello', SECRET);
+  assert.throws(() => crypto.decrypt(blob, crypto.newSecret()), /decrypt failed/);
+});
+
+test('tampered ciphertext is rejected by the GCM auth tag', () => {
+  const parts = crypto.encrypt('hello', SECRET).split(':');
+  const buf = Buffer.from(parts[3], 'base64');
+  buf[0] ^= 0xff;
+  parts[3] = buf.toString('base64');
+  assert.throws(() => crypto.decrypt(parts.join(':'), SECRET), /decrypt failed/);
+});
+
+test('a passphrase secret is stretched, a short one refused', () => {
+  assert.strictEqual(crypto.decrypt(crypto.encrypt('x', 'a-long-enough-passphrase'), 'a-long-enough-passphrase'), 'x');
+  assert.throws(() => crypto.encrypt('x', 'short'), /too short/);
+});
+
+// ---------------------------------------------------------------- HD wallets
+test('the same mnemonic always derives the same 10 addresses', () => {
+  const m = ethers.Wallet.createRandom().mnemonic.phrase;
+  const { derive } = require('./wallets');
+  const a = derive(m, 10, "m/44'/60'/0'/0").map((w) => w.address);
+  const b = derive(m, 10, "m/44'/60'/0'/0").map((w) => w.address);
+  assert.deepStrictEqual(a, b);
+  assert.strictEqual(new Set(a).size, 10, 'addresses must be distinct');
+});
+
+// ---------------------------------------------------------------- rate limiter
+test('rate limiter allows exactly max per rolling hour', () => {
+  const rl = new guards.RateLimiter(5);
+  const t0 = 1_000_000;
+  for (let i = 0; i < 5; i++) { assert.strictEqual(rl.waitMs(t0 + i), 0); rl.record(t0 + i); }
+  assert.ok(rl.waitMs(t0 + 5) > 0, 'sixth call in the hour must wait');
+  assert.strictEqual(rl.waitMs(t0 + 3600001), 0, 'window must roll forward');
+});
+
+test('rate limiter reports the trailing-hour count', () => {
+  const rl = new guards.RateLimiter(100);
+  const t0 = 5_000_000;
+  for (let i = 0; i < 10; i++) rl.record(t0 + i * 1000);
+  assert.strictEqual(rl.countLastHour(t0 + 20000), 10);
+  assert.strictEqual(rl.countLastHour(t0 + 3600000 + 20000), 0);
+});
+
+// ---------------------------------------------------------------- stop controller
+test('stop trips after N consecutive failures', () => {
+  const s = new guards.StopController({ maxConsecutiveFailures: 3, stopFile: null, maxSessionTx: 0, maxSessionNotionalWl1x: 0, maxRuntimeMin: 0 });
+  s.recordFailure(); s.recordFailure();
+  assert.strictEqual(s.stopped, false);
+  s.recordFailure();
+  assert.strictEqual(s.stopped, true);
+  assert.match(s.reason, /consecutive/);
+});
+
+test('a success resets the failure streak', () => {
+  const s = new guards.StopController({ maxConsecutiveFailures: 3, stopFile: null, maxSessionTx: 0, maxSessionNotionalWl1x: 0, maxRuntimeMin: 0 });
+  s.recordFailure(); s.recordFailure(); s.recordSuccess(1);
+  s.recordFailure(); s.recordFailure();
+  assert.strictEqual(s.stopped, false);
+});
+
+test('session transaction budget trips the stop', () => {
+  const s = new guards.StopController({ maxConsecutiveFailures: 99, stopFile: null, maxSessionTx: 2, maxSessionNotionalWl1x: 0, maxRuntimeMin: 0 });
+  s.recordSuccess(1); s.recordSuccess(1);
+  assert.strictEqual(s.shouldStop(), true);
+  assert.match(s.reason, /transaction budget/);
+});
+
+test('session notional budget trips the stop', () => {
+  const s = new guards.StopController({ maxConsecutiveFailures: 99, stopFile: null, maxSessionTx: 0, maxSessionNotionalWl1x: 5, maxRuntimeMin: 0 });
+  s.recordSuccess(3); s.recordSuccess(3);
+  assert.strictEqual(s.shouldStop(), true);
+  assert.match(s.reason, /notional budget/);
+});
+
+// ---------------------------------------------------------------- side choice
+const sideCfg = { maxDeviationPct: 0.75, inventoryTargetPct: 50, biasStrength: 0.7 };
+
+test('price below the band forces SELL, above forces BUY', () => {
+  assert.strictEqual(guards.chooseSide({ wl1xValue: 1, tokenValue: 1, deviationPct: -2, config: sideCfg }).side, 'sell');
+  assert.strictEqual(guards.chooseSide({ wl1xValue: 1, tokenValue: 1, deviationPct: 2, config: sideCfg }).side, 'buy');
+});
+
+test('a wallet holding only WL1X leans BUY — this is what opens epoch 1', () => {
+  let buys = 0;
+  for (let i = 0; i < 2000; i++) {
+    if (guards.chooseSide({ wl1xValue: 3, tokenValue: 0, deviationPct: 0, config: sideCfg }).side === 'buy') buys++;
+  }
+  assert.ok(buys / 2000 > 0.7, `expected a strong buy lean, got ${(buys / 2000 * 100).toFixed(0)}%`);
+});
+
+test('a balanced wallet is near a coin flip', () => {
+  let buys = 0;
+  for (let i = 0; i < 4000; i++) {
+    if (guards.chooseSide({ wl1xValue: 1, tokenValue: 1, deviationPct: 0, config: sideCfg }).side === 'buy') buys++;
+  }
+  const r = buys / 4000;
+  assert.ok(r > 0.44 && r < 0.56, `expected ~50/50, got ${(r * 100).toFixed(0)}%`);
+});
+
+// ---------------------------------------------------------------- sizing
+test('logUniform stays in range and favours smaller sizes', () => {
+  let sum = 0;
+  for (let i = 0; i < 5000; i++) {
+    const v = guards.logUniform(0.05, 1.0);
+    assert.ok(v >= 0.05 && v <= 1.0, `out of range: ${v}`);
+    sum += v;
+  }
+  const mean = sum / 5000;
+  assert.ok(mean < 0.5, `log-uniform mean should sit below the midpoint, got ${mean.toFixed(3)}`);
+});
+
+test('weightedPick follows the weights', () => {
+  const items = [{ id: 'big', w: 90 }, { id: 'small', w: 10 }];
+  let big = 0;
+  for (let i = 0; i < 5000; i++) if (guards.weightedPick(items, (x) => x.w).id === 'big') big++;
+  const r = big / 5000;
+  assert.ok(r > 0.85 && r < 0.95, `expected ~90% big, got ${(r * 100).toFixed(0)}%`);
+});
+
+// ---------------------------------------------------------------- V3 pool math
+// Synthetic 18/18-decimal pool with WL1X as token0 at a price of 100 token/WL1X.
+function synth({ price = 100, L = 1e24, wl1xIsToken0 = true } = {}) {
+  const t1PerT0 = wl1xIsToken0 ? price : 1 / price;
+  const sqrtX96 = Math.sqrt(t1PerT0) * pools.Q96;
+  const wl1x = { address: '0x' + '11'.repeat(20), symbol: 'WL1X', decimals: 18 };
+  const tok = { address: '0x' + '22'.repeat(20), symbol: 'TOK', decimals: 18 };
+  return {
+    cfg: { label: 'synth', router: '0x' + '33'.repeat(20) },
+    address: '0x' + '44'.repeat(20),
+    fee: 3000, liquidity: BigInt(Math.floor(L)), sqrtPriceX96: BigInt(Math.floor(sqrtX96)),
+    token0: wl1xIsToken0 ? wl1x : tok, token1: wl1xIsToken0 ? tok : wl1x,
+    baseIsToken0: wl1xIsToken0, base: wl1x, quote: tok
+  };
+}
+
+test('price() recovers the price the pool was built at (WL1X = token0)', () => {
+  assert.ok(Math.abs(pools.price(synth({ price: 100 })) - 100) / 100 < 1e-6);
+});
+
+test('price() recovers it with WL1X as token1 too', () => {
+  assert.ok(Math.abs(pools.price(synth({ price: 100, wl1xIsToken0: false })) - 100) / 100 < 1e-6);
+});
+
+test('BUY pushes token-per-WL1X DOWN, SELL pushes it UP', () => {
+  const m = synth();
+  const b = pools.quote({ market: m, side: 'buy', sizeWl1x: 1, slippageBps: 100 });
+  const s = pools.quote({ market: m, side: 'sell', sizeWl1x: 1, slippageBps: 100 });
+  assert.ok(b.priceAfter < b.priceBefore, 'buy must lower the price');
+  assert.ok(s.priceAfter > s.priceBefore, 'sell must raise it');
+});
+
+test('maxSizeAtImpact actually lands on the cap', () => {
+  for (const wl1xIsToken0 of [true, false]) {
+    for (const side of ['buy', 'sell']) {
+      const m = synth({ wl1xIsToken0 });
+      const cap = 25;
+      const size = pools.maxSizeAtImpact(m, cap, side);
+      assert.ok(size > 0, `${side}/${wl1xIsToken0}: size must be positive`);
+      const q = pools.quote({ market: m, side, sizeWl1x: size, slippageBps: 100 });
+      // The fee is taken off the input, so realised impact lands slightly under
+      // the cap — it must never land over it.
+      assert.ok(q.impactBps <= cap * 1.02,
+        `${side}/token0=${wl1xIsToken0}: impact ${q.impactBps.toFixed(2)} exceeded cap ${cap}`);
+      assert.ok(q.impactBps > cap * 0.85,
+        `${side}/token0=${wl1xIsToken0}: impact ${q.impactBps.toFixed(2)} far below cap — sizing is too timid`);
+    }
+  }
+});
+
+test('impact grows with size', () => {
+  const m = synth();
+  const a = pools.quote({ market: m, side: 'buy', sizeWl1x: 1, slippageBps: 100 });
+  const b = pools.quote({ market: m, side: 'buy', sizeWl1x: 10, slippageBps: 100 });
+  assert.ok(b.impactBps > a.impactBps);
+});
+
+test('quoteWithinImpact shrinks an oversized trade under the cap', () => {
+  const m = synth();
+  const huge = pools.maxSizeAtImpact(m, 25, 'buy') * 8;
+  const fit = pools.quoteWithinImpact({ market: m, side: 'buy', sizeWl1x: huge, maxImpactBps: 25, minWl1x: 0.001, slippageBps: 100 });
+  assert.ok(fit, 'should find a fitting size');
+  assert.strictEqual(fit.shrunkFrom, huge);
+  assert.ok(fit.quote.sizeWl1x < huge);
+  assert.ok(fit.quote.impactBps <= 25, `shrunk impact ${fit.quote.impactBps} still over cap`);
+});
+
+test('quoteWithinImpact gives up when even the minimum is too big', () => {
+  const thin = synth({ L: 1e18 });
+  const fit = pools.quoteWithinImpact({ market: thin, side: 'buy', sizeWl1x: 100, maxImpactBps: 1, minWl1x: 50, slippageBps: 100 });
+  assert.strictEqual(fit, null);
+});
+
+test('the pool fee is charged on the input', () => {
+  const m = synth();
+  const q = pools.quote({ market: m, side: 'buy', sizeWl1x: 0.001, slippageBps: 0 });
+  // Tiny trade => negligible slippage, so output/input should be price minus fee.
+  const effective = q.amountOutHuman / q.amountInHuman;
+  const expected = 100 * (1 - 3000 / 1e6);
+  assert.ok(Math.abs(effective - expected) / expected < 0.001,
+    `effective ${effective.toFixed(4)} vs expected ${expected.toFixed(4)}`);
+});
+
+test('minOut respects the slippage setting', () => {
+  const m = synth();
+  const q = pools.quote({ market: m, side: 'buy', sizeWl1x: 1, slippageBps: 100 });
+  assert.ok(Math.abs(q.minOutHuman - q.amountOutHuman * 0.99) < 1e-9);
+});
+
+test('a zero-liquidity pool quotes nothing rather than dividing by zero', () => {
+  const dead = synth({ L: 0 });
+  assert.strictEqual(pools.quote({ market: dead, side: 'buy', sizeWl1x: 1, slippageBps: 100 }), null);
+  assert.strictEqual(pools.maxSizeAtImpact(dead, 25, 'buy'), 0);
+});
+
+// ---------------------------------------------------------------- donor choice
+test('donor selection never drops a donor below its own floor', () => {
+  const { chooseDonor } = require('./funding');
+  const cfg = { walletFloorWl1x: 0.3, minTransferWl1x: 0.25 };
+  const snaps = [
+    { address: '0xa', wl1x: 0.35 },  // surplus 0.05 — too small
+    { address: '0xb', wl1x: 2.0 },   // surplus 1.7  — the winner
+    { address: '0xc', wl1x: 0.9 }
+  ];
+  const d = chooseDonor(snaps, '0xz', cfg);
+  assert.strictEqual(d.s.address, '0xb');
+  assert.ok(d.surplus <= 2.0 - cfg.walletFloorWl1x + 1e-9);
+});
+
+test('no donor is returned when everyone is at the floor', () => {
+  const { chooseDonor } = require('./funding');
+  const cfg = { walletFloorWl1x: 0.3, minTransferWl1x: 0.25 };
+  const snaps = [{ address: '0xa', wl1x: 0.31 }, { address: '0xb', wl1x: 0.30 }];
+  assert.strictEqual(chooseDonor(snaps, '0xz', cfg), null);
+});
+
+console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ', all green'}\n`);

@@ -10,6 +10,11 @@ npm-debug.log*
 # Arb monitor runtime state (flags, opportunity log)
 arb/state/
 
+# QDex volume test harness: wallet keyfile (mnemonic!) and the emergency stop flag
+qdex/volume/.wallets*.json
+qdex/volume/.wallets*.bak
+qdex/volume/.STOP
+
 # Legacy per-project installs
 Market_Making_Bitmart/node_modules/
 Market_making_Lbank/node_modules/
