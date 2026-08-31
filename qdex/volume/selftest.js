@@ -266,6 +266,76 @@ test('zero or nonsense limits never empty the roster', () => {
   }
 });
 
+// ---------------------------------------------------------------- rotation cost
+// sweepWallet and distributeInKind both touch the chain, so these exercise the
+// decision each one makes rather than the transfer itself: which bags are worth
+// moving, and which assets seed the new roster.
+const funding = require('./funding');
+
+function fakeSnapshot(bags) {
+  const tokens = {};
+  Object.entries(bags).forEach(([sym, human], i) => {
+    tokens[`0xt${i}`] = { symbol: sym, decimals: 18, raw: human > 0 ? 1n : 0n, human };
+  });
+  return { address: '0xw', nativeRaw: 0n, native: 0, wl1xRaw: 0n, wl1x: 0, tokens };
+}
+// price 1.0 for every token, so WL1X value == token amount and the threshold
+// reads directly off the numbers in the test.
+const unitValuer = (addr, human) => human;
+// sweepWallet asks the provider for fee data to size its gas reserve. Nothing is
+// broadcast (execute:false), so a stub is enough.
+const stubProvider = { getFeeData: async () => ({ gasPrice: 1n, maxFeePerGas: 1n }) };
+
+async function sweepDecisions(bags, minWl1x) {
+  const swept = [];
+  await funding.sweepWallet({
+    provider: stubProvider, signer: { idx: 0, address: '0xw', wallet: null }, parent: { address: '0xp' },
+    snapshot: fakeSnapshot(bags),
+    config: { sweepMinWl1x: minWl1x, txTimeoutMs: 1000 },
+    execute: false,                       // nothing is broadcast
+    record: async (x) => { if (x.kind === 'sweep' && x.tokenSymbol) swept.push(x.tokenSymbol); },
+    log: () => {}, nonces: null, valueBag: unitValuer
+  });
+  return swept;
+}
+
+test('sweep leaves bags below the threshold behind', async () => {
+  const swept = await sweepDecisions({ BIG: 0.5, MID: 0.04, DUST: 0.001 }, 0.03);
+  assert.ok(swept.includes('BIG'), 'BIG must be swept');
+  assert.ok(swept.includes('MID'), 'MID is above the threshold');
+  assert.ok(!swept.includes('DUST'), 'DUST must be abandoned, not swept');
+});
+
+test('threshold 0 sweeps everything — the old behaviour is still reachable', async () => {
+  const swept = await sweepDecisions({ BIG: 0.5, DUST: 0.000001 }, 0);
+  assert.ok(swept.includes('DUST'), 'a zero threshold must not abandon anything');
+});
+
+test('a bag with no price is swept, never silently abandoned', async () => {
+  const swept = [];
+  await funding.sweepWallet({
+    provider: stubProvider, signer: { idx: 0, address: '0xw', wallet: null }, parent: { address: '0xp' },
+    snapshot: fakeSnapshot({ UNKNOWN: 0.000001 }),
+    config: { sweepMinWl1x: 0.03, txTimeoutMs: 1000 }, execute: false,
+    record: async (x) => { if (x.kind === 'sweep' && x.tokenSymbol) swept.push(x.tokenSymbol); },
+    log: () => {}, nonces: null,
+    valueBag: () => Infinity            // what bagValuer returns for an unpriced token
+  });
+  assert.ok(swept.includes('UNKNOWN'), 'abandoning is irreversible — an unvalued bag must be swept');
+});
+
+test('sweepWallet defaults to sweeping everything when given no valuer', async () => {
+  const swept = [];
+  await funding.sweepWallet({
+    provider: stubProvider, signer: { idx: 0, address: '0xw', wallet: null }, parent: { address: '0xp' },
+    snapshot: fakeSnapshot({ DUST: 0.000001 }),
+    config: { sweepMinWl1x: 0.03, txTimeoutMs: 1000 }, execute: false,
+    record: async (x) => { if (x.kind === 'sweep' && x.tokenSymbol) swept.push(x.tokenSymbol); },
+    log: () => {}, nonces: null
+  });
+  assert.ok(swept.includes('DUST'), 'a caller supplying no prices must not lose balances');
+});
+
 // ---------------------------------------------------------------- pool affinity
 const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
 

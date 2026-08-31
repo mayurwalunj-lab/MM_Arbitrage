@@ -8,10 +8,17 @@
 //   2. peer transfer    surplus sub-wallet -> starved sub-wallet
 //   3. parent backstop  when the whole fleet is short, or gas is low
 //
-// SWEEP IS IN KIND. At epoch rotation every non-zero token balance is
-// transferred to the parent as-is, never sold back to WL1X first. Liquidating
-// ~100 token bags would burn the pool fee twice over and move ten prices at once;
-// transferring costs one ERC-20 transfer each and moves nothing.
+// SWEEP IS IN KIND. At epoch rotation token balances are transferred to the
+// parent as-is, never sold back to WL1X first. Liquidating ~100 token bags would
+// burn the pool fee twice over and move ten prices at once; transferring costs
+// one ERC-20 transfer each and moves nothing.
+//
+// But in kind is not the same as in full. After a few days every wallet holds a
+// bag in every pool, and most are worth fractions of a cent — sweeping and then
+// redistributing them costs hundreds of transfers to relocate almost nothing,
+// and hands the incoming roster the same fragmentation the outgoing one died of.
+// config.sweepMinWl1x leaves those behind; config.distributeMode decides whether
+// the new roster is seeded with WL1X alone or with every asset the parent holds.
 
 const { ethers } = require('ethers');
 const lib = require('../lib');
@@ -153,14 +160,25 @@ async function ensureSweepGas({ provider, signer, parent, snapshot, config, exec
 }
 
 // ---- sweep: sub-wallet -> parent, IN KIND (no swaps) ----
-async function sweepWallet({ provider, signer, parent, snapshot, config, execute, record, log, nonces }) {
+// `valueBag(tokenAddress, human) -> WL1X` lets the sweep tell dust from
+// substance. It defaults to "everything is worth sweeping", so a caller that
+// does not supply prices keeps the old sweep-it-all behaviour rather than
+// silently abandoning balances it could not value.
+async function sweepWallet({ provider, signer, parent, snapshot, config, execute, record, log, nonces,
+                             valueBag = () => Infinity }) {
   const moved = [];
+  const abandoned = [];
+  const minBag = (config && config.sweepMinWl1x) || 0;
   const toppedUp = await ensureSweepGas({ provider, signer, parent, snapshot, config, execute, record, log, nonces });
   if (toppedUp > 0n) snapshot = { ...snapshot, nativeRaw: snapshot.nativeRaw + toppedUp };
 
-  // 1. every non-zero pool token, as-is
+  // 1. every pool token worth moving, as-is
   for (const [addr, t] of Object.entries(snapshot.tokens)) {
     if (!(t.raw > 0n)) continue;
+    if (minBag > 0) {
+      const worth = valueBag(addr, t.human);
+      if (worth < minBag) { abandoned.push({ symbol: t.symbol, amount: t.human, worth }); continue; }
+    }
     log(`sweep w${signer.idx} ${t.human} ${t.symbol}`);
     let hash = null;
     if (execute) hash = (await transferToken({ signer: signer.wallet, token: addr, to: parent.address, amountWei: t.raw, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
@@ -188,6 +206,11 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
     await record({ kind: 'sweep', from: signer.address, to: parent.address, token: null, tokenSymbol: 'L1X', amount: human, txHash: hash });
     moved.push({ symbol: 'L1X', amount: human });
   }
+  if (abandoned.length) {
+    const worth = abandoned.reduce((a, b) => a + b.worth, 0);
+    log(`sweep w${signer.idx} left ${abandoned.length} dust bags behind (~${worth.toFixed(4)} WL1X, each under ${minBag})`);
+  }
+  moved.abandoned = abandoned;
   return moved;
 }
 
@@ -198,11 +221,20 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
   const n = signers.length;
   const keep = 1 - config.parentReservePct / 100;
 
+  // WL1X-only is the default. Splitting every token across every wallet gives
+  // each one a bag in each pool worth a fraction of the trading minimum — the
+  // new roster starts fragmented and cannot sell any of it. Leaving the tokens
+  // at the parent costs nothing: they are still held, and the parent can be
+  // consolidated on its own schedule.
+  const wl1xOnly = (config.distributeMode || 'wl1x') !== 'inkind';
   const assets = [{ address: config.wl1x, symbol: 'WL1X', decimals: 18 },
-    ...config.pools.map((p) => {
+    ...(wl1xOnly ? [] : config.pools.map((p) => {
       const m = tokenMeta[p.token.toLowerCase()] || { symbol: p.label, decimals: 18 };
       return { address: p.token, symbol: m.symbol, decimals: m.decimals };
-    })];
+    }))];
+  log(wl1xOnly
+    ? `distributing WL1X only (QVT_DISTRIBUTE_MODE=wl1x) — tokens stay at the parent`
+    : `distributing all ${assets.length} assets in kind (QVT_DISTRIBUTE_MODE=inkind)`);
 
   for (const a of assets) {
     const c = new ethers.Contract(a.address, ERC20_ABI, provider);

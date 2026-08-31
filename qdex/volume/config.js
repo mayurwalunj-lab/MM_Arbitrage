@@ -176,6 +176,18 @@ function getConfig() {
     // the same skip from the same wallet and pool collapse into one row carrying
     // a count for this long. 0 disables the throttle (a row per attempt).
     skipLogWindowMs: envNum('QVT_SKIP_LOG_WINDOW_MS', 300000),
+    // ROTATION. sweepWallet moves every non-zero balance, and after a few days
+    // of trading each wallet carries a bag in every pool — 120 of them, most
+    // worth fractions of a cent. Sweeping and redistributing those costs ~280
+    // transfers to relocate ~0.5 WL1X. Bags worth less than this in WL1X are
+    // left on the retired wallet instead. 0 sweeps everything (the old cost).
+    sweepMinWl1x: envNum('QVT_SWEEP_MIN_WL1X', 0.03),
+    // 'wl1x'   distribute WL1X only; tokens stay parked at the parent.
+    // 'inkind' distribute every asset, split across the roster.
+    // In-kind hands each new wallet a bag in every pool — which is precisely the
+    // fragmentation that leaves a wallet unable to trade, recreated on day one
+    // of the new epoch. WL1X-only starts the roster concentrated.
+    distributeMode: (process.env.QVT_DISTRIBUTE_MODE || 'wl1x').toLowerCase(),
     lockFile: process.env.QVT_LOCK_FILE || require('path').join(__dirname, '.LOCK'),
     stopFile: process.env.QVT_STOP_FILE || require('path').join(__dirname, '.STOP'),
 

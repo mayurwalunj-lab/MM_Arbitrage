@@ -115,18 +115,22 @@ async function cmdSweep(config) {
   const parent = walletsMod.parentSigner(config, provider);
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
   const record = mkRecord(e.id, execute);
+  const valueBag = await bagValuer({ provider, config, tokenMeta });
 
   // Only mutate state when actually sweeping. A dry run that marks the epoch
   // 'draining' leaves the bot refusing to trade until someone notices and
   // reverses it by hand — simulation must never change what is stored.
   if (execute) await db.setEpochStatus(e.id, 'draining', 'sweep started');
   log(`sweeping ${signers.length} wallets to ${parent.address} IN KIND (no swaps) — ${execute ? 'LIVE' : 'DRY-RUN'}`);
+  if (config.sweepMinWl1x > 0) log(`  leaving bags worth under ${config.sweepMinWl1x} WL1X behind (QVT_SWEEP_MIN_WL1X)`);
+  let dustBags = 0, dustWl1x = 0;
   for (const s of signers) {
     const snap = await walletsMod.snapshot({ provider, address: s.address, config, tokenMeta });
-    const moved = await funding.sweepWallet({ provider, signer: s, parent, snapshot: snap, config, execute, record, log, nonces });
+    const moved = await funding.sweepWallet({ provider, signer: s, parent, snapshot: snap, config, execute, record, log, nonces, valueBag });
+    for (const d of moved.abandoned || []) { dustBags++; dustWl1x += d.worth; }
     if (execute) await db.markWallet(e.id, s.idx, 'swept', moved);
   }
-  log('sweep complete');
+  log(`sweep complete — ${dustBags} dust bags left behind (~${dustWl1x.toFixed(4)} WL1X)`);
   return e;
 }
 
@@ -143,6 +147,27 @@ async function cmdSweep(config) {
 // It sells largest-first so an interrupted run still recovers most of the value,
 // and it does NOT touch the epoch status — unlike `sweep`, nothing is being
 // retired here; the wallets keep trading afterwards.
+// Price every pool token in WL1X once, so the sweep can distinguish a bag worth
+// moving from one worth abandoning. A pool that will not load yields no price,
+// and a bag it cannot value is swept rather than dropped — the conservative way
+// round, since abandoning a balance is irreversible and moving one is merely
+// a wasted transfer.
+async function bagValuer({ provider, config, tokenMeta }) {
+  const px = new Map();
+  for (const pc of config.pools) {
+    try {
+      const m = await poolsMod.loadMarket({ provider, poolCfg: pc, config, tokenMeta });
+      px.set(pc.token.toLowerCase(), poolsMod.price(m));
+    } catch (e) {
+      log(`WARN ${pc.label} price unavailable — its bags will be swept, not abandoned`);
+    }
+  }
+  return (addr, human) => {
+    const p = px.get(String(addr).toLowerCase());
+    return p > 0 ? human / p : Infinity;
+  };
+}
+
 async function cmdConsolidate(config) {
   await db.init();
   const { provider, execute } = await withChain(config);
@@ -240,14 +265,34 @@ async function cmdRotate(config) {
   }
 
   const parent = walletsMod.parentSigner(config, provider);
-  const res = await epochMod.createEpoch({ config, chainId, parentAddress: parent.address, force: true, log });
-  const signers = await epochMod.loadSigners({ config, epochId: res.epochId, provider });
+
+  // Creating the epoch must be gated on --execute like everything else. Left
+  // ungated a dry run writes a real epoch row and ten real private keys, and —
+  // because the dry run correctly does NOT retire the outgoing epoch — the new
+  // row collides with the single-active-epoch constraint and the command dies
+  // half way through. Simulation must not write.
+  let epochId = null, signers;
+  if (execute) {
+    const res = await epochMod.createEpoch({ config, chainId, parentAddress: parent.address, force: true, log });
+    epochId = res.epochId;
+    signers = await epochMod.loadSigners({ config, epochId, provider });
+  } else {
+    log(`[DRY] would generate a fresh roster of ${config.walletCount} wallets — no epoch and no keys created`);
+    // Placeholders purely so the distribution below can report what it would
+    // send and to how many wallets. They are never signed with.
+    signers = Array.from({ length: config.walletCount },
+      (_, i) => ({ idx: i, address: '0x' + String(i).padStart(40, '0') }));
+  }
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
 
-  log(`distributing parent holdings across the new roster IN KIND — ${execute ? 'LIVE' : 'DRY-RUN'}`);
-  await funding.distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record: mkRecord(res.epochId, execute), log, nonces });
-  if (execute) for (const s of signers) await db.markWallet(res.epochId, s.idx, 'funded');
-  log(`rotation complete — epoch ${res.epochId} is now active`);
+  log(`seeding the new roster — ${execute ? 'LIVE' : 'DRY-RUN'}`);
+  await funding.distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record: mkRecord(epochId, execute), log, nonces });
+  if (execute) {
+    for (const s of signers) await db.markWallet(epochId, s.idx, 'funded');
+    log(`rotation complete — epoch ${epochId} is now active`);
+  } else {
+    log('rotation DRY-RUN complete — nothing was sent and nothing was stored');
+  }
 }
 
 async function cmdExport() {
