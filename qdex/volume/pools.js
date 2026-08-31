@@ -239,7 +239,7 @@ async function ensureAllowance({ tokenAddress, signer, spender, amountWei, log =
   const timeout = (config && config.txTimeoutMs) || 120000;
   try {
     const tx = await withTimeout(erc.approve(spender, ethers.MaxUint256, { nonce }), timeout, 'approve.send');
-    return await waitFor(tx, timeout, 'approve.wait');
+    return await waitFor(tx, timeout, 'approve.wait', log);
   } catch (e) {
     if (nonces) nonces.reset(signer);
     throw e;
@@ -324,7 +324,7 @@ async function executeSwap({ market, signer, side, quote: q, config, log = () =>
     { attempts: 2, label: 'swap.send', log });
   if (onSent) await onSent({ hash: tx.hash, nonce });
   try {
-    return await waitFor(tx, config.txTimeoutMs, 'swap.wait');
+    return await waitFor(tx, config.txTimeoutMs, 'swap.wait', log);
   } catch (e) {
     if (nonces) nonces.reset(signer);
     // Always surface the nonce: after a timeout it is the only thing that can

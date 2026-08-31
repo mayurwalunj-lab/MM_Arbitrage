@@ -368,6 +368,35 @@ test('a failed native drain does not abort the sweep', async () => {
   assert.ok(!swept.includes('L1X'), 'the failed leg must not be recorded as moved');
 });
 
+const noncesMod = require('./nonces');
+
+test('a replaced transaction that SUCCEEDED is treated as landed', async () => {
+  // This RPC rewrites transactions between submission and inclusion, so the
+  // mined hash differs and ethers reports TRANSACTION_REPLACED — even though the
+  // receipt shows the intended transfer succeeded. Treating that as an error
+  // aborted a live rotation after all ten transfers had already landed.
+  const err = Object.assign(new Error('transaction was replaced'),
+    { code: 'TRANSACTION_REPLACED', receipt: { status: 1, hash: '0xdead' } });
+  const tx = { wait: async () => { throw err; } };
+  const r = await noncesMod.waitFor(tx, 1000, 'test.wait');
+  assert.strictEqual(r.hash, '0xdead');
+  assert.strictEqual(r.wasReplaced, true, 'the caller must be able to tell it was replaced');
+});
+
+test('a replaced transaction that REVERTED still throws', async () => {
+  const err = Object.assign(new Error('transaction was replaced'),
+    { code: 'TRANSACTION_REPLACED', receipt: { status: 0, hash: '0xbad' } });
+  const tx = { wait: async () => { throw err; } };
+  await assert.rejects(() => noncesMod.waitFor(tx, 1000, 'test.wait'),
+    /replaced/, 'a failed replacement is a real failure');
+});
+
+test('a replacement with no receipt at all still throws', async () => {
+  const err = Object.assign(new Error('transaction was replaced'), { code: 'TRANSACTION_REPLACED' });
+  const tx = { wait: async () => { throw err; } };
+  await assert.rejects(() => noncesMod.waitFor(tx, 1000, 'test.wait'), /replaced/);
+});
+
 // ---------------------------------------------------------------- pool affinity
 const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
 

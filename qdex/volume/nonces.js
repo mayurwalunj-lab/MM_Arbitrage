@@ -84,11 +84,25 @@ function withTimeout(promise, ms, label) {
 
 // tx.wait(confirmations, timeoutMs) is bounded by ethers itself, but it throws a
 // generic error; wrap it so the caller can tell a timeout from a revert.
-async function waitFor(tx, ms, label = 'tx.wait') {
+async function waitFor(tx, ms, label = 'tx.wait', log = () => {}) {
   try {
     return await tx.wait(1, ms);
   } catch (e) {
     if (/timeout|timed out/i.test(String(e.message))) e.timedOut = true;
+    // TRANSACTION_REPLACED with a SUCCESSFUL receipt is a success, not a failure.
+    // This RPC rewrites transactions between submission and inclusion — the
+    // observed replacement carried different gas fields and therefore a
+    // different hash, so ethers concluded the original had been replaced. The
+    // receipt showed status 1 and exactly the intended transfer. Treating that
+    // as an error aborted a rotation with all ten transfers already landed.
+    //
+    // Only a successful receipt counts. A replacement that reverted, or one with
+    // no receipt at all, is still a genuine failure and still throws.
+    if (e.code === 'TRANSACTION_REPLACED' && e.receipt && Number(e.receipt.status) === 1) {
+      log(`${label}: transaction was re-broadcast as ${e.receipt.hash} and succeeded — treating as landed`);
+      e.receipt.wasReplaced = true;
+      return e.receipt;
+    }
     throw e;
   }
 }

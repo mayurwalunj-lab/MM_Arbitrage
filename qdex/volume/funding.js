@@ -33,7 +33,7 @@ async function transferToken({ signer, token, to, amountWei, log = () => {}, non
   const nonce = await NonceManager.nonceFor(nonces, signer, 'transfer.nonce');
   try {
     const tx = await withTimeout(c.transfer(to, amountWei, { gasLimit: (gas * 12n) / 10n, nonce }), timeoutMs, 'transfer.send');
-    return await waitFor(tx, timeoutMs, 'transfer.wait');
+    return await waitFor(tx, timeoutMs, 'transfer.wait', log);
   } catch (e) {
     if (nonces) nonces.reset(signer);
     throw e;
@@ -44,7 +44,7 @@ async function transferNative({ signer, to, amountWei, log = () => {}, nonces, t
   const nonce = await NonceManager.nonceFor(nonces, signer, 'native.nonce');
   try {
     const tx = await withTimeout(signer.sendTransaction({ to, value: amountWei, nonce }), timeoutMs, 'native.send');
-    return await waitFor(tx, timeoutMs, 'native.wait');
+    return await waitFor(tx, timeoutMs, 'native.wait', log);
   } catch (e) {
     if (nonces) nonces.reset(signer);
     throw e;
@@ -241,6 +241,7 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
   // new roster starts fragmented and cannot sell any of it. Leaving the tokens
   // at the parent costs nothing: they are still held, and the parent can be
   // consolidated on its own schedule.
+  const failures = [];
   const wl1xOnly = (config.distributeMode || 'wl1x') !== 'inkind';
   const assets = [{ address: config.wl1x, symbol: 'WL1X', decimals: 18 },
     ...(wl1xOnly ? [] : config.pools.map((p) => {
@@ -260,22 +261,43 @@ async function distributeInKind({ provider, parent, signers, config, tokenMeta, 
     const human = Number(ethers.formatUnits(share, a.decimals));
     log(`distribute ${human} ${a.symbol} to each of ${n} wallets`);
     for (const s of signers) {
-      let hash = null;
-      if (execute) hash = (await transferToken({ signer: parent, token: a.address, to: s.address, amountWei: share, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
-      await record({ kind: 'fund', from: parent.address, to: s.address, token: a.address, tokenSymbol: a.symbol, amount: human, txHash: hash, reason: 'in-kind distribution' });
+      // Per wallet, not per run. A rotation that throws on wallet 9 leaves the
+      // epoch live with an unfunded roster and no record of how far it got —
+      // seen in production, where every transfer had in fact landed and only the
+      // receipt lookup failed. Record the failure and keep going; the operator
+      // finishes with `fund`, which tops up whatever is short.
+      try {
+        let hash = null;
+        if (execute) hash = (await transferToken({ signer: parent, token: a.address, to: s.address, amountWei: share, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
+        await record({ kind: 'fund', from: parent.address, to: s.address, token: a.address, tokenSymbol: a.symbol, amount: human, txHash: hash, reason: 'in-kind distribution' });
+      } catch (e) {
+        failures.push({ idx: s.idx, symbol: a.symbol });
+        log(`distribute w${String(s.idx).padStart(2, '0')} ${a.symbol} FAILED: ${String(e.shortMessage || e.message).slice(0, 90)}`);
+      }
     }
   }
 
-  // native gas for the new roster
+  // native gas for the new roster — the leg that matters most, because a wallet
+  // holding WL1X but no gas cannot move it or trade at all.
   for (const s of signers) {
     const have = await provider.getBalance(s.address);
     const need = wei(config.fundGasNative, 18) - have;
     if (need <= 0n) continue;
-    let hash = null;
-    if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: need, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
-    await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
-      amount: Number(ethers.formatEther(need)), txHash: hash, reason: 'gas' });
+    try {
+      let hash = null;
+      if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: need, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
+      await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
+        amount: Number(ethers.formatEther(need)), txHash: hash, reason: 'gas' });
+    } catch (e) {
+      failures.push({ idx: s.idx, symbol: 'L1X' });
+      log(`distribute w${String(s.idx).padStart(2, '0')} gas FAILED: ${String(e.shortMessage || e.message).slice(0, 90)}`);
+    }
   }
+  if (failures.length) {
+    log(`WARNING: ${failures.length} distribution legs failed — run \`fund --execute\` to finish: ` +
+      failures.map((f) => `w${String(f.idx).padStart(2, '0')}/${f.symbol}`).join(' '));
+  }
+  return { failures };
 }
 
 module.exports = { NonceManager, transferToken, transferNative, nativeSweepReserve, ensureSweepGas, fundWallets, rebalanceWallet, chooseDonor, sweepWallet, distributeInKind };
