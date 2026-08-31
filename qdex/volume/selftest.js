@@ -370,30 +370,46 @@ test('a failed native drain does not abort the sweep', async () => {
 
 const noncesMod = require('./nonces');
 
-test('a replaced transaction that SUCCEEDED is treated as landed', async () => {
+const replacedErr = (receipt, replacement) => Object.assign(new Error('transaction was replaced'),
+  { code: 'TRANSACTION_REPLACED', receipt, replacement });
+
+test('an IDENTICAL re-broadcast is treated as landed', async () => {
   // This RPC rewrites transactions between submission and inclusion, so the
   // mined hash differs and ethers reports TRANSACTION_REPLACED — even though the
   // receipt shows the intended transfer succeeded. Treating that as an error
   // aborted a live rotation after all ten transfers had already landed.
-  const err = Object.assign(new Error('transaction was replaced'),
-    { code: 'TRANSACTION_REPLACED', receipt: { status: 1, hash: '0xdead' } });
-  const tx = { wait: async () => { throw err; } };
+  const tx = { to: '0xAAA', value: 5n, data: '0x', wait: async () => { throw err; } };
+  const err = replacedErr({ status: 1, hash: '0xdead' }, { to: '0xaaa', value: 5n, data: '0x' });
   const r = await noncesMod.waitFor(tx, 1000, 'test.wait');
   assert.strictEqual(r.hash, '0xdead');
   assert.strictEqual(r.wasReplaced, true, 'the caller must be able to tell it was replaced');
 });
 
+test('a DIFFERENT transaction taking the nonce is NOT a success', async () => {
+  // The live false positive: wallet 4's funding reported as landed against a
+  // hash that had paid wallet 3. Wallet 4 got nothing and the run said success.
+  const tx = { to: '0xW04', value: 5n, data: '0x', wait: async () => { throw err; } };
+  const err = replacedErr({ status: 1, hash: '0xpaidW03' }, { to: '0xW03', value: 5n, data: '0x' });
+  await assert.rejects(() => noncesMod.waitFor(tx, 1000, 'test.wait'), /replaced/,
+    'a successful receipt for someone else must not be reported as our success');
+});
+
+test('a re-broadcast for a different AMOUNT is not a success either', async () => {
+  const tx = { to: '0xAAA', value: 5n, data: '0x', wait: async () => { throw err; } };
+  const err = replacedErr({ status: 1, hash: '0xh' }, { to: '0xAAA', value: 999n, data: '0x' });
+  await assert.rejects(() => noncesMod.waitFor(tx, 1000, 'test.wait'), /replaced/);
+});
+
 test('a replaced transaction that REVERTED still throws', async () => {
-  const err = Object.assign(new Error('transaction was replaced'),
-    { code: 'TRANSACTION_REPLACED', receipt: { status: 0, hash: '0xbad' } });
-  const tx = { wait: async () => { throw err; } };
+  const err = replacedErr({ status: 0, hash: '0xbad' }, { to: '0xAAA', value: 0n, data: '0x' });
+  const tx = { to: '0xAAA', value: 0n, data: '0x', wait: async () => { throw err; } };
   await assert.rejects(() => noncesMod.waitFor(tx, 1000, 'test.wait'),
     /replaced/, 'a failed replacement is a real failure');
 });
 
 test('a replacement with no receipt at all still throws', async () => {
-  const err = Object.assign(new Error('transaction was replaced'), { code: 'TRANSACTION_REPLACED' });
-  const tx = { wait: async () => { throw err; } };
+  const err = replacedErr(undefined, { to: '0xAAA', value: 0n, data: '0x' });
+  const tx = { to: '0xAAA', value: 0n, data: '0x', wait: async () => { throw err; } };
   await assert.rejects(() => noncesMod.waitFor(tx, 1000, 'test.wait'), /replaced/);
 });
 

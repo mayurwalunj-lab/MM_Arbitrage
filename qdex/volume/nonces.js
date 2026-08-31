@@ -99,10 +99,24 @@ async function waitFor(tx, ms, label = 'tx.wait', log = () => {}) {
     //
     // Only a successful receipt counts. A replacement that reverted, or one with
     // no receipt at all, is still a genuine failure and still throws.
+    // A replacement counts ONLY if it is the same transaction re-broadcast: same
+    // recipient, same value, same calldata. A successful receipt alone proves
+    // nothing — the nonce may have been taken by an entirely different transfer.
+    // Seen live: wallet 4's funding was reported as "re-broadcast and succeeded"
+    // against a hash that had paid wallet 3, and wallet 4 was left with no gas
+    // while the run recorded a success. Only sameness makes it safe.
     if (e.code === 'TRANSACTION_REPLACED' && e.receipt && Number(e.receipt.status) === 1) {
-      log(`${label}: transaction was re-broadcast as ${e.receipt.hash} and succeeded — treating as landed`);
-      e.receipt.wasReplaced = true;
-      return e.receipt;
+      const r = e.replacement;
+      const same = r
+        && String(r.to || '').toLowerCase() === String(tx.to || '').toLowerCase()
+        && BigInt(r.value ?? 0) === BigInt(tx.value ?? 0)
+        && String(r.data || '0x').toLowerCase() === String(tx.data || '0x').toLowerCase();
+      if (same) {
+        log(`${label}: re-broadcast as ${e.receipt.hash} with identical terms — treating as landed`);
+        e.receipt.wasReplaced = true;
+        return e.receipt;
+      }
+      log(`${label}: nonce was taken by a DIFFERENT transaction (${e.receipt.hash}) — this one did NOT land`);
     }
     // A transient RPC failure DURING the wait says nothing about the
     // transaction. The node fell over answering eth_getBlockByNumber for a block
