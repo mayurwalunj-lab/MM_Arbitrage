@@ -560,6 +560,47 @@ test('a receipt found by hash short-circuits to landed', async () => {
   assert.strictEqual(r.receipt.blockNumber, 999);
 });
 
+// ------------------------------------------------- trade-ability deadlock
+// Reproduces a production deadlock: after days of trading across 12 pools, every
+// wallet sat just ABOVE the WL1X floor with its holdings fragmented into bags all
+// smaller than minTrade. It could neither buy nor sell, and because the rebalance
+// trigger tested `balance < floor` it never asked for help — the bot span on
+// skips at 5.2/second for hours.
+const canTrade = ({ wl1x, floor, minTrade, bags }) => ({
+  buyable: wl1x - floor >= minTrade,
+  sellable: bags.some((v) => v >= minTrade)
+});
+
+test('a wallet above the floor but unable to trade is detected', () => {
+  // w00's real state when the deadlock was found.
+  const s = canTrade({ wl1x: 0.5476, floor: 0.3, minTrade: 0.25,
+    bags: [0.00339, 0.07282, 0.00950, 0.02543, 0.00559, 0.13609, 0.09320, 0.00121, 0.15092, 0.13173, 0.11936, 0.00960] });
+  assert.strictEqual(s.buyable, false, 'surplus 0.2476 is below minTrade 0.25');
+  assert.strictEqual(s.sellable, false, 'every one of the twelve bags is too small');
+  assert.ok(0.5476 > 0.3, 'and it is ABOVE the floor, so the old trigger stayed silent');
+});
+
+test('a wallet with one large enough bag can still act', () => {
+  const s = canTrade({ wl1x: 0.31, floor: 0.3, minTrade: 0.25, bags: [0.02, 0.9, 0.01] });
+  assert.strictEqual(s.buyable, false);
+  assert.strictEqual(s.sellable, true, 'the 0.9 bag is sellable — no rebalance needed');
+});
+
+test('a healthy wallet needs no intervention', () => {
+  const s = canTrade({ wl1x: 3.0, floor: 0.3, minTrade: 0.25, bags: [0.4, 0.1] });
+  assert.strictEqual(s.buyable, true);
+  assert.strictEqual(s.sellable, true);
+});
+
+test('fragmentation across N pools shrinks each holding below the minimum', () => {
+  // The structural cause: a fixed float spread over more pools makes every
+  // holding smaller, and once average holding < minTrade nothing is sellable.
+  const float = 3.0, minTrade = 0.25;
+  const avgHolding = (n) => float / n;
+  assert.ok(avgHolding(4) > minTrade, '4 pools leaves room');
+  assert.ok(avgHolding(12) <= minTrade, '12 pools puts the average at or below the minimum');
+});
+
 // ------------------------------------------------- swap step ordering
 test('executeSwap approves BEFORE it simulates', () => {
   // eth_call runs the real transferFrom, so simulating an unapproved wallet

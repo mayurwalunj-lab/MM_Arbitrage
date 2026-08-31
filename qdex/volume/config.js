@@ -150,6 +150,10 @@ function getConfig() {
     maxRuntimeMin: envNum('QVT_MAX_RUNTIME_MIN', 0),
     maxConsecutiveFailures: envNum('QVT_MAX_CONSECUTIVE_FAILURES', 5),
     maxConsecutiveRpcErrors: envNum('QVT_MAX_CONSECUTIVE_RPC_ERRORS', 25),
+    // A skip consumes no rate budget, so a fleet that cannot trade spins as fast
+    // as the RPC allows — measured at 5.2 skips/second, ~450k database rows a
+    // day. Back off while skipping and stop after this many in a row. 0 disables.
+    maxConsecutiveSkips: envNum('QVT_MAX_CONSECUTIVE_SKIPS', 200),
     lockFile: process.env.QVT_LOCK_FILE || require('path').join(__dirname, '.LOCK'),
     stopFile: process.env.QVT_STOP_FILE || require('path').join(__dirname, '.STOP'),
 

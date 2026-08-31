@@ -238,6 +238,31 @@ async function run() {
   }
   const lastTraded = new Map();   // wallet address -> ms
   let cursor = 0;                 // round-robin base, jittered per pick
+  // A skip costs no rate budget and only a short sleep, so a fleet that cannot
+  // trade at all spins as fast as the RPC allows. Observed in production: a
+  // fragmentation deadlock produced 5.2 skips/second and ~260,000 rows before
+  // anyone noticed. Count consecutive skips, back off, and eventually stop —
+  // a bot that cannot trade should say so, not hammer the database.
+  let consecutiveSkips = 0;
+  // Back off geometrically while nothing can trade, and give up rather than
+  // spin forever. Returns true when the caller should break out of the loop.
+  const onSkip = async () => {
+    consecutiveSkips++;
+    if (config.maxConsecutiveSkips > 0 && consecutiveSkips >= config.maxConsecutiveSkips) {
+      stop.trip(`${consecutiveSkips} consecutive skips — no wallet can trade. ` +
+        'Likely inventory fragmentation: check `npm run qdex:vol:preflight` and consider ' +
+        'lowering QVT_MIN_TRADE_WL1X, raising QVT_FUND_WL1X, or enabling fewer pools.');
+      return true;
+    }
+    // 0.5s, 1s, 2s, 4s ... capped. A healthy run never reaches the longer waits.
+    const backoff = Math.min(500 * Math.pow(2, Math.floor(consecutiveSkips / 5)), 30000);
+    if (consecutiveSkips % 25 === 0) {
+      log(`${consecutiveSkips} consecutive skips — backing off ${(backoff / 1000).toFixed(1)}s ` +
+        `(stops at ${config.maxConsecutiveSkips || 'never'})`);
+    }
+    await sleep(backoff);
+    return false;
+  };
 
   const recordTrade = async (t) => {
     try { await db.insertTrade({ ...t, epochId: epoch.id, runId, isDryRun: !execute }); }
@@ -332,7 +357,7 @@ async function run() {
         await recordTrade({ ...base, status: 'skipped', priceBefore: px, anchorPrice: anchor, deviationPct: devPct,
           reason: `native gas ${realSnap.native.toFixed(6)} below QVT_MIN_GAS_NATIVE ${config.minGasNative}` });
         log(`w${pad2(signer.idx)} SKIP  out of gas (${realSnap.native.toFixed(6)} L1X)`);
-        await sleep(1000);
+        if (await onSkip()) break;
         continue;
       }
 
@@ -356,9 +381,9 @@ async function run() {
         }
         if (!moved) {
           await recordTrade({ ...base, status: 'skipped', priceBefore: px, anchorPrice: anchor, deviationPct: devPct,
-            reason: `WL1X ${snap.wl1x.toFixed(4)} below floor ${config.walletFloorWl1x} and no donor available` });
-          log(`w${pad2(signer.idx)} SKIP  below WL1X floor, no donor`);
-          await sleep(1000);
+            reason: `cannot trade: WL1X surplus ${buyableSurplus.toFixed(4)} < minTrade ${config.minTradeWl1x}, no sellable bag, no donor` });
+          log(`w${pad2(signer.idx)} SKIP  cannot trade either way and no donor available`);
+          if (await onSkip()) break;
           continue;
         }
       }
@@ -376,7 +401,7 @@ async function run() {
         await recordTrade({ ...base, status: 'skipped', side, priceBefore: px, anchorPrice: anchor, deviationPct: devPct,
           reason: `no ${m.quote.symbol} inventory for SELL (${tokenHuman.toPrecision(4)})` });
         log(`w${pad2(signer.idx)} ${market.cfg.label} SKIP  no ${m.quote.symbol} inventory for SELL`);
-        await sleep(500);
+        if (await onSkip()) break;
         continue;
       }
 
@@ -391,7 +416,7 @@ async function run() {
         await recordTrade({ ...base, status: 'skipped', side, priceBefore: px, anchorPrice: anchor, deviationPct: devPct,
           reason: `no size fits: poolMax=${poolMax.toFixed(4)} fracMax=${fractionMax.toFixed(4)} invMax=${inventoryMax.toFixed(4)} min=${config.minTradeWl1x}` });
         log(`w${pad2(signer.idx)} ${market.cfg.label} SKIP  no feasible size (pool caps at ${poolMax.toFixed(4)} WL1X)`);
-        await sleep(500);
+        if (await onSkip()) break;
         continue;
       }
 
@@ -404,7 +429,7 @@ async function run() {
         await recordTrade({ ...base, status: 'skipped', side, priceBefore: px, anchorPrice: anchor, deviationPct: devPct,
           reason: `even ${config.minTradeWl1x} WL1X exceeds the ${capBps}bps impact cap` });
         log(`w${pad2(signer.idx)} ${market.cfg.label} SKIP  minimum size still over the ${capBps}bps cap`);
-        await sleep(500);
+        if (await onSkip()) break;
         continue;
       }
       if (fit.shrunkFrom) {
@@ -538,6 +563,7 @@ async function run() {
         }
       }
 
+      consecutiveSkips = 0;
       limiter.record();
       lastTraded.set(signer.address, Date.now());
       // Keep the weighting current — liquidity moves as LPs add and pull.
