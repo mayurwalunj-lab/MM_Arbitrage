@@ -85,6 +85,7 @@ function withTimeout(promise, ms, label) {
 // tx.wait(confirmations, timeoutMs) is bounded by ethers itself, but it throws a
 // generic error; wrap it so the caller can tell a timeout from a revert.
 async function waitFor(tx, ms, label = 'tx.wait', log = () => {}) {
+  const deadline = Date.now() + ms;
   try {
     return await tx.wait(1, ms);
   } catch (e) {
@@ -102,6 +103,22 @@ async function waitFor(tx, ms, label = 'tx.wait', log = () => {}) {
       log(`${label}: transaction was re-broadcast as ${e.receipt.hash} and succeeded — treating as landed`);
       e.receipt.wasReplaced = true;
       return e.receipt;
+    }
+    // A transient RPC failure DURING the wait says nothing about the
+    // transaction. The node fell over answering eth_getBlockByNumber for a block
+    // it had not indexed yet ("Failed to find block number"); the transfer it was
+    // asked about had already landed. Give up on the node's own waiter and poll
+    // for the receipt by hash until the deadline.
+    if (lib.isTransientRpcError(e) && tx && tx.hash && tx.provider && Date.now() < deadline) {
+      log(`${label}: node failed mid-wait, polling for ${tx.hash}`);
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const r = await tx.provider.getTransactionReceipt(tx.hash);
+          if (r) { log(`${label}: receipt found by polling (status ${r.status})`); return r; }
+        } catch { /* node still unwell — keep polling until the deadline */ }
+      }
+      e.timedOut = true;   // exhausted the budget without ever seeing a receipt
     }
     throw e;
   }

@@ -397,6 +397,40 @@ test('a replacement with no receipt at all still throws', async () => {
   await assert.rejects(() => noncesMod.waitFor(tx, 1000, 'test.wait'), /replaced/);
 });
 
+test('a transient RPC failure mid-wait polls for the receipt instead of giving up', async () => {
+  // Live failure: the node fell over on eth_getBlockByNumber for a block it had
+  // not indexed ("Failed to find block number", -32603) while waiting on a
+  // transfer that had already landed. The wait threw and stranded 7 wallets.
+  const rpcErr = Object.assign(new Error('could not coalesce error'),
+    { code: 'UNKNOWN_ERROR', error: { code: -32603, message: 'Failed to find block number' } });
+  let polls = 0;
+  const tx = {
+    hash: '0xabc',
+    wait: async () => { throw rpcErr; },
+    provider: { getTransactionReceipt: async () => (++polls >= 2 ? { status: 1, hash: '0xabc' } : null) }
+  };
+  const r = await noncesMod.waitFor(tx, 20000, 'test.wait');
+  assert.strictEqual(r.hash, '0xabc', 'the receipt must be recovered by polling');
+  assert.ok(polls >= 2, 'it must keep polling while the node returns nothing');
+});
+
+test('polling gives up at the deadline rather than looping forever', async () => {
+  const rpcErr = Object.assign(new Error('could not coalesce error'),
+    { code: 'UNKNOWN_ERROR', error: { code: -32603, message: 'Failed to find block number' } });
+  const tx = { hash: '0xabc', wait: async () => { throw rpcErr; },
+    provider: { getTransactionReceipt: async () => null } };
+  await assert.rejects(() => noncesMod.waitFor(tx, 4000, 'test.wait'), /coalesce/);
+});
+
+test('a revert is NOT retried as if the node were at fault', async () => {
+  const revert = Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' });
+  let polls = 0;
+  const tx = { hash: '0xabc', wait: async () => { throw revert; },
+    provider: { getTransactionReceipt: async () => { polls++; return null; } } };
+  await assert.rejects(() => noncesMod.waitFor(tx, 20000, 'test.wait'), /reverted/);
+  assert.strictEqual(polls, 0, 'a reverted transaction must not be polled for');
+});
+
 // ---------------------------------------------------------------- pool affinity
 const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
 

@@ -69,29 +69,42 @@ async function nativeSweepReserve(provider, config) {
 // ---- fund: parent -> each sub-wallet, WL1X + native gas ----
 async function fundWallets({ provider, parent, signers, config, execute, record, log, nonces = new NonceManager() }) {
   const results = [];
+  const failures = [];
   for (const s of signers) {
-    const bal = await provider.getBalance(s.address);
-    const wl1x = new ethers.Contract(config.wl1x, ERC20_ABI, provider);
-    const haveWl1x = await wl1x.balanceOf(s.address);
+    // Per wallet. This is the repair tool — it is what an operator reaches for
+    // when an earlier run left the roster half funded, so it above all must not
+    // abort on the first bad wallet and leave the rest short. It did exactly
+    // that on a node hiccup at wallet 3 of 10.
+    try {
+      const bal = await provider.getBalance(s.address);
+      const wl1x = new ethers.Contract(config.wl1x, ERC20_ABI, provider);
+      const haveWl1x = await wl1x.balanceOf(s.address);
 
-    const needNative = wei(config.fundGasNative, 18) - bal;
-    const needWl1x = wei(config.fundWl1xPerWallet, 18) - haveWl1x;
+      const needNative = wei(config.fundGasNative, 18) - bal;
+      const needWl1x = wei(config.fundWl1xPerWallet, 18) - haveWl1x;
 
-    if (needNative > 0n) {
-      log(`fund w${String(s.idx).padStart(2, '0')} native ${ethers.formatEther(needNative)}`);
-      let hash = null;
-      if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: needNative, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
-      await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
-        amount: Number(ethers.formatEther(needNative)), txHash: hash });
+      if (needNative > 0n) {
+        log(`fund w${String(s.idx).padStart(2, '0')} native ${ethers.formatEther(needNative)}`);
+        let hash = null;
+        if (execute) hash = (await transferNative({ signer: parent, to: s.address, amountWei: needNative, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
+        await record({ kind: 'fund', from: parent.address, to: s.address, token: null, tokenSymbol: 'L1X',
+          amount: Number(ethers.formatEther(needNative)), txHash: hash });
+      }
+      if (needWl1x > 0n) {
+        log(`fund w${String(s.idx).padStart(2, '0')} WL1X ${ethers.formatUnits(needWl1x, 18)}`);
+        let hash = null;
+        if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: s.address, amountWei: needWl1x, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
+        await record({ kind: 'fund', from: parent.address, to: s.address, token: config.wl1x, tokenSymbol: 'WL1X',
+          amount: Number(ethers.formatUnits(needWl1x, 18)), txHash: hash });
+      }
+      results.push({ idx: s.idx, address: s.address });
+    } catch (e) {
+      failures.push(s.idx);
+      log(`fund w${String(s.idx).padStart(2, '0')} FAILED: ${String(e.shortMessage || e.message).slice(0, 90)}`);
     }
-    if (needWl1x > 0n) {
-      log(`fund w${String(s.idx).padStart(2, '0')} WL1X ${ethers.formatUnits(needWl1x, 18)}`);
-      let hash = null;
-      if (execute) hash = (await transferToken({ signer: parent, token: config.wl1x, to: s.address, amountWei: needWl1x, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
-      await record({ kind: 'fund', from: parent.address, to: s.address, token: config.wl1x, tokenSymbol: 'WL1X',
-        amount: Number(ethers.formatUnits(needWl1x, 18)), txHash: hash });
-    }
-    results.push({ idx: s.idx, address: s.address });
+  }
+  if (failures.length) {
+    log(`WARNING: ${failures.length} wallet(s) not fully funded (${failures.map((i) => 'w' + String(i).padStart(2, '0')).join(' ')}) — re-run to finish; it tops up only what is short`);
   }
   return results;
 }
