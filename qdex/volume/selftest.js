@@ -266,6 +266,41 @@ test('zero or nonsense limits never empty the roster', () => {
   }
 });
 
+// ---------------------------------------------------------------- pool affinity
+const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
+
+test('affinity gives each wallet exactly K distinct pools', () => {
+  for (let i = 0; i < 10; i++) {
+    const mine = guards.poolsForWallet(POOLS12, i, 3);
+    assert.strictEqual(mine.length, 3, `wallet ${i}`);
+    assert.strictEqual(new Set(mine.map((m) => m.address)).size, 3, `wallet ${i} got a duplicate pool`);
+  }
+});
+
+test('affinity is stable — the same wallet always gets the same pools', () => {
+  const a = guards.poolsForWallet(POOLS12, 4, 3).map((m) => m.address);
+  const b = guards.poolsForWallet(POOLS12, 4, 3).map((m) => m.address);
+  assert.deepStrictEqual(a, b, 'affinity must not drift between calls or restarts');
+});
+
+test('10 wallets x 3 pools still covers all 12 pools', () => {
+  const covered = new Set();
+  for (let i = 0; i < 10; i++) guards.poolsForWallet(POOLS12, i, 3).forEach((m) => covered.add(m.address));
+  assert.strictEqual(covered.size, 12, 'every pool must keep getting traffic');
+});
+
+test('every pool gets at least two wallets, so one stuck wallet cannot orphan it', () => {
+  const count = new Map(POOLS12.map((m) => [m.address, 0]));
+  for (let i = 0; i < 10; i++) guards.poolsForWallet(POOLS12, i, 3).forEach((m) => count.set(m.address, count.get(m.address) + 1));
+  for (const [addr, n] of count) assert.ok(n >= 2, `pool ${addr} has only ${n} wallet(s)`);
+});
+
+test('affinity off (0) or wider than the pool list leaves every pool available', () => {
+  for (const k of [0, -1, 12, 50, NaN, null, undefined]) {
+    assert.strictEqual(guards.poolsForWallet(POOLS12, 3, k).length, 12, `k=${k} must not restrict`);
+  }
+});
+
 // ---------------------------------------------------------------- side choice
 const sideCfg = { maxDeviationPct: 0.75, inventoryTargetPct: 50, biasStrength: 0.7 };
 

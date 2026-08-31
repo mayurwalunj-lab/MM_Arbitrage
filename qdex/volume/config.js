@@ -143,6 +143,15 @@ function getConfig() {
     // silently doing nothing, and says so loudly.
     focusPools: envList('QVT_FOCUS_POOLS').map((s) => s.toLowerCase()),
     activeWallets: envNum('QVT_ACTIVE_WALLETS', 0),   // 0 = use the whole roster
+    // POOL AFFINITY. Give each wallet a fixed subset of the pools instead of
+    // letting every wallet trade every pool. Inventory then concentrates rather
+    // than spreading thin: with a 3 WL1X float and a 50% inventory target, only
+    // ~1.5 WL1X sits in tokens, so across 12 pools each holding averages 0.125 —
+    // below minTrade, so nothing is ever sellable and the fleet deadlocks. Across
+    // 3 pools the same wallet holds ~0.5 per position, comfortably tradeable, and
+    // 10 wallets x 3 pools still covers all 12 with ~2.5 wallets each.
+    // 0 = every wallet trades every pool (the behaviour that fragmented).
+    poolsPerWallet: envNum('QVT_POOLS_PER_WALLET', 0),
 
     // ---- session budget + emergency stop ----
     maxSessionTx: envNum('QVT_MAX_SESSION_TX', 0),           // 0 = unlimited

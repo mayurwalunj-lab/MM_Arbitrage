@@ -335,7 +335,12 @@ async function run() {
       // weighting by depth wastes turns on the smallest bags.
       const sellable = holdings.filter((h) => h.valueWl1x >= config.minTradeWl1x)
         .sort((a, b) => b.valueWl1x - a.valueWl1x);
-      const candidates = wantSell && sellable.length ? [sellable[0].market] : markets;
+      // Restrict where this wallet may trade NEXT to its assigned pools, so its
+      // positions concentrate instead of spreading across every pool. Selling is
+      // exempt: a holding must be sellable wherever it happens to be, including
+      // in a pool no longer assigned to this wallet.
+      const myPools = guards.poolsForWallet(markets, signer.idx, config.poolsPerWallet);
+      const candidates = wantSell && sellable.length ? [sellable[0].market] : myPools;
       // Weighting choice matters more than it looks: TVL here spans ~40x, so
       // straight TVL weighting starves the small pools of traffic entirely.
       // 'sqrt' keeps the ordering but compresses the ratio; 'uniform' ignores

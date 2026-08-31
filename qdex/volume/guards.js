@@ -188,6 +188,32 @@ function applyWalletLimit(signers, n) {
   return { signers: signers.slice(0, n), limited: true };
 }
 
+// Deterministic pool subset for a wallet. Stable across restarts — the point is
+// that a wallet keeps returning to the SAME few pools so its positions build up
+// rather than scattering, so the assignment must not be random per run.
+//
+// Holdings are still read across every pool (a wallet may hold tokens from a
+// pool it is no longer assigned, and consolidation must be able to free those);
+// only the choice of where to trade next is restricted.
+function poolsForWallet(markets, walletIdx, perWallet) {
+  const n = markets.length;
+  if (!perWallet || perWallet <= 0 || perWallet >= n) return markets;
+  // Stagger the windows. Stepping by perWallet itself looks natural but when it
+  // shares a factor with the pool count the wallets collapse into a few identical
+  // blocks — 10 wallets, 12 pools, 3 each gives only 4 distinct groups, so pools
+  // 0-2 are always the SAME three wallets and one stuck wallet takes the block
+  // down with it. A stride co-prime with n makes every wallet's window start
+  // somewhere different, so each pool draws on a different mix.
+  const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+  let stride = perWallet;
+  while (stride < n && gcd(stride, n) !== 1) stride++;
+  if (gcd(stride, n) !== 1) stride = 1;
+  const out = [];
+  for (let j = 0; j < perWallet; j++) out.push(markets[(walletIdx * stride + j) % n]);
+  // Distinct only — a small roster over many pools can wrap onto itself.
+  return [...new Set(out)];
+}
+
 // Weighted pick without replacement bias — used for pool selection so a $2M pool
 // gets proportionally more traffic than a $26K one.
 function weightedPick(items, weightOf, rng = Math.random) {
@@ -207,4 +233,4 @@ function logUniform(lo, hi, rng = Math.random) {
   return Math.exp(randBetween(Math.log(lo), Math.log(hi), rng));
 }
 
-module.exports = { RateLimiter, StopController, AnchorBook, chooseSide, weightedPick, randBetween, logUniform, acquireLock, releaseLock, applyPoolFocus, applyWalletLimit };
+module.exports = { RateLimiter, StopController, AnchorBook, chooseSide, weightedPick, randBetween, logUniform, acquireLock, releaseLock, applyPoolFocus, applyWalletLimit, poolsForWallet };
