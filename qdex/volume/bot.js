@@ -264,9 +264,37 @@ async function run() {
     return false;
   };
 
+  // Skip rows collapse; executed/failed rows never do — those are the audit
+  // trail and every one must survive. A skip's reason carries live numbers
+  // ("invMax=0.247"), which would shatter one recurring condition into thousands
+  // of near-identical rows, so the key normalises digits away.
+  const skipSeen = new Map();
+  const skipKey = (t) =>
+    `${t.walletIdx}|${t.poolLabel}|${String(t.reason || '').replace(/[\d.]+/g, '#').slice(0, 120)}`;
+
   const recordTrade = async (t) => {
-    try { await db.insertTrade({ ...t, epochId: epoch.id, runId, isDryRun: !execute }); }
-    catch (e) { log(`WARN trade not recorded: ${String(e.message).slice(0, 100)}`); }
+    try {
+      if (t.status === 'skipped' && config.skipLogWindowMs > 0) {
+        const now = Date.now();
+        const key = skipKey(t);
+        const prev = skipSeen.get(key);
+        // `at` deliberately stays at the window's START, not the last hit, so a
+        // condition that persists still writes a fresh row each window rather
+        // than updating one row forever and losing when it was still happening.
+        if (prev && now - prev.at < config.skipLogWindowMs) {
+          prev.n++;
+          await db.updateTrade(prev.id, { reason: `${t.reason} (x${prev.n})` });
+          return;
+        }
+        const id = await db.insertTrade({ ...t, epochId: epoch.id, runId, isDryRun: !execute });
+        skipSeen.set(key, { id, n: 1, at: now });
+        if (skipSeen.size > 500) {
+          for (const [k, v] of skipSeen) if (now - v.at > config.skipLogWindowMs) skipSeen.delete(k);
+        }
+        return;
+      }
+      await db.insertTrade({ ...t, epochId: epoch.id, runId, isDryRun: !execute });
+    } catch (e) { log(`WARN trade not recorded: ${String(e.message).slice(0, 100)}`); }
   };
   const recordTransfer = async (x) => {
     try { await db.insertTransfer({ ...x, epochId: epoch.id, runId, isDryRun: !execute }); }

@@ -23,3 +23,7 @@ Market_making _Dashboard/node_modules/
 
 # Archived legacy projects
 archive/legacy-projects/
+
+# Pruned skip-row archives (scripts/qdex_volume_prune_skips.js) — large dumps,
+# kept on the machine that ran the prune, never in the repo.
+qdex/volume/archive/

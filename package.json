@@ -64,6 +64,7 @@
     "qdex:vol:fund": "node qdex/volume/cli.js fund",
     "qdex:vol:sweep": "node qdex/volume/cli.js sweep",
     "qdex:vol:consolidate": "node qdex/volume/cli.js consolidate",
+    "qdex:vol:prune-skips": "node scripts/qdex_volume_prune_skips.js",
     "qdex:vol:export": "node qdex/volume/cli.js export",
     "qdex:vol:reconcile": "node qdex/volume/cli.js reconcile",
     "qdex:vol:dashboard": "node dashboard/volume_server.js",

@@ -170,6 +170,12 @@ function getConfig() {
     // 4% to free a holding beats leaving it permanently unusable.
     consolidateMinWl1x: envNum('QVT_CONSOLIDATE_MIN_WL1X', 0.03),
     consolidateMaxCostBps: envNum('QVT_CONSOLIDATE_MAX_COST_BPS', 800),
+    // SKIP-ROW THROTTLE. Every trade ATTEMPT is recorded, skips included, and a
+    // fragmented fleet attempts several times a second — 260,137 rows in four
+    // days, 106 MB of a 107 MB table, burying the 4,656 real trades. Repeats of
+    // the same skip from the same wallet and pool collapse into one row carrying
+    // a count for this long. 0 disables the throttle (a row per attempt).
+    skipLogWindowMs: envNum('QVT_SKIP_LOG_WINDOW_MS', 300000),
     lockFile: process.env.QVT_LOCK_FILE || require('path').join(__dirname, '.LOCK'),
     stopFile: process.env.QVT_STOP_FILE || require('path').join(__dirname, '.STOP'),
 
