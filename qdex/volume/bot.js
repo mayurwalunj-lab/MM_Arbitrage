@@ -329,8 +329,13 @@ async function run() {
       const wantSell = guards.chooseSide({
         wl1xValue: snap.wl1x, tokenValue: tokenValueTotal, deviationPct: 0, config
       }).side === 'sell';
-      const sellable = holdings.filter((h) => h.valueWl1x >= config.minTradeWl1x);
-      const candidates = wantSell && sellable.length ? sellable.map((h) => h.market) : markets;
+      // Selling is constrained by what the wallet HOLDS, so pick the largest
+      // holding rather than weighting by pool depth. Depth decides where trading
+      // is cheap; only inventory decides where a sell is possible at all, and
+      // weighting by depth wastes turns on the smallest bags.
+      const sellable = holdings.filter((h) => h.valueWl1x >= config.minTradeWl1x)
+        .sort((a, b) => b.valueWl1x - a.valueWl1x);
+      const candidates = wantSell && sellable.length ? [sellable[0].market] : markets;
       // Weighting choice matters more than it looks: TVL here spans ~40x, so
       // straight TVL weighting starves the small pools of traffic entirely.
       // 'sqrt' keeps the ordering but compresses the ratio; 'uniform' ignores
@@ -361,8 +366,63 @@ async function run() {
         continue;
       }
 
-      // ---- WL1X floor: peer transfer, else parent backstop ----
-      if (snap.wl1x < config.walletFloorWl1x) {
+      // ---- can this wallet act at all? ----
+      // Testing `balance < floor` is the wrong question. A wallet can sit above
+      // the floor and still be unable to trade: its WL1X surplus below minTrade
+      // AND every token bag too small to sell. Seen in production with 12 pools —
+      // 0.5476 WL1X (surplus 0.2476 against 0.25 needed) and twelve bags none
+      // over 0.15. Nothing fired and the bot span on skips for hours.
+      const buyableSurplus = snap.wl1x - config.walletFloorWl1x;
+      const canSellSomething = sellable.length > 0;
+      const stuck = buyableSurplus < config.minTradeWl1x && !canSellSomething;
+
+      // CONSOLIDATE FIRST. A stuck wallet is fragmented, not empty — it still
+      // holds value, just in pieces below the trading minimum. Selling the
+      // largest piece recovers WL1X and lets the normal cycle resume, which
+      // beats moving funds between wallets that are all equally fragmented.
+      const biggest = holdings.slice().sort((a, b) => b.valueWl1x - a.valueWl1x)[0];
+      if (stuck && biggest && biggest.valueWl1x >= config.consolidateMinWl1x) {
+        const cm = await poolsMod.loadMarket({ provider, poolCfg: biggest.market.cfg, config, tokenMeta });
+        const cq = poolsMod.quote({ market: cm, side: 'sell', sizeWl1x: biggest.valueWl1x, slippageBps: config.slippageBps });
+        if (cq) {
+          log(`w${pad2(signer.idx)} CONSOLIDATE ${cm.cfg.label} ${biggest.valueWl1x.toFixed(4)} WL1X-worth ` +
+            `(fragmented: no bag reaches minTrade ${config.minTradeWl1x})`);
+          // Uses the consolidation ceiling, not the normal cost cap: freeing a
+          // stranded holding is worth paying more for than an ordinary trade.
+          const savedCap = config.maxCostBps;
+          config.maxCostBps = config.consolidateMaxCostBps;
+          try {
+            if (!execute) {
+              sim.applyTrade(signer.address, cm.quote.address, 'sell', cq.amountInHuman, cq.amountOutHuman);
+              await recordTrade({ ...base, poolAddress: cm.address, poolLabel: cm.cfg.label,
+                status: 'executed', side: 'sell', amountIn: cq.amountInHuman, amountInSymbol: cq.tokenIn.symbol,
+                amountOut: cq.amountOutHuman, amountOutSymbol: cq.tokenOut.symbol,
+                notionalWl1x: cq.notionalWl1x, execPrice: cq.execPrice, priceBefore: poolsMod.price(cm),
+                reason: 'consolidation (dry-run)' });
+            } else {
+              const rc = await poolsMod.executeSwap({ market: cm, signer: signer.wallet, side: 'sell', quote: cq, config, log, nonces });
+              await recordTrade({ ...base, poolAddress: cm.address, poolLabel: cm.cfg.label,
+                status: 'executed', side: 'sell', amountIn: cq.amountInHuman, amountInSymbol: cq.tokenIn.symbol,
+                amountOut: cq.amountOutHuman, amountOutSymbol: cq.tokenOut.symbol,
+                notionalWl1x: cq.notionalWl1x, execPrice: cq.execPrice, priceBefore: poolsMod.price(cm),
+                costBps: cq.effectiveCostBps ?? null, txHash: rc?.hash ?? null,
+                blockNumber: rc?.blockNumber != null ? Number(rc.blockNumber) : null,
+                reason: 'consolidation: recovered a fragmented holding' });
+            }
+            consecutiveSkips = 0;
+            limiter.record();
+            lastTraded.set(signer.address, Date.now());
+            await sleep(Math.round(guards.randBetween(config.minDelayMs, config.maxDelayMs)));
+            continue;
+          } catch (ce) {
+            log(`w${pad2(signer.idx)} consolidation failed: ${String(ce.shortMessage || ce.message).slice(0, 90)}`);
+          } finally {
+            config.maxCostBps = savedCap;
+          }
+        }
+      }
+
+      if (stuck) {
         const others = [];
         for (const s of signers) {
           if (s.address === signer.address) continue;

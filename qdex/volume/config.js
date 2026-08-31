@@ -154,6 +154,13 @@ function getConfig() {
     // as the RPC allows — measured at 5.2 skips/second, ~450k database rows a
     // day. Back off while skipping and stop after this many in a row. 0 disables.
     maxConsecutiveSkips: envNum('QVT_MAX_CONSECUTIVE_SKIPS', 200),
+    // CONSOLIDATION. When a wallet cannot trade normally — no WL1X surplus and
+    // every token bag below minTrade — sell its LARGEST bag anyway to recover
+    // WL1X, rather than sitting stuck. Small trades are expensive (measured
+    // ~424bps at 0.05 WL1X), so this carries its own higher cost ceiling: paying
+    // 4% to free a holding beats leaving it permanently unusable.
+    consolidateMinWl1x: envNum('QVT_CONSOLIDATE_MIN_WL1X', 0.03),
+    consolidateMaxCostBps: envNum('QVT_CONSOLIDATE_MAX_COST_BPS', 800),
     lockFile: process.env.QVT_LOCK_FILE || require('path').join(__dirname, '.LOCK'),
     stopFile: process.env.QVT_STOP_FILE || require('path').join(__dirname, '.STOP'),
 
