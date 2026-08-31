@@ -9,6 +9,7 @@
 //   node qdex/volume/cli.js fund      [--execute] parent -> sub-wallets (WL1X + gas)
 //   node qdex/volume/cli.js sweep     [--execute] sub-wallets -> parent, IN KIND
 //   node qdex/volume/cli.js rotate    [--execute] sweep -> retire -> new epoch -> distribute
+//   node qdex/volume/cli.js consolidate [--execute] sell every token bag back to WL1X
 //   node qdex/volume/cli.js export --epoch N --idx I    decrypt one private key
 //   node qdex/volume/cli.js keygen-secret          print a fresh QVT_KEY_ENCRYPTION_KEY
 //
@@ -24,6 +25,7 @@ const db = require('./db');
 const epochMod = require('./epoch');
 const walletsMod = require('./wallets');
 const funding = require('./funding');
+const poolsMod = require('./pools');
 const cryptoMod = require('./crypto');
 const { NonceManager } = require('./nonces');
 
@@ -126,6 +128,105 @@ async function cmdSweep(config) {
   }
   log('sweep complete');
   return e;
+}
+
+// Drain every wallet's token bags back to WL1X in one pass.
+//
+// This is the repair for fragmentation. When each wallet spreads buys over every
+// pool, no single holding ever reaches minTrade, so nothing is sellable, the
+// wallet can only buy, and once its WL1X surplus is gone it skips forever. The
+// bot's in-loop consolidation only nibbles at this: it fires ONLY when a wallet
+// is already stuck and sells ONLY the largest bag, after which the wallet is
+// unstuck, resumes buying, and re-fragments. It never converges. This empties
+// every bag at once so the fleet restarts from clean WL1X.
+//
+// It sells largest-first so an interrupted run still recovers most of the value,
+// and it does NOT touch the epoch status — unlike `sweep`, nothing is being
+// retired here; the wallets keep trading afterwards.
+async function cmdConsolidate(config) {
+  await db.init();
+  const { provider, execute } = await withChain(config);
+  const e = await epochMod.current();
+  if (!e) throw new Error('no active epoch');
+  const signers = await epochMod.loadSigners({ config, epochId: e.id, provider });
+  const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
+
+  // Bags below --min are left alone: below some size the gas and fees cost more
+  // than the bag is worth, and selling it destroys value rather than recovering
+  // it. The cost ceiling is raised well above the normal trading cap for the
+  // same reason the bot raises it — freeing stranded value is worth paying for.
+  const minBag = Number(arg('--min', config.consolidateMinWl1x));
+  const maxCost = Number(arg('--max-cost-bps', config.consolidateMaxCostBps));
+  const delayMs = Number(arg('--delay-ms', 1500));
+  config.maxCostBps = maxCost;
+
+  const markets = [];
+  for (const pc of config.pools) {
+    try { markets.push(await poolsMod.loadMarket({ provider, poolCfg: pc, config, tokenMeta })); }
+    catch (err) { log(`WARN pool ${pc.label} unreadable, skipped: ${String(err.message).slice(0, 70)}`); }
+  }
+
+  log(`consolidating ${signers.length} wallets across ${markets.length} pools — ${execute ? 'LIVE' : 'DRY-RUN'}`);
+  log(`  selling every bag worth >= ${minBag} WL1X, cost ceiling ${maxCost}bps`);
+
+  let sold = 0, skipped = 0, failed = 0, recovered = 0, dustLeft = 0;
+  for (const s of signers) {
+    const snap = await walletsMod.snapshot({ provider, address: s.address, config, tokenMeta });
+    const bags = markets.map((mk) => {
+      const t = snap.tokens[mk.cfg.token.toLowerCase()];
+      const px = poolsMod.price(mk);
+      return { mk, px, tokenHuman: t ? t.human : 0, valueWl1x: t && px > 0 ? t.human / px : 0 };
+    }).filter((b) => b.valueWl1x > 0).sort((a, b) => b.valueWl1x - a.valueWl1x);
+
+    const target = bags.filter((b) => b.valueWl1x >= minBag);
+    const dust = bags.filter((b) => b.valueWl1x < minBag);
+    dustLeft += dust.reduce((a, b) => a + b.valueWl1x, 0);
+    log(`w${String(s.idx).padStart(2, '0')} ${snap.wl1x.toFixed(4)} WL1X, ${bags.length} bags — selling ${target.length}, leaving ${dust.length} as dust`);
+
+    for (const b of target) {
+      // Re-read the pool: earlier sells in this same run have moved its price.
+      const mk = await poolsMod.loadMarket({ provider, poolCfg: b.mk.cfg, config, tokenMeta });
+      const px = poolsMod.price(mk);
+      if (!(px > 0)) { skipped++; continue; }
+      // Shave a hair off so float rounding can never ask for more than the
+      // wallet holds — that reverts, and the bag stays stranded.
+      const sizeWl1x = (b.tokenHuman * 0.999) / px;
+      const q = poolsMod.quote({ market: mk, side: 'sell', sizeWl1x, slippageBps: config.slippageBps });
+      if (!q) { log(`     ${mk.cfg.label} unquotable, left in place`); skipped++; continue; }
+
+      const row = { epochId: e.id, runId, isDryRun: !execute, walletIdx: s.idx, walletAddress: s.address,
+        poolAddress: mk.address, poolLabel: mk.cfg.label, side: 'sell', priceBefore: px,
+        reason: 'consolidation sweep: draining a fragmented holding' };
+      if (!execute) {
+        log(`     [DRY] ${mk.cfg.label} sell ${b.valueWl1x.toFixed(4)} WL1X-worth`);
+        sold++; recovered += b.valueWl1x;
+        continue;
+      }
+      try {
+        const rc = await poolsMod.executeSwap({ market: mk, signer: s.wallet, side: 'sell', quote: q, config, log, nonces });
+        await db.insertTrade({ ...row, status: 'executed', amountIn: q.amountInHuman, amountInSymbol: q.tokenIn.symbol,
+          amountOut: q.amountOutHuman, amountOutSymbol: q.tokenOut.symbol, notionalWl1x: q.notionalWl1x,
+          execPrice: q.execPrice, costBps: q.effectiveCostBps ?? null, txHash: rc?.hash ?? null,
+          blockNumber: rc?.blockNumber != null ? Number(rc.blockNumber) : null });
+        log(`     ${mk.cfg.label} sold ${b.valueWl1x.toFixed(4)} WL1X-worth  ${rc?.hash ?? ''}`);
+        sold++; recovered += q.notionalWl1x || b.valueWl1x;
+      } catch (err) {
+        // A bag that cannot be sold is not fatal — the rest of the fleet still
+        // needs draining, so record it and carry on.
+        const why = String(err.shortMessage || err.message).slice(0, 120);
+        await db.insertTrade({ ...row, status: err.preflightRejected ? 'skipped' : 'failed', reason: `consolidation sweep: ${why}` })
+          .catch(() => {});
+        log(`     ${mk.cfg.label} NOT sold: ${why}`);
+        err.preflightRejected ? skipped++ : failed++;
+      }
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  log('');
+  log(`consolidation ${execute ? 'complete' : 'DRY-RUN complete — nothing was sent'}`);
+  log(`  bags sold ${sold}   skipped ${skipped}   failed ${failed}`);
+  log(`  WL1X recovered ~${recovered.toFixed(4)}   left as dust below ${minBag}: ~${dustLeft.toFixed(4)}`);
+  if (!execute) log('  re-run with --execute to actually sell.');
 }
 
 async function cmdRotate(config) {
@@ -315,6 +416,7 @@ const COMMANDS = {
   fund: cmdFund,
   sweep: cmdSweep,
   rotate: cmdRotate,
+  consolidate: cmdConsolidate,
   export: cmdExport,
   'keygen-secret': async () => {
     console.log('\n  Add this to .env as QVT_KEY_ENCRYPTION_KEY and back it up:\n');
