@@ -182,6 +182,13 @@ function getConfig() {
     // transfers to relocate ~0.5 WL1X. Bags worth less than this in WL1X are
     // left on the retired wallet instead. 0 sweeps everything (the old cost).
     sweepMinWl1x: envNum('QVT_SWEEP_MIN_WL1X', 0.03),
+    // Native left behind so the gas-drain transaction can pay for itself. Sized
+    // from getFeeData normally, but floored at this: L1X reports gasPrice = 1
+    // wei, which makes the derived reserve 63,000 wei (~6e-14 L1X). The drain
+    // then offers the whole balance and the node rejects it outright with
+    // "Not enough balance", because it prices the transaction above what the
+    // sender left room for. Stranding a hundredth of an L1X beats a failed sweep.
+    nativeSweepReserve: envNum('QVT_NATIVE_SWEEP_RESERVE', 0.01),
     // 'wl1x'   distribute WL1X only; tokens stay parked at the parent.
     // 'inkind' distribute every asset, split across the roster.
     // In-kind hands each new wallet a bag in every pool — which is precisely the

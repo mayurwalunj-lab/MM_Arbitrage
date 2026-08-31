@@ -53,10 +53,17 @@ async function transferNative({ signer, to, amountWei, log = () => {}, nonces, t
 
 // Cost of one plain native transfer, used to leave exactly enough behind when
 // draining a wallet's gas so the drain transaction itself can still be paid for.
-async function nativeSweepReserve(provider) {
+async function nativeSweepReserve(provider, config) {
   const fee = await provider.getFeeData();
   const price = fee.maxFeePerGas ?? fee.gasPrice ?? ethers.parseUnits('1', 'gwei');
-  return price * 21000n * 3n; // 3x headroom — better to strand dust than to brick the sweep
+  const derived = price * 21000n * 3n; // 3x headroom
+  // ...but only if the node reports a believable price. L1X returns 1 wei, which
+  // makes `derived` 63,000 wei — about 6e-14 L1X. The drain then offers the whole
+  // balance minus nothing, and the node refuses the transaction outright:
+  //   -32603 "Invalid transaction: Not enough balance"
+  // Observed live, aborting a rotation one wallet in. Floor it.
+  const floor = wei((config && config.nativeSweepReserve) || 0.01, 18);
+  return derived > floor ? derived : floor;
 }
 
 // ---- fund: parent -> each sub-wallet, WL1X + native gas ----
@@ -196,15 +203,23 @@ async function sweepWallet({ provider, signer, parent, snapshot, config, execute
   }
 
   // 3. native gas LAST, minus the cost of this very transaction
-  const reserve = await nativeSweepReserve(provider);
+  const reserve = await nativeSweepReserve(provider, config);
   const send = snapshot.nativeRaw - reserve;
   if (send > 0n) {
     const human = Number(ethers.formatEther(send));
     log(`sweep w${signer.idx} ${human.toFixed(6)} L1X (gas dust left behind: ${ethers.formatEther(reserve)})`);
-    let hash = null;
-    if (execute) hash = (await transferNative({ signer: signer.wallet, to: parent.address, amountWei: send, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
-    await record({ kind: 'sweep', from: signer.address, to: parent.address, token: null, tokenSymbol: 'L1X', amount: human, txHash: hash });
-    moved.push({ symbol: 'L1X', amount: human });
+    // Best effort. Leftover gas is the least valuable thing in the wallet and
+    // this is the only leg that spends a whole balance, so it is by far the most
+    // likely to be refused. One wallet's gas dust must not abort a ten-wallet
+    // rotation with nine wallets still full — which is exactly what it did.
+    try {
+      let hash = null;
+      if (execute) hash = (await transferNative({ signer: signer.wallet, to: parent.address, amountWei: send, log, nonces, timeoutMs: config.txTimeoutMs }))?.hash;
+      await record({ kind: 'sweep', from: signer.address, to: parent.address, token: null, tokenSymbol: 'L1X', amount: human, txHash: hash });
+      moved.push({ symbol: 'L1X', amount: human });
+    } catch (e) {
+      log(`sweep w${signer.idx} native drain FAILED, leaving ${human.toFixed(6)} L1X behind: ${String(e.shortMessage || e.message).slice(0, 90)}`);
+    }
   }
   if (abandoned.length) {
     const worth = abandoned.reduce((a, b) => a + b.worth, 0);

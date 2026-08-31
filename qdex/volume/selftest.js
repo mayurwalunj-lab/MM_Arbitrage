@@ -336,6 +336,38 @@ test('sweepWallet defaults to sweeping everything when given no valuer', async (
   assert.ok(swept.includes('DUST'), 'a caller supplying no prices must not lose balances');
 });
 
+test('the native reserve is floored when the node reports a nonsense gas price', async () => {
+  // L1X reports 1 wei. Derived would be 63,000 wei — the drain then offers the
+  // whole balance and the node rejects it. Observed live.
+  const cheap = { getFeeData: async () => ({ gasPrice: 1n, maxFeePerGas: null }) };
+  const r = await funding.nativeSweepReserve(cheap, { nativeSweepReserve: 0.01 });
+  assert.strictEqual(r, 10n ** 16n, 'must fall back to the 0.01 L1X floor, not 63000 wei');
+});
+
+test('a genuinely expensive chain still gets the derived reserve, not the floor', async () => {
+  const dear = { getFeeData: async () => ({ gasPrice: null, maxFeePerGas: 10n ** 12n }) };
+  const r = await funding.nativeSweepReserve(dear, { nativeSweepReserve: 0.01 });
+  assert.strictEqual(r, 10n ** 12n * 21000n * 3n, 'the floor must not cap a real fee estimate');
+});
+
+test('a failed native drain does not abort the sweep', async () => {
+  // This is the live failure: the node refused w00's gas drain and the whole
+  // rotation died with nine wallets still full. Nothing but native here, so the
+  // only leg that runs is the one that must not be allowed to throw.
+  const snap = fakeSnapshot({});
+  snap.nativeRaw = 10n ** 18n;
+  const swept = [];
+  const moved = await funding.sweepWallet({
+    provider: stubProvider, signer: { idx: 0, address: '0xw', wallet: null }, parent: { address: '0xp' },
+    snapshot: snap, config: { sweepMinWl1x: 0.03, txTimeoutMs: 1000, nativeSweepReserve: 0.01 },
+    execute: true,                       // real transfer path, against a null wallet
+    record: async (x) => { if (x.kind === 'sweep') swept.push(x.tokenSymbol); },
+    log: () => {}, nonces: null, valueBag: unitValuer
+  });
+  assert.ok(Array.isArray(moved), 'sweepWallet must return normally rather than throw');
+  assert.ok(!swept.includes('L1X'), 'the failed leg must not be recorded as moved');
+});
+
 // ---------------------------------------------------------------- pool affinity
 const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
 
