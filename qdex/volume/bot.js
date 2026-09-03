@@ -354,9 +354,17 @@ async function run() {
       const tokenValueTotal = holdings.reduce((a, h) => a + h.valueWl1x, 0);
 
       // ---- pick a pool that can actually serve the wallet's needed side ----
-      const wantSell = guards.chooseSide({
+      // Feasibility first, preference second. Choosing a side the wallet cannot
+      // fund and discovering it three checks later is what produced a 38% skip
+      // rate: 2,082 skips were BUYs blocked by the wallet's own WL1X (never by
+      // pool depth — the caps were 7-268 WL1X against a 0.25 minimum), and
+      // ~1,400 more were SELLs into a pool holding nothing. In almost every one
+      // of those turns the OTHER side was perfectly tradeable.
+      const canBuy = snap.wl1x - config.walletFloorWl1x >= config.minTradeWl1x;
+      const pref = guards.chooseSide({
         wl1xValue: snap.wl1x, tokenValue: tokenValueTotal, deviationPct: 0, config
-      }).side === 'sell';
+      });
+      let wantSell = pref.side === 'sell';
       // Selling is constrained by what the wallet HOLDS, so pick the largest
       // holding rather than weighting by pool depth. Depth decides where trading
       // is cheap; only inventory decides where a sell is possible at all, and
@@ -368,6 +376,10 @@ async function run() {
       // exempt: a holding must be sellable wherever it happens to be, including
       // in a pool no longer assigned to this wallet.
       const myPools = guards.poolsForWallet(markets, signer.idx, config.poolsPerWallet);
+      // Flip to the side the wallet CAN fund. No price is involved at this
+      // point (deviationPct is 0 above), so nothing here can override a band.
+      if (wantSell && !sellable.length && canBuy) wantSell = false;
+      if (!wantSell && !canBuy && sellable.length) wantSell = true;
       const candidates = wantSell && sellable.length ? [sellable[0].market] : myPools;
       // Weighting choice matters more than it looks: TVL here spans ~40x, so
       // straight TVL weighting starves the small pools of traffic entirely.
@@ -485,15 +497,41 @@ async function run() {
       const tokenBal = snap.tokens[m.quote.address.toLowerCase()];
       const tokenHuman = tokenBal ? tokenBal.human : 0;
       const tokenInWl1x = px > 0 ? tokenHuman / px : 0;
-      const { side, reason: sideReason } = guards.chooseSide({
+      const decision = guards.chooseSide({
         wl1xValue: snap.wl1x, tokenValue: tokenValueTotal, deviationPct: devPct, config
       });
+      let side = decision.side;
+      let sideReason = decision.reason;
+
+      // This runs AFTER the pool is chosen, using that pool's deviation, so it
+      // can land on a side the pre-selected pool cannot serve. Rather than skip
+      // the turn, take the side this wallet can fund HERE.
+      //
+      // A forced side is never flipped: the band forced it precisely because the
+      // price has drifted, and trading the other way would push it further out.
+      // Skipping is the correct answer there, so those skips remain.
+      const canSellHere = tokenInWl1x >= config.minTradeWl1x;
+      if (!decision.forced) {
+        if (side === 'sell' && !canSellHere && canBuy) {
+          side = 'buy'; sideReason = `${decision.reason} — flipped to BUY, nothing sellable in ${m.cfg.label}`;
+        } else if (side === 'buy' && !canBuy && canSellHere) {
+          side = 'sell'; sideReason = `${decision.reason} — flipped to SELL, WL1X surplus below minTrade`;
+        }
+      }
 
       // ---- can this wallet actually fund that side? ----
-      if (side === 'sell' && tokenInWl1x < config.minTradeWl1x) {
+      if (side === 'sell' && !canSellHere) {
         await recordTrade({ ...base, status: 'skipped', side, priceBefore: px, anchorPrice: anchor, deviationPct: devPct,
-          reason: `no ${m.quote.symbol} inventory for SELL (${tokenHuman.toPrecision(4)})` });
+          reason: `no ${m.quote.symbol} inventory for SELL (${tokenHuman.toPrecision(4)})${decision.forced ? ' [band-forced]' : ''}` });
         log(`w${pad2(signer.idx)} ${market.cfg.label} SKIP  no ${m.quote.symbol} inventory for SELL`);
+        if (await onSkip()) break;
+        continue;
+      }
+      if (side === 'buy' && !canBuy) {
+        await recordTrade({ ...base, status: 'skipped', side, priceBefore: px, anchorPrice: anchor, deviationPct: devPct,
+          reason: `WL1X surplus ${(snap.wl1x - config.walletFloorWl1x).toFixed(4)} below minTrade ${config.minTradeWl1x}` +
+            `${decision.forced ? ' [band-forced]' : ''}` });
+        log(`w${pad2(signer.idx)} ${market.cfg.label} SKIP  no WL1X surplus to BUY`);
         if (await onSkip()) break;
         continue;
       }

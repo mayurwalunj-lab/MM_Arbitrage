@@ -152,20 +152,24 @@ class AnchorBook {
 //     special-case seeding code.
 //   - price: if the pool has drifted outside the band, force the corrective side.
 // `biasStrength` (0..1) sets how strongly inventory tilts an otherwise coin-flip.
+// `forced` marks a side the PRICE demanded rather than one inventory merely
+// preferred. It matters because the caller may flip an unfundable side to the
+// other one instead of skipping — but flipping a forced side would trade further
+// away from the anchor, which is the one thing the band exists to prevent.
 function chooseSide({ wl1xValue, tokenValue, deviationPct, config, rng = Math.random }) {
   const band = config.maxDeviationPct;
-  if (deviationPct < -band) return { side: 'sell', reason: `pool ${deviationPct.toFixed(2)}% below anchor — forced SELL` };
-  if (deviationPct > band) return { side: 'buy', reason: `pool ${deviationPct.toFixed(2)}% above anchor — forced BUY` };
+  if (deviationPct < -band) return { side: 'sell', forced: true, reason: `pool ${deviationPct.toFixed(2)}% below anchor — forced SELL` };
+  if (deviationPct > band) return { side: 'buy', forced: true, reason: `pool ${deviationPct.toFixed(2)}% above anchor — forced BUY` };
 
   const total = wl1xValue + tokenValue;
-  if (!(total > 0)) return { side: 'buy', reason: 'no inventory' };
+  if (!(total > 0)) return { side: 'buy', forced: false, reason: 'no inventory' };
   const wl1xShare = wl1xValue / total;
   const target = config.inventoryTargetPct / 100;
   // Over-weight WL1X -> lean buy. p is the probability of picking BUY.
   const tilt = (wl1xShare - target) * config.biasStrength;
   const p = Math.min(0.98, Math.max(0.02, 0.5 + tilt));
   const side = rng() < p ? 'buy' : 'sell';
-  return { side, reason: `inventory ${(wl1xShare * 100).toFixed(0)}% WL1X (target ${config.inventoryTargetPct}%), p(buy)=${p.toFixed(2)}` };
+  return { side, forced: false, reason: `inventory ${(wl1xShare * 100).toFixed(0)}% WL1X (target ${config.inventoryTargetPct}%), p(buy)=${p.toFixed(2)}` };
 }
 
 // Narrow a loaded market list to the focused pools. A focus can name either the

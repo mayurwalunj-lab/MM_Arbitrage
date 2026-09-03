@@ -447,6 +447,68 @@ test('a revert is NOT retried as if the node were at fault', async () => {
   assert.strictEqual(polls, 0, 'a reverted transaction must not be polled for');
 });
 
+// ------------------------------------------------------- side feasibility flip
+// 38% of live turns were skipped because a side was chosen the wallet could not
+// fund: 2,082 BUYs blocked by the wallet's own WL1X (pool depth was never the
+// constraint) and ~1,400 SELLs into a pool holding nothing. These pin the rule
+// that decides when flipping to the other side is allowed.
+
+test('a band-forced side is marked forced; an inventory-chosen one is not', () => {
+  const cfg = { maxDeviationPct: 0.75, inventoryTargetPct: 50, biasStrength: 0.7 };
+  assert.strictEqual(guards.chooseSide({ wl1xValue: 1, tokenValue: 1, deviationPct: -2, config: cfg }).forced, true);
+  assert.strictEqual(guards.chooseSide({ wl1xValue: 1, tokenValue: 1, deviationPct: 2, config: cfg }).forced, true);
+  assert.strictEqual(guards.chooseSide({ wl1xValue: 1, tokenValue: 1, deviationPct: 0, config: cfg }).forced, false);
+});
+
+test('an empty wallet reports forced:false so its side can still be flipped', () => {
+  const cfg = { maxDeviationPct: 0.75, inventoryTargetPct: 50, biasStrength: 0.7 };
+  const d = guards.chooseSide({ wl1xValue: 0, tokenValue: 0, deviationPct: 0, config: cfg });
+  assert.strictEqual(d.forced, false, 'the no-inventory branch must not look band-forced');
+});
+
+// The bot's rule, extracted so it can be tested without a chain. Mirrors the
+// flip block in bot.js exactly.
+function resolveSide(decision, { canBuy, canSellHere }) {
+  let side = decision.side;
+  if (!decision.forced) {
+    if (side === 'sell' && !canSellHere && canBuy) side = 'buy';
+    else if (side === 'buy' && !canBuy && canSellHere) side = 'sell';
+  }
+  const fundable = side === 'buy' ? canBuy : canSellHere;
+  return { side, fundable };
+}
+
+test('an unfundable BUY flips to SELL rather than skipping', () => {
+  // The live case: surplus 0.19 against a 0.25 minimum, but 0.5 of token held.
+  const r = resolveSide({ side: 'buy', forced: false }, { canBuy: false, canSellHere: true });
+  assert.strictEqual(r.side, 'sell');
+  assert.strictEqual(r.fundable, true, 'the turn must now produce a trade, not a skip');
+});
+
+test('an unfundable SELL flips to BUY rather than skipping', () => {
+  const r = resolveSide({ side: 'sell', forced: false }, { canBuy: true, canSellHere: false });
+  assert.strictEqual(r.side, 'buy');
+  assert.strictEqual(r.fundable, true);
+});
+
+test('a BAND-FORCED side is never flipped — it must skip instead', () => {
+  // Flipping here would trade further away from the anchor, which is the exact
+  // thing the deviation band exists to prevent. A skip is the correct outcome.
+  const r = resolveSide({ side: 'sell', forced: true }, { canBuy: true, canSellHere: false });
+  assert.strictEqual(r.side, 'sell', 'a forced side must survive an unfundable check');
+  assert.strictEqual(r.fundable, false, 'and therefore still skip');
+});
+
+test('a fundable side is left alone', () => {
+  assert.strictEqual(resolveSide({ side: 'buy', forced: false }, { canBuy: true, canSellHere: true }).side, 'buy');
+  assert.strictEqual(resolveSide({ side: 'sell', forced: false }, { canBuy: true, canSellHere: true }).side, 'sell');
+});
+
+test('a wallet that can do NEITHER still skips — flipping invents nothing', () => {
+  const r = resolveSide({ side: 'buy', forced: false }, { canBuy: false, canSellHere: false });
+  assert.strictEqual(r.fundable, false, 'a genuinely stuck wallet must reach the consolidation path');
+});
+
 // ---------------------------------------------------------------- pool affinity
 const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
 
