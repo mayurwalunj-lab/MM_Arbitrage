@@ -551,7 +551,21 @@ async function run() {
         continue;
       }
 
-      const wanted = guards.logUniform(config.minTradeWl1x, upper);
+      let wanted = guards.logUniform(config.minTradeWl1x, upper);
+      // DUST AVOIDANCE. Selling a random slice leaves the rest of the bag behind,
+      // and when that remainder falls below minTrade it can never be sold again —
+      // it is stranded for the life of the wallet. Holdings sit just above the
+      // minimum (a buy creates ~minTrade of token), and logUniform biases toward
+      // small sizes, so nearly every sell stranded something: 0.46 WL1X across
+      // the retired epoch, 0.19 more in the live one.
+      //
+      // Only when the BAG is what limits the trade. If a cap (impact, pool
+      // fraction, maxTrade) is binding instead, the bag is far larger than the
+      // minimum and whatever is left stays sellable, so a partial sell is right.
+      if (side === 'sell' && upper >= inventoryMax - 1e-12
+          && (inventoryMax - wanted) < config.minTradeWl1x) {
+        wanted = inventoryMax;
+      }
       const fit = poolsMod.quoteWithinImpact({
         market: m, side, sizeWl1x: wanted, maxImpactBps: capBps,
         minWl1x: config.minTradeWl1x, slippageBps: config.slippageBps

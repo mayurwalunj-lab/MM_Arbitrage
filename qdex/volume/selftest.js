@@ -509,6 +509,49 @@ test('a wallet that can do NEITHER still skips — flipping invents nothing', ()
   assert.strictEqual(r.fundable, false, 'a genuinely stuck wallet must reach the consolidation path');
 });
 
+// -------------------------------------------------------------- dust avoidance
+// Every sell used to leave a random remainder, and a remainder below minTrade
+// can never be sold again. That stranded 0.46 WL1X in the retired epoch and
+// 0.19 in the live one — the reason every wallet carried tiny unsellable bags.
+// Extracted from bot.js so the rule can be tested without a chain.
+function sizeSell({ bag, wanted, upper, minTrade }) {
+  if (upper >= bag - 1e-12 && (bag - wanted) < minTrade) return bag;
+  return wanted;
+}
+
+test('a sell that would strand the remainder takes the whole bag', () => {
+  // bag 0.30, random slice 0.26 -> remainder 0.04, unsellable forever.
+  assert.strictEqual(sizeSell({ bag: 0.30, wanted: 0.26, upper: 0.30, minTrade: 0.25 }), 0.30);
+});
+
+test('a sell leaving a still-sellable remainder is left partial', () => {
+  // bag 0.90, slice 0.30 -> remainder 0.60, comfortably tradeable. Keep the
+  // randomness: always selling the whole bag would make sizes predictable.
+  assert.strictEqual(sizeSell({ bag: 0.90, wanted: 0.30, upper: 0.90, minTrade: 0.25 }), 0.30);
+});
+
+test('a remainder exactly at minTrade is left alone', () => {
+  assert.strictEqual(sizeSell({ bag: 0.75, wanted: 0.50, upper: 0.75, minTrade: 0.25 }), 0.50);
+});
+
+test('when a CAP binds, not the bag, the sell stays partial', () => {
+  // bag 5.0 but the impact cap allows only 1.0. The 4.0 left is far above
+  // minTrade and perfectly sellable next turn — taking "the whole bag" here
+  // would breach the cap the pool guard exists to enforce.
+  assert.strictEqual(sizeSell({ bag: 5.0, wanted: 0.8, upper: 1.0, minTrade: 0.25 }), 0.8);
+});
+
+test('a bag only just above minTrade is taken whole', () => {
+  assert.strictEqual(sizeSell({ bag: 0.26, wanted: 0.2501, upper: 0.26, minTrade: 0.25 }), 0.26);
+});
+
+test('dust avoidance never sells more than the wallet holds', () => {
+  for (const bag of [0.26, 0.3, 0.49, 0.9, 5.0]) {
+    const out = sizeSell({ bag, wanted: 0.25, upper: Math.min(bag, 1.0), minTrade: 0.25 });
+    assert.ok(out <= bag + 1e-12, `sold ${out} from a bag of ${bag}`);
+  }
+});
+
 // ---------------------------------------------------------------- pool affinity
 const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
 
