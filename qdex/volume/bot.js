@@ -562,9 +562,19 @@ async function run() {
       // Only when the BAG is what limits the trade. If a cap (impact, pool
       // fraction, maxTrade) is binding instead, the bag is far larger than the
       // minimum and whatever is left stays sellable, so a partial sell is right.
+      //
+      // The 0.999 is not cosmetic. inventoryMax is tokenHuman/px, and the quote
+      // multiplies it back by px — a float round-trip that lands a few hundred
+      // wei ABOVE the balance for ~half of all bags (measured: 13 of 27 live
+      // holdings, one by 408,648 wei). parseUnits then asks for more than the
+      // wallet holds, transferFrom reverts, and every whole-bag sell is skipped
+      // as "simulation says this swap would revert". Asking for 99.9% leaves a
+      // margin thousands of times larger than the error. The 0.1% left behind is
+      // ~0.00025 WL1X on a 0.25 bag — negligible against the ~0.05 remainders
+      // this rule exists to prevent. cli.js consolidate does the same thing.
       if (side === 'sell' && upper >= inventoryMax - 1e-12
           && (inventoryMax - wanted) < config.minTradeWl1x) {
-        wanted = inventoryMax;
+        wanted = inventoryMax * 0.999;
       }
       const fit = poolsMod.quoteWithinImpact({
         market: m, side, sizeWl1x: wanted, maxImpactBps: capBps,

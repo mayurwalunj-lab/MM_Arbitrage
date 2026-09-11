@@ -515,13 +515,25 @@ test('a wallet that can do NEITHER still skips — flipping invents nothing', ()
 // 0.19 in the live one — the reason every wallet carried tiny unsellable bags.
 // Extracted from bot.js so the rule can be tested without a chain.
 function sizeSell({ bag, wanted, upper, minTrade }) {
-  if (upper >= bag - 1e-12 && (bag - wanted) < minTrade) return bag;
+  if (upper >= bag - 1e-12 && (bag - wanted) < minTrade) return bag * 0.999;
   return wanted;
 }
 
-test('a sell that would strand the remainder takes the whole bag', () => {
+test('a sell that would strand the remainder takes (almost) the whole bag', () => {
   // bag 0.30, random slice 0.26 -> remainder 0.04, unsellable forever.
-  assert.strictEqual(sizeSell({ bag: 0.30, wanted: 0.26, upper: 0.30, minTrade: 0.25 }), 0.30);
+  const out = sizeSell({ bag: 0.30, wanted: 0.26, upper: 0.30, minTrade: 0.25 });
+  assert.ok(out > 0.299 && out < 0.30, `expected just under the bag, got ${out}`);
+});
+
+test('a whole-bag sell asks for STRICTLY LESS than the wallet holds', () => {
+  // Asking for exactly the bag reverts: inventoryMax is tokenHuman/px and the
+  // quote multiplies back by px, landing a few hundred wei over the balance for
+  // about half of all bags. Every such sell was skipped as "would revert".
+  for (const bag of [0.26, 0.30, 0.4238812302565396, 4121.545533194]) {
+    const out = sizeSell({ bag, wanted: bag - 0.001, upper: bag, minTrade: 0.25 });
+    assert.ok(out < bag, `must leave headroom for float error: ${out} vs ${bag}`);
+    assert.ok(out > bag * 0.998, `but must still clear the bag: ${out} vs ${bag}`);
+  }
 });
 
 test('a sell leaving a still-sellable remainder is left partial', () => {
@@ -542,7 +554,8 @@ test('when a CAP binds, not the bag, the sell stays partial', () => {
 });
 
 test('a bag only just above minTrade is taken whole', () => {
-  assert.strictEqual(sizeSell({ bag: 0.26, wanted: 0.2501, upper: 0.26, minTrade: 0.25 }), 0.26);
+  const out = sizeSell({ bag: 0.26, wanted: 0.2501, upper: 0.26, minTrade: 0.25 });
+  assert.ok(out > 0.2597 && out < 0.26, `got ${out}`);
 });
 
 test('dust avoidance never sells more than the wallet holds', () => {
