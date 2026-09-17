@@ -31,6 +31,12 @@ const test = (name, fn) => {
   } catch (e) { console.log(`  FAIL  ${name}\n        ${e.message}`); process.exitCode = 1; }
 };
 
+// Tests that swap out shared module functions (db, epoch, funding) must not
+// overlap with each other or with anything else that uses those modules. They
+// are queued and run one at a time after every other test has settled.
+const serialTests = [];
+const serialTest = (name, fn) => serialTests.push([name, fn]);
+
 console.log('\nQDex volume harness — offline self-test\n');
 
 // ---------------------------------------------------------------- crypto
@@ -565,6 +571,197 @@ test('dust avoidance never sells more than the wallet holds', () => {
   }
 });
 
+// ------------------------------------------------------------ rotation lifecycle
+// Epoch 13 was retired still holding 106 token bags, and on expiry the bot just
+// stopped until a person intervened. These pin the replacement: nothing is
+// retired until it is PROVEN empty, and the lifecycle carries itself from an
+// expired roster to a funded live one.
+const rotateMod = require('./rotate');
+
+test('leftovers counts WL1X and priced tokens above the allowance', () => {
+  const snap = { wl1x: 0.5, wl1xRaw: 1n, tokens: {
+    '0xa': { symbol: 'AAA', human: 2, raw: 1n },       // worth 2 (price 1)
+    '0xb': { symbol: 'BBB', human: 0.00001, raw: 1n }, // worth 0.00001
+    '0xc': { symbol: 'CCC', human: 5, raw: 0n } } };   // empty
+  const left = rotateMod.leftovers(snap, (a, h) => h, 0.0001).map((x) => x.symbol).sort();
+  assert.deepStrictEqual(left, ['AAA', 'WL1X'], 'dust under the allowance and empty balances are not leftovers');
+});
+
+test('an UNPRICED token balance always counts as left over', () => {
+  // Abandoning is irreversible. A token we cannot value must block retirement.
+  const snap = { wl1x: 0, wl1xRaw: 0n, tokens: { '0xz': { symbol: 'ZZZ', human: 1e-12, raw: 1n } } };
+  const left = rotateMod.leftovers(snap, () => Infinity, 0.0001);
+  assert.strictEqual(left.length, 1);
+});
+
+test('seed target is the float at which a position can still be sold', () => {
+  // server settings: floor 0.05, minTrade 0.25, 3 pools, 50% inventory
+  const t = rotateMod.seedTarget({ walletFloorWl1x: 0.05, minTradeWl1x: 0.25, poolsPerWallet: 3, inventoryTargetPct: 50 });
+  assert.ok(Math.abs(t - 1.55) < 1e-9, `expected 1.55, got ${t}`);
+  assert.strictEqual(rotateMod.seedTarget({ seedMinWl1x: 2, walletFloorWl1x: 0.05, minTradeWl1x: 0.25 }), 2,
+    'an explicit QVT_SEED_MIN_WL1X wins');
+});
+
+test('seeding is a top-up: already-funded amounts are not paid twice', () => {
+  // A crash half way through seeding left one wallet with its share already.
+  const plan = rotateMod.planSeed({ parentWl1x: 18, unfundedBalances: [2, 0, 0], reservePct: 10 });
+  // (18*0.9 + 2) / 3 = 6.0666…
+  assert.ok(Math.abs(plan.perWallet - 18.2 / 3) < 1e-9);
+  // the wallet already holding 2 only needs the difference
+  assert.ok(Math.abs(plan.needFromParent - (plan.perWallet * 3 - 2)) < 1e-9);
+  assert.ok(plan.needFromParent <= 18 * 0.9 + 1e-9, 'never asks the parent for more than it can give');
+});
+
+// --- the lifecycle, with the chain and database replaced by an in-memory model
+function lifecycleHarness({ epochs, holdings = {}, parentWl1x = 0, sweepWorks = true, fundWorks = true }) {
+  const dbm = require('./db'), ep = require('./epoch'), wal = require('./wallets'), fund = require('./funding');
+  const saved = {
+    current: ep.current, isExpired: ep.isExpired, loadSigners: ep.loadSigners, createEpoch: ep.createEpoch,
+    setEpochStatus: dbm.setEpochStatus, getWallets: dbm.getWallets, markWallet: dbm.markWallet,
+    snapshot: wal.snapshot, sweepWallet: fund.sweepWallet, fundWallets: fund.fundWallets
+  };
+  const state = { epochs, holdings, parentWl1x, wallets: {}, retired: [], created: 0, calls: [] };
+  let nextId = Math.max(...epochs.map((e) => e.id), 0) + 1;
+  const rosterOf = (id) => (state.wallets[id] ||= [0, 1].map((idx) => ({ idx, address: `0xE${id}W${idx}`, funded_at: null })));
+
+  ep.current = async () => state.epochs.find((e) => e.status === 'active' || e.status === 'draining') || null;
+  ep.isExpired = (e) => !!e.expired;
+  ep.loadSigners = async ({ epochId }) => rosterOf(epochId).map((r) => ({ idx: r.idx, address: r.address }));
+  ep.createEpoch = async () => { const id = nextId++; state.epochs.push({ id, status: 'active' }); state.created++; return { epochId: id }; };
+  dbm.setEpochStatus = async (id, status) => { state.epochs.find((e) => e.id === id).status = status; if (status === 'retired') state.retired.push(id); };
+  dbm.getWallets = async (id) => rosterOf(id);
+  dbm.markWallet = async (id, idx, field) => { if (field === 'funded') rosterOf(id).find((r) => r.idx === idx).funded_at = new Date(); };
+  wal.snapshot = async ({ address }) => {
+    const h = state.holdings[address] || 0;
+    return { address, native: 0.01, nativeRaw: 1n, wl1x: 0, wl1xRaw: 0n,
+      tokens: h > 0 ? { '0xtok': { symbol: 'TOK', human: h, raw: 1n } } : {} };
+  };
+  fund.sweepWallet = async ({ signer }) => {
+    state.calls.push('sweep');
+    const moved = [];
+    if (sweepWorks && state.holdings[signer.address]) { state.parentWl1x += state.holdings[signer.address]; delete state.holdings[signer.address]; moved.push({}); }
+    return moved;
+  };
+  fund.fundWallets = async ({ signers, config }) => {
+    state.calls.push('fund');
+    if (!fundWorks) return [];
+    for (const s of signers) { state.parentWl1x -= config.fundWl1xPerWallet; state.holdings['bal:' + s.address] = config.fundWl1xPerWallet; }
+    return [];
+  };
+  const restore = () => { Object.assign(ep, { current: saved.current, isExpired: saved.isExpired, loadSigners: saved.loadSigners, createEpoch: saved.createEpoch });
+    Object.assign(dbm, { setEpochStatus: saved.setEpochStatus, getWallets: saved.getWallets, markWallet: saved.markWallet });
+    wal.snapshot = saved.snapshot; Object.assign(fund, { sweepWallet: saved.sweepWallet, fundWallets: saved.fundWallets }); };
+  const run = (opts = {}) => rotateMod.ensureLiveEpoch({
+    config: { pools: [], walletCount: 2, epochDays: 7, parentReservePct: 10, rotateMaxLeftWl1x: 0.0001, sweepMinWl1x: 0,
+      walletFloorWl1x: 0.05, minTradeWl1x: 0.25, poolsPerWallet: 1, inventoryTargetPct: 50, fundGasNative: 0.5, fundPollMs: 1 },
+    provider: { getBalance: async () => 10n ** 18n }, chainId: 1066,
+    parent: { address: '0xPARENT' }, tokenMeta: {}, execute: true, log: () => {}, nonces: null,
+    recordFor: () => async () => {}, backoffMs: 1,
+    seedOpts: { balanceOf: async (a) => (a === '0xPARENT' ? state.parentWl1x : (state.holdings['bal:' + a] || 0)), retryDelayMs: 1 },
+    ...opts
+  });
+  return { state, run, restore };
+}
+
+serialTest('an expired roster is swept, verified, retired, replaced and seeded', async () => {
+  const h = lifecycleHarness({
+    epochs: [{ id: 14, status: 'active', expired: true }],
+    holdings: { '0xE14W0': 1.0, '0xE14W1': 1.0 },   // tokens left in the old roster
+    parentWl1x: 2.0
+  });
+  try {
+    const live = await h.run();
+    assert.ok(live, 'must reach a live epoch');
+    assert.strictEqual(live.id, 15, 'a fresh roster must be opened');
+    assert.deepStrictEqual(h.state.retired, [14], 'the expired roster must be retired');
+    assert.ok(!h.state.holdings['0xE14W0'] && !h.state.holdings['0xE14W1'], 'nothing may be left in the old roster');
+    assert.ok(h.state.wallets[15].every((w) => w.funded_at), 'every new wallet must be seeded');
+  } finally { h.restore(); }
+});
+
+serialTest('a roster that is NOT empty is never retired', async () => {
+  // The sweep "succeeds" but moves nothing — exactly how epoch 13 was retired
+  // with 106 bags in it. It must stay draining and be swept again instead.
+  const h = lifecycleHarness({
+    epochs: [{ id: 14, status: 'active', expired: true }],
+    holdings: { '0xE14W0': 1.0 },
+    sweepWorks: false
+  });
+  let checks = 0;
+  try {
+    const live = await h.run({ shouldStop: () => ++checks > 40 });
+    assert.strictEqual(live, null, 'it must give up only when told to stop');
+    assert.deepStrictEqual(h.state.retired, [], 'a non-empty roster must never be retired');
+    assert.strictEqual(h.state.epochs[0].status, 'draining', 'it stays draining so the next run resumes');
+    assert.ok(h.state.calls.filter((c) => c === 'sweep').length >= 2, 'it must keep re-sweeping');
+    assert.strictEqual(h.state.created, 0, 'no new roster may open while the old one holds funds');
+  } finally { h.restore(); }
+});
+
+serialTest('an underfunded parent means WAIT — the roster is not seeded thin', async () => {
+  // 0.5 WL1X cannot give two wallets the 0.55 each this config needs to trade.
+  const h = lifecycleHarness({ epochs: [{ id: 20, status: 'active' }], parentWl1x: 0.5 });
+  let checks = 0;
+  try {
+    const live = await h.run({ shouldStop: () => ++checks > 20 });
+    assert.strictEqual(live, null);
+    assert.ok(!h.state.calls.includes('fund'), 'no WL1X may be sent to a roster that cannot trade');
+    assert.ok(h.state.wallets[20].every((w) => !w.funded_at));
+  } finally { h.restore(); }
+});
+
+serialTest('funding the parent while it waits is picked up without a restart', async () => {
+  const h = lifecycleHarness({ epochs: [{ id: 20, status: 'active' }], parentWl1x: 0.5 });
+  let checks = 0;
+  try {
+    const live = await h.run({ shouldStop: () => { if (++checks === 5) h.state.parentWl1x = 10; return checks > 200; } });
+    assert.ok(live && live.id === 20, 'it must resume on its own once the parent is funded');
+    assert.ok(h.state.wallets[20].every((w) => w.funded_at));
+  } finally { h.restore(); }
+});
+
+serialTest('a half-drained (draining) epoch is resumed, not abandoned', async () => {
+  // The process died mid-sweep. On restart it must finish the job.
+  const h = lifecycleHarness({
+    epochs: [{ id: 14, status: 'draining' }],
+    holdings: { '0xE14W1': 0.7 },
+    parentWl1x: 5
+  });
+  try {
+    const live = await h.run();
+    assert.deepStrictEqual(h.state.retired, [14]);
+    assert.ok(!h.state.holdings['0xE14W1']);
+    assert.strictEqual(live.id, 15);
+  } finally { h.restore(); }
+});
+
+serialTest('sweeping a RETIRED roster leaves it retired', async () => {
+  // Recovering epoch 13's leftovers must not reopen it: a second open epoch
+  // would stop the whole harness.
+  const h = lifecycleHarness({ epochs: [{ id: 13, status: 'retired' }, { id: 14, status: 'active' }],
+    holdings: { '0xE13W0': 0.3 } });
+  try {
+    const r = await rotateMod.sweepAndVerify({
+      config: { pools: [], rotateMaxLeftWl1x: 0.0001, sweepMinWl1x: 0 },
+      provider: {}, epoch: h.state.epochs[0], parent: { address: '0xPARENT' }, tokenMeta: {},
+      execute: true, log: () => {}, nonces: null, record: async () => {}
+    });
+    assert.strictEqual(r.ok, true, 'the leftovers must be recovered');
+    assert.strictEqual(h.state.epochs[0].status, 'retired', 'a retired roster must stay retired');
+    assert.strictEqual(h.state.epochs[1].status, 'active', 'the live roster must be untouched');
+  } finally { h.restore(); }
+});
+
+serialTest('a dry run changes nothing', async () => {
+  const h = lifecycleHarness({ epochs: [{ id: 14, status: 'active', expired: true }], holdings: { '0xE14W0': 1 } });
+  try {
+    await h.run({ execute: false });
+    assert.strictEqual(h.state.epochs[0].status, 'active', 'dry run must not mark the epoch draining');
+    assert.deepStrictEqual(h.state.retired, []);
+    assert.strictEqual(h.state.created, 0);
+  } finally { h.restore(); }
+});
+
 // ---------------------------------------------------------------- pool affinity
 const POOLS12 = Array.from({ length: 12 }, (_, i) => ({ address: '0xp' + i, cfg: { label: 'P' + i } }));
 
@@ -972,6 +1169,10 @@ test('no donor is returned when everyone is at the floor', () => {
   assert.strictEqual(chooseDonor(snaps, '0xz', cfg), null);
 });
 
-Promise.all(pending).then(() => {
+Promise.all(pending).then(async () => {
+  for (const [name, fn] of serialTests) {
+    try { await fn(); console.log(`  ok    ${name}`); passed++; }
+    catch (e) { console.log(`  FAIL  ${name}\n        ${e.message}`); process.exitCode = 1; }
+  }
   console.log(`\n${passed} passed${process.exitCode ? ', SOME FAILED' : ', all green'}\n`);
 });

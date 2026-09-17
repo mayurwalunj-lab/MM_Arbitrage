@@ -209,30 +209,80 @@ The parent wallet is **not** generated — supply it via `QVT_PARENT_PK`.
 
 ```
 epoch N trading (QVT_EPOCH_DAYS)
-  -> sweep to parent IN KIND (every token as-is, no swaps)
+  -> sweep EVERY balance to the parent in kind (tokens as-is, no swaps)
+  -> VERIFY every wallet is empty          <- not retired until this passes
   -> retire epoch N
   -> generate 10 fresh wallets (offline)
-  -> parent distributes every asset pro rata
+  -> seed them from the parent: WL1X + gas, as a top-up to an even share
   -> epoch N+1 trading
 ```
 
 ```bash
-npm run qdex:vol:epoch           # status, age, time left, roster
-npm run qdex:vol:epoch:rotate    # the whole cycle (dry-run without --execute)
-npm run qdex:vol:sweep           # sweep only
+npm run qdex:vol:epoch                       # status, age, time left, roster
+npm run qdex:vol:epoch:rotate                # the whole cycle (dry-run without --execute)
+npm run qdex:vol:sweep                       # sweep + verify the live roster only
+node qdex/volume/cli.js sweep --epoch 13     # recover leftovers from an OLD roster (stays retired)
+npm run qdex:vol:seed                        # top up the live roster from the parent
 ```
 
-**The sweep is in kind.** Token bags are transferred as they are, never sold back
-to WL1X first — liquidating them would pay the pool fee twice over and move every
-price at once. A side effect is that epoch 2 onward starts *pre-balanced*: new
-wallets inherit the previous epoch's tokens and can trade either direction
-immediately.
+### Nothing is left behind
 
-Native gas is swept last, minus the cost of that very transaction, so retired
-wallets do not accumulate stranded dust across epochs.
+A roster is retired only once a fresh read of every wallet shows it empty. If
+anything remains — an RPC timeout, a dropped transaction — the epoch stays
+`draining` and the next run sweeps it again. Retiring on "the sweep didn't
+throw" is how epoch 13 was retired still holding 106 token bags.
 
-A rotation is roughly `wallets × (pools + 2)` transfers out and the same back —
-with 10 wallets and 10 pools that is ~120 each way. Budget parent gas for it.
+`QVT_SWEEP_MIN_WL1X` now defaults to **0**: every non-zero balance moves. Gas on
+this chain has never measurably reduced a wallet balance, so there was nothing
+to save by leaving dust. `QVT_ROTATE_MAX_LEFT_WL1X` (default 0.0001 WL1X per
+asset) is the only allowance, so that one token that refuses to transfer cannot
+wedge rotation forever. A token that cannot be priced always counts as left over.
+
+Native gas is swept last, less `QVT_NATIVE_SWEEP_RESERVE` (0.01 L1X) so the
+drain can pay for itself — this chain reports a 1-wei gas price that the node
+does not actually accept.
+
+**Tokens stay at the parent.** With `QVT_DISTRIBUTE_MODE=wl1x` (the default) the
+new roster is seeded with WL1X only. Splitting a dozen token types across ten
+wallets hands every wallet a bag too small to sell — the fragmentation that
+stalls a fleet, recreated on day one.
+
+### Automatic rotation — `QVT_AUTO_ROTATE=true`
+
+With it on, the bot runs the whole cycle itself. Nobody needs to touch the server:
+
+| situation at start-up | what the bot does |
+|---|---|
+| epoch expired | sweep → verify → retire → new roster → seed → trade |
+| epoch `draining` (a previous run died mid-sweep) | finish the sweep, then as above |
+| live roster not yet seeded | seed it, then trade |
+| parent can't fund a tradeable roster | **wait**, re-checking every `QVT_FUND_POLL_MS` (5 min) |
+| no epoch at all | create one, then seed |
+
+When an epoch expires **mid-run** the bot exits cleanly and pm2 restarts it
+(after `restart_delay`) straight into the cycle above. Because the process has
+been up far longer than `min_uptime`, this does not count towards pm2's crash
+limit.
+
+**Funding while it waits.** A roster is only seeded once every wallet can get at
+least `QVT_SEED_MIN_WL1X` — by default `floor + poolsPerWallet × minTrade /
+inventoryTarget`, which is 1.55 WL1X with floor 0.05, minTrade 0.25 and 3 pools.
+Below that the fleet seizes up within hours, so the bot waits instead and logs
+exactly how much to send:
+
+```
+epoch 15: parent holds 2.5500 WL1X — enough for 0.2295/wallet, but a tradeable
+roster needs 1.5500. Send ~14.67 WL1X to 0x1471…d3b2; re-checking every 5 min
+```
+
+Send it, and trading resumes on the next check — no restart.
+
+Every step is safe to repeat: a draining epoch is re-swept, and seeding tops each
+wallet up to its share rather than paying it again, so a restart at any point
+simply carries on.
+
+Auto-rotation needs the execution gate open (it moves real funds) and never runs
+in a dry run.
 
 ## Two factories, two routers
 

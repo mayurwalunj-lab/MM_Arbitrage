@@ -8,7 +8,9 @@
 //   node qdex/volume/cli.js epoch:new [--force]   generate 10 fresh wallets (offline)
 //   node qdex/volume/cli.js fund      [--execute] parent -> sub-wallets (WL1X + gas)
 //   node qdex/volume/cli.js sweep     [--execute] sub-wallets -> parent, IN KIND
-//   node qdex/volume/cli.js rotate    [--execute] sweep -> retire -> new epoch -> distribute
+//   node qdex/volume/cli.js rotate    [--execute] sweep -> VERIFY empty -> retire -> new epoch -> seed
+//   node qdex/volume/cli.js seed      [--execute] top the live roster up from the parent
+//   node qdex/volume/cli.js sweep --epoch N [--execute]   recover leftovers from any roster, even a retired one
 //   node qdex/volume/cli.js consolidate [--execute] sell every token bag back to WL1X
 //   node qdex/volume/cli.js export --epoch N --idx I    decrypt one private key
 //   node qdex/volume/cli.js keygen-secret          print a fresh QVT_KEY_ENCRYPTION_KEY
@@ -26,6 +28,7 @@ const epochMod = require('./epoch');
 const walletsMod = require('./wallets');
 const funding = require('./funding');
 const poolsMod = require('./pools');
+const rotate = require('./rotate');
 const cryptoMod = require('./crypto');
 const { NonceManager } = require('./nonces');
 
@@ -109,29 +112,41 @@ async function cmdFund(config) {
 async function cmdSweep(config) {
   await db.init();
   const { provider, execute } = await withChain(config);
-  const e = await epochMod.current();
-  if (!e) throw new Error('no active epoch');
-  const signers = await epochMod.loadSigners({ config, epochId: e.id, provider });
+  // --epoch N sweeps a specific roster — including a RETIRED one, to recover
+  // what an older, thresholded sweep left behind. It stays retired.
+  const want = arg('--epoch');
+  const e = want ? await db.getEpoch(Number(want)) : await epochMod.current();
+  if (!e) throw new Error(want ? `epoch ${want} not found` : 'no active epoch');
   const parent = walletsMod.parentSigner(config, provider);
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
-  const record = mkRecord(e.id, execute);
-  const valueBag = await bagValuer({ provider, config, tokenMeta });
-
-  // Only mutate state when actually sweeping. A dry run that marks the epoch
-  // 'draining' leaves the bot refusing to trade until someone notices and
-  // reverses it by hand — simulation must never change what is stored.
-  if (execute) await db.setEpochStatus(e.id, 'draining', 'sweep started');
-  log(`sweeping ${signers.length} wallets to ${parent.address} IN KIND (no swaps) — ${execute ? 'LIVE' : 'DRY-RUN'}`);
-  if (config.sweepMinWl1x > 0) log(`  leaving bags worth under ${config.sweepMinWl1x} WL1X behind (QVT_SWEEP_MIN_WL1X)`);
-  let dustBags = 0, dustWl1x = 0;
-  for (const s of signers) {
-    const snap = await walletsMod.snapshot({ provider, address: s.address, config, tokenMeta });
-    const moved = await funding.sweepWallet({ provider, signer: s, parent, snapshot: snap, config, execute, record, log, nonces, valueBag });
-    for (const d of moved.abandoned || []) { dustBags++; dustWl1x += d.worth; }
-    if (execute) await db.markWallet(e.id, s.idx, 'swept', moved);
+  const r = await rotate.sweepAndVerify({ config, provider, epoch: e, parent, tokenMeta, execute, log, nonces, record: mkRecord(e.id, execute) });
+  if (r.dryRun) log('sweep DRY-RUN complete — nothing was sent');
+  else if (r.ok) log(`sweep complete — epoch ${e.id} verified empty`);
+  else {
+    log(`sweep INCOMPLETE — epoch ${e.id} still holds funds${e.status === 'retired' ? '' : " and stays 'draining'"}; run it again`);
+    process.exitCode = 2;
   }
-  log(`sweep complete — ${dustBags} dust bags left behind (~${dustWl1x.toFixed(4)} WL1X)`);
-  return e;
+  return { epoch: e, result: r };
+}
+
+// Seed the live roster from the parent. Tops each unfunded wallet up to an even
+// share — safe to repeat, and it refuses to seed a roster too thin to trade.
+async function cmdSeed(config) {
+  await db.init();
+  const { provider, execute } = await withChain(config);
+  const e = await epochMod.current();
+  if (!e) throw new Error('no active epoch');
+  const parent = walletsMod.parentSigner(config, provider);
+  const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
+  const r = await rotate.seedRoster({ config, provider, epoch: e, parent, tokenMeta, execute, log, nonces, record: mkRecord(e.id, execute) });
+  if (r.waitingForFunds) {
+    log(`not seeding: the parent holds ${r.parentWl1x.toFixed(4)} WL1X, enough for ${r.perWallet.toFixed(4)} per wallet;`);
+    log(`a tradeable roster needs ${r.target.toFixed(4)}. Send ~${r.shortfall.toFixed(2)} WL1X to ${parent.address} and re-run.`);
+    process.exitCode = 3;
+  } else if (r.ok) {
+    log(r.seeded ? `seeded ${r.seeded} wallet(s)` : 'every wallet in this roster is already funded');
+  }
+  return r;
 }
 
 // Drain every wallet's token bags back to WL1X in one pass.
@@ -147,27 +162,6 @@ async function cmdSweep(config) {
 // It sells largest-first so an interrupted run still recovers most of the value,
 // and it does NOT touch the epoch status — unlike `sweep`, nothing is being
 // retired here; the wallets keep trading afterwards.
-// Price every pool token in WL1X once, so the sweep can distinguish a bag worth
-// moving from one worth abandoning. A pool that will not load yields no price,
-// and a bag it cannot value is swept rather than dropped — the conservative way
-// round, since abandoning a balance is irreversible and moving one is merely
-// a wasted transfer.
-async function bagValuer({ provider, config, tokenMeta }) {
-  const px = new Map();
-  for (const pc of config.pools) {
-    try {
-      const m = await poolsMod.loadMarket({ provider, poolCfg: pc, config, tokenMeta });
-      px.set(pc.token.toLowerCase(), poolsMod.price(m));
-    } catch (e) {
-      log(`WARN ${pc.label} price unavailable — its bags will be swept, not abandoned`);
-    }
-  }
-  return (addr, human) => {
-    const p = px.get(String(addr).toLowerCase());
-    return p > 0 ? human / p : Infinity;
-  };
-}
-
 async function cmdConsolidate(config) {
   await db.init();
   const { provider, execute } = await withChain(config);
@@ -255,43 +249,30 @@ async function cmdConsolidate(config) {
 }
 
 async function cmdRotate(config) {
-  const e = await cmdSweep(config);
-  const { provider, chainId, execute } = await withChain(config);
-  if (execute) {
-    await db.setEpochStatus(e.id, 'retired', 'rotated');
-    log(`epoch ${e.id} retired`);
-  } else {
-    log(`[DRY] would retire epoch ${e.id} — epoch status left untouched`);
+  if (arg('--epoch')) throw new Error('rotate always acts on the live epoch — use `sweep --epoch N` for an old one');
+  // Retire only a roster that is PROVEN empty. The old flow retired on the
+  // strength of "the sweep did not throw", which is how epoch 13 was retired
+  // still holding 106 token bags.
+  const { epoch: old, result } = await cmdSweep(config);
+  if (result.dryRun) {
+    log(`[DRY] would retire epoch ${old.id}, open a fresh roster and seed it — nothing stored`);
+    return;
   }
+  if (!result.ok) throw new Error(`epoch ${old.id} is not empty — not retiring it. Re-run rotate to sweep again.`);
+
+  const { provider, chainId, execute } = await withChain(config);
+  await db.setEpochStatus(old.id, 'retired', 'rotated: verified empty');
+  log(`epoch ${old.id} retired`);
 
   const parent = walletsMod.parentSigner(config, provider);
-
-  // Creating the epoch must be gated on --execute like everything else. Left
-  // ungated a dry run writes a real epoch row and ten real private keys, and —
-  // because the dry run correctly does NOT retire the outgoing epoch — the new
-  // row collides with the single-active-epoch constraint and the command dies
-  // half way through. Simulation must not write.
-  let epochId = null, signers;
-  if (execute) {
-    const res = await epochMod.createEpoch({ config, chainId, parentAddress: parent.address, force: true, log });
-    epochId = res.epochId;
-    signers = await epochMod.loadSigners({ config, epochId, provider });
+  const res = await epochMod.createEpoch({ config, chainId, parentAddress: parent.address, log });
+  log(`epoch ${res.epochId} created`);
+  const r = await cmdSeed(config);
+  if (r && r.waitingForFunds) {
+    log(`rotation done, roster NOT seeded yet. After funding the parent: node qdex/volume/cli.js seed --execute`);
+    log(`(with QVT_AUTO_ROTATE=true the bot seeds it by itself once the parent is funded)`);
   } else {
-    log(`[DRY] would generate a fresh roster of ${config.walletCount} wallets — no epoch and no keys created`);
-    // Placeholders purely so the distribution below can report what it would
-    // send and to how many wallets. They are never signed with.
-    signers = Array.from({ length: config.walletCount },
-      (_, i) => ({ idx: i, address: '0x' + String(i).padStart(40, '0') }));
-  }
-  const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
-
-  log(`seeding the new roster — ${execute ? 'LIVE' : 'DRY-RUN'}`);
-  await funding.distributeInKind({ provider, parent, signers, config, tokenMeta, execute, record: mkRecord(epochId, execute), log, nonces });
-  if (execute) {
-    for (const s of signers) await db.markWallet(epochId, s.idx, 'funded');
-    log(`rotation complete — epoch ${epochId} is now active`);
-  } else {
-    log('rotation DRY-RUN complete — nothing was sent and nothing was stored');
+    log(`rotation complete — epoch ${res.epochId} is live${execute ? '' : ' (dry-run)'}`);
   }
 }
 
@@ -461,6 +442,7 @@ const COMMANDS = {
   fund: cmdFund,
   sweep: cmdSweep,
   rotate: cmdRotate,
+  seed: cmdSeed,
   consolidate: cmdConsolidate,
   export: cmdExport,
   'keygen-secret': async () => {

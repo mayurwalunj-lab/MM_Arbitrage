@@ -32,6 +32,7 @@ const lib = require('../lib');
 const cfgMod = require('./config');
 const db = require('./db');
 const epochMod = require('./epoch');
+const rotate = require('./rotate');
 const walletsMod = require('./wallets');
 const poolsMod = require('./pools');
 const funding = require('./funding');
@@ -154,14 +155,16 @@ async function run() {
 
   if (poolSrc.error) log(`WARNING: could not read pools from the database (${poolSrc.error}) — using .env`);
 
-  const epoch = await epochMod.current();
-  if (!epoch) {
+  const autoRotate = config.autoRotate && execute;
+  let epoch = await epochMod.current();
+  if (!epoch && !autoRotate) {
     console.error('No active epoch. Create one first:  npm run qdex:vol:epoch:new');
     process.exit(1);
   }
 
   config.poolSource = poolSrc.source;
-  const runId = `${config.testTag}-e${epoch.id}-${Date.now().toString(36)}`;
+  const mkRunId = (e) => `${config.testTag}-e${e ? e.id : 'new'}-${Date.now().toString(36)}`;
+  let runId = mkRunId(epoch);
   banner({ config, chainId, gate, execute, epoch, runId });
 
   // Clear a stale stop file so a previous emergency stop does not silently
@@ -181,6 +184,46 @@ async function run() {
   }
   const cleanup = () => guards.releaseLock(config.lockFile);
   process.on('exit', cleanup);
+
+  const stop = new guards.StopController(config, log);
+  stop.installSignalHandlers();
+  // ONE nonce tracker for the whole run. The bot is single-threaded, so a
+  // single instance safely covers every send from every wallet: approvals,
+  // swaps, peer transfers, backstops — and the rotation below, which sends from
+  // the parent. Two trackers for one address is how nonces collide.
+  const nonces = new NonceManager();
+
+  // ---- automatic rotation (QVT_AUTO_ROTATE) ----
+  // Runs under the single-instance lock, so two bots can never rotate at once.
+  // Brings the harness to a live, FUNDED epoch: sweeps and verifies an expired
+  // roster, retires it, opens a fresh one, and seeds it from the parent — or
+  // waits, re-checking the parent, until there is enough to seed a roster that
+  // can actually trade. Every step is repeatable, so a restart part-way through
+  // simply carries on.
+  if (autoRotate) {
+    const recordFor = (epochId) => async (x) => {
+      try { await db.insertTransfer({ ...x, epochId, runId, isDryRun: !execute }); }
+      catch (e) { log(`WARN transfer not recorded: ${String(e.message).slice(0, 100)}`); }
+    };
+    const live = await rotate.ensureLiveEpoch({
+      config, provider, chainId, execute, log, nonces, recordFor,
+      parent: walletsMod.parentSigner(config, provider),
+      tokenMeta: await walletsMod.loadTokenMeta(provider, config),
+      shouldStop: () => stop.shouldStop()
+    });
+    if (!live) {
+      log(`stopped before a live epoch was ready${stop.reason ? ` — ${stop.reason}` : ''}`);
+      stop.removeSignalHandlers();
+      guards.releaseLock(config.lockFile);
+      await db.end().catch(() => {});
+      return;
+    }
+    if (!epoch || live.id !== epoch.id) {
+      epoch = live;
+      runId = mkRunId(epoch);
+      log(`trading on epoch ${epoch.id} (run ${runId})`);
+    }
+  }
 
   const fullRoster = await epochMod.loadSigners({ config, epochId: epoch.id, provider });
   const walletLimit = Number.isFinite(cliWallets) && cliWallets > 0 ? cliWallets : config.activeWallets;
@@ -221,12 +264,6 @@ async function run() {
   markets.forEach((m) => anchors.seedIfAbsent(m.address, poolsMod.price(m)));
 
   const limiter = new guards.RateLimiter(config.maxTxPerHour);
-  const stop = new guards.StopController(config, log);
-  stop.installSignalHandlers();
-  // ONE nonce tracker for the whole run. The bot is single-threaded, so a
-  // single instance safely covers every send from every wallet: approvals,
-  // swaps, peer transfers and backstops alike.
-  const nonces = new NonceManager();
   const sim = new SimLedger();
   // Dry-run against an unfunded roster: assume the fleet has been funded so the
   // run demonstrates real behaviour instead of ten identical "out of gas" skips.
@@ -308,8 +345,17 @@ async function run() {
     // ---- epoch expiry: drain rather than trading past the rotation point ----
     const fresh = await epochMod.current();
     if (epochMod.isExpired(fresh)) {
-      log(`epoch ${fresh.id} has expired — stopping. Rotate with:  npm run qdex:vol:epoch:rotate`);
-      stop.trip('epoch expired');
+      if (autoRotate) {
+        // Everything below is bound to this roster, so hand over to a fresh
+        // process rather than re-wiring it in place: exit cleanly, pm2 restarts
+        // after restart_delay, and start-up rotates. The process has been up far
+        // longer than min_uptime, so this is not counted as a crash restart.
+        log(`epoch ${fresh.id} has expired — exiting so the restart rotates it (QVT_AUTO_ROTATE)`);
+        stop.reason = 'epoch expired — rotating on restart';
+      } else {
+        log(`epoch ${fresh.id} has expired — stopping. Rotate with:  npm run qdex:vol:epoch:rotate`);
+        stop.trip('epoch expired');
+      }
       break;
     }
 
