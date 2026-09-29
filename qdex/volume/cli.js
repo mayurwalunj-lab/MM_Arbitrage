@@ -10,6 +10,7 @@
 //   node qdex/volume/cli.js sweep     [--execute] sub-wallets -> parent, IN KIND
 //   node qdex/volume/cli.js rotate    [--execute] sweep -> VERIFY empty -> retire -> new epoch -> seed
 //   node qdex/volume/cli.js seed      [--execute] top the live roster up from the parent
+//   node qdex/volume/cli.js consolidate --parent [--execute]  sell the parent's swept tokens back to WL1X
 //   node qdex/volume/cli.js sweep --epoch N [--execute]   recover leftovers from any roster, even a retired one
 //   node qdex/volume/cli.js consolidate [--execute] sell every token bag back to WL1X
 //   node qdex/volume/cli.js export --epoch N --idx I    decrypt one private key
@@ -167,6 +168,25 @@ async function cmdConsolidate(config) {
   const { provider, execute } = await withChain(config);
   const e = await epochMod.current();
   if (!e) throw new Error('no active epoch');
+  // --parent drains the PARENT's token pile instead of the roster's. The sweep is
+  // in kind, so every rotation leaves the previous roster's positions there as
+  // tokens that a WL1X-only distribution cannot hand back out.
+  if (has('--parent')) {
+    const parent = walletsMod.parentSigner(config, provider);
+    const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
+    const r = await rotate.consolidateWallet({
+      provider, signer: parent, walletIdx: null, config, tokenMeta, execute, log, nonces,
+      recordTrade: async (t) => db.insertTrade({ ...t, epochId: e.id, runId, isDryRun: !execute }),
+      minBagWl1x: Number(arg('--min', config.consolidateMinWl1x)),
+      maxCostBps: Number(arg('--max-cost-bps', config.consolidateMaxCostBps)),
+      delayMs: Number(arg('--delay-ms', 1500)),
+      reason: 'parent consolidation: tokens back to WL1X'
+    });
+    log(`parent: ${r.sold} sold, ${r.skipped} skipped, ${r.failed} failed — ` +
+      `~${r.recovered.toFixed(4)} WL1X recovered, ${r.dustLeft.toFixed(4)} left as dust`);
+    if (!execute) log('re-run with --execute to actually sell.');
+    return;
+  }
   const signers = await epochMod.loadSigners({ config, epochId: e.id, provider });
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
 

@@ -48,6 +48,81 @@ async function bagValuer({ provider, config, tokenMeta, log = () => {} }) {
   };
 }
 
+// Sell a wallet's token bags back to WL1X. Used for a fragmented roster and for
+// the PARENT, which accumulates tokens every rotation: the sweep is in kind, so
+// a retired roster's positions arrive as tokens, and a WL1X-only distribution
+// cannot hand them back out. Left alone they are dead weight — that is how
+// epoch 16 ended up unseeded with 7.58 WL1X of the fleet's own value parked at
+// the parent.
+//
+// Bags below minBagWl1x are left: under some size the fees exceed the bag.
+async function consolidateWallet({ provider, signer, walletIdx, config, tokenMeta, execute, log, nonces,
+                                  recordTrade = async () => {}, minBagWl1x, maxCostBps, delayMs = 1500,
+                                  reason = 'consolidation: token bag back to WL1X' }) {
+  const label = walletIdx === null || walletIdx === undefined ? 'parent' : 'w' + pad2(walletIdx);
+  const out = { sold: 0, skipped: 0, failed: 0, recovered: 0, dustLeft: 0 };
+  const snap = await walletsMod.snapshot({ provider, address: signer.address, config, tokenMeta });
+
+  const bags = [];
+  for (const pc of config.pools) {
+    const t = snap.tokens[pc.token.toLowerCase()];
+    if (!t || !(t.raw > 0n)) continue;
+    let mk;
+    try { mk = await poolsMod.loadMarket({ provider, poolCfg: pc, config, tokenMeta }); }
+    catch { log(`WARN ${pc.label} unreadable — its bag is left in place`); out.skipped++; continue; }
+    const px = poolsMod.price(mk);
+    bags.push({ cfg: pc, tokenHuman: t.human, valueWl1x: px > 0 ? t.human / px : 0 });
+  }
+  bags.sort((a, b) => b.valueWl1x - a.valueWl1x);
+  const target = bags.filter((b) => b.valueWl1x >= minBagWl1x);
+  out.dustLeft = bags.filter((b) => b.valueWl1x < minBagWl1x).reduce((a, b) => a + b.valueWl1x, 0);
+  if (!target.length) return out;
+
+  log(`${label}: ${snap.wl1x.toFixed(4)} WL1X, ${bags.length} bags — selling ${target.length}, leaving ${bags.length - target.length} as dust`);
+  // Freeing stranded value is worth paying more for than an ordinary trade, so
+  // the consolidation ceiling replaces the normal cost cap for this run only.
+  const cfg = { ...config, maxCostBps: maxCostBps };
+
+  for (const b of target) {
+    // Re-read: earlier sells in this same run have moved the price.
+    let mk;
+    try { mk = await poolsMod.loadMarket({ provider, poolCfg: b.cfg, config, tokenMeta }); }
+    catch { out.skipped++; continue; }
+    const px = poolsMod.price(mk);
+    if (!(px > 0)) { out.skipped++; continue; }
+    // 0.999: tokenHuman/px multiplied back by px lands ABOVE the real balance for
+    // about half of all bags, and transferFrom then reverts. Leave headroom.
+    const sizeWl1x = (b.tokenHuman * 0.999) / px;
+    const q = poolsMod.quote({ market: mk, side: 'sell', sizeWl1x, slippageBps: config.slippageBps });
+    if (!q) { log(`     ${b.cfg.label} unquotable, left in place`); out.skipped++; continue; }
+
+    const row = { walletIdx: walletIdx ?? null, walletAddress: signer.address,
+      poolAddress: mk.address, poolLabel: mk.cfg.label, side: 'sell', priceBefore: px, reason };
+    if (!execute) {
+      log(`     [DRY] ${b.cfg.label} sell ${b.valueWl1x.toFixed(4)} WL1X-worth`);
+      out.sold++; out.recovered += b.valueWl1x;
+      continue;
+    }
+    try {
+      const rc = await poolsMod.executeSwap({ market: mk, signer, side: 'sell', quote: q, config: cfg, log, nonces });
+      await recordTrade({ ...row, status: 'executed', amountIn: q.amountInHuman, amountInSymbol: q.tokenIn.symbol,
+        amountOut: q.amountOutHuman, amountOutSymbol: q.tokenOut.symbol, notionalWl1x: q.notionalWl1x,
+        execPrice: q.execPrice, costBps: q.effectiveCostBps ?? null, txHash: rc?.hash ?? null,
+        blockNumber: rc?.blockNumber != null ? Number(rc.blockNumber) : null });
+      log(`     ${b.cfg.label} sold ${b.valueWl1x.toFixed(4)} WL1X-worth  ${rc?.hash ?? ''}`);
+      out.sold++; out.recovered += q.notionalWl1x || b.valueWl1x;
+    } catch (err) {
+      const why = String(err.shortMessage || err.message).slice(0, 120);
+      await recordTrade({ ...row, status: err.preflightRejected ? 'skipped' : 'failed', reason: `${reason}: ${why}` }).catch(() => {});
+      log(`     ${b.cfg.label} NOT sold: ${why}`);
+      if (err.preflightRejected) out.skipped++; else out.failed++;
+      if (nonces) nonces.reset(signer);
+    }
+    if (delayMs) await sleep(delayMs);
+  }
+  return out;
+}
+
 // What a wallet still holds that a sweep should have removed. Native gas is
 // reported but never counted: the drain must leave enough to pay for itself.
 function leftovers(snapshot, valueBag, allowWl1x) {
@@ -129,14 +204,22 @@ function seedTarget(config) {
 // Share the parent's WL1X across the wallets that are not yet funded, as a
 // TOP-UP to a fixed per-wallet level. Re-running sends only the shortfall, so a
 // crash half way through never pays anyone twice.
-function planSeed({ parentWl1x, unfundedBalances, reservePct }) {
+function planSeed({ parentWl1x, unfundedBalances, reservePct, target = 0 }) {
   const keep = 1 - (reservePct || 0) / 100;
   const n = unfundedBalances.length;
-  if (!n) return { perWallet: 0, needFromParent: 0 };
+  if (!n) return { perWallet: 0, count: 0, needFromParent: 0 };
   const alreadyThere = unfundedBalances.reduce((a, b) => a + b, 0);
-  const perWallet = (parentWl1x * keep + alreadyThere) / n;
-  const needFromParent = unfundedBalances.reduce((a, b) => a + Math.max(0, perWallet - b), 0);
-  return { perWallet, needFromParent };
+  const avail = parentWl1x * keep + alreadyThere;
+  // Fund FEWER wallets properly rather than every wallet too thinly. Eight
+  // wallets that can trade beat ten that cannot — and beat waiting, which is
+  // what left epoch 16 idle for five days. Whatever is available is split across
+  // the wallets that can be funded, so nothing sits back at the parent.
+  let count = n;
+  if (target > 0 && avail / n < target) count = Math.floor(avail / target);
+  if (count < 1) return { perWallet: avail / n, count: 0, needFromParent: 0, avail };
+  const perWallet = avail / count;
+  const needFromParent = unfundedBalances.slice(0, count).reduce((a, b) => a + Math.max(0, perWallet - b), 0);
+  return { perWallet, count, needFromParent, avail };
 }
 
 async function seedRoster({ config, provider, epoch, parent, tokenMeta, execute, log, nonces, record, passes = 4,
@@ -155,10 +238,10 @@ async function seedRoster({ config, provider, epoch, parent, tokenMeta, execute,
   const parentWl1x = await balOf(parent.address);
   const balances = [];
   for (const s of signers) balances.push(await balOf(s.address));
-  const plan = planSeed({ parentWl1x, unfundedBalances: balances, reservePct: config.parentReservePct });
   const target = seedTarget(config);
+  const plan = planSeed({ parentWl1x, unfundedBalances: balances, reservePct: config.parentReservePct, target });
 
-  if (plan.perWallet < target) {
+  if (!plan.count) {
     // perWallet = (parent*keep + alreadyThere) / n  >=  target
     //   =>  parent >= (target*n - alreadyThere) / keep
     const keep = 1 - (config.parentReservePct || 0) / 100;
@@ -170,13 +253,19 @@ async function seedRoster({ config, provider, epoch, parent, tokenMeta, execute,
     };
   }
 
-  log(`epoch ${epoch.id}: seeding ${signers.length} wallet(s) to ${plan.perWallet.toFixed(4)} WL1X + ${config.fundGasNative} L1X each — ${execute ? 'LIVE' : 'DRY-RUN'}`);
-  if (!execute) return { ok: false, dryRun: true, perWallet: plan.perWallet };
+  const chosen = signers.slice(0, plan.count);
+  log(`epoch ${epoch.id}: seeding ${chosen.length} of ${signers.length} unfunded wallet(s) to ` +
+    `${plan.perWallet.toFixed(4)} WL1X + ${config.fundGasNative} L1X each — ${execute ? 'LIVE' : 'DRY-RUN'}`);
+  if (chosen.length < signers.length) {
+    log(`  the parent cannot give all ${signers.length} the ${target.toFixed(4)} a tradeable wallet needs, ` +
+      `so ${signers.length - chosen.length} stay unfunded and will be seeded when there is more`);
+  }
+  if (!execute) return { ok: false, dryRun: true, perWallet: plan.perWallet, count: plan.count };
 
   // fundWallets tops up to config.fundWl1xPerWallet — point it at this roster's
   // share for the duration, without touching the caller's config.
   const cfg = { ...config, fundWl1xPerWallet: plan.perWallet };
-  let pending = signers;
+  let pending = chosen;
   for (let pass = 1; pass <= passes && pending.length; pass++) {
     await funding.fundWallets({ provider, parent, signers: pending, config: cfg, execute, record, log, nonces });
     const still = [];
@@ -199,10 +288,10 @@ async function seedRoster({ config, provider, epoch, parent, tokenMeta, execute,
   }
   if (pending.length) {
     log(`epoch ${epoch.id}: ${pending.length} wallet(s) still short after ${passes} passes — they will be retried on the next start`);
-    return { ok: false, seeded: signers.length - pending.length, pending: pending.map((s) => s.idx) };
+    return { ok: false, seeded: chosen.length - pending.length, pending: pending.map((s) => s.idx) };
   }
-  log(`epoch ${epoch.id}: all ${signers.length} wallet(s) seeded`);
-  return { ok: true, seeded: signers.length };
+  log(`epoch ${epoch.id}: all ${chosen.length} wallet(s) seeded`);
+  return { ok: true, seeded: chosen.length, partial: signers.length - chosen.length };
 }
 
 // Drive the lifecycle until there is a live, funded epoch — or until told to
@@ -220,6 +309,7 @@ async function ensureLiveEpoch({ config, provider, chainId, parent, tokenMeta, e
     return !shouldStop();
   };
 
+  let parentRecycled = false;
   for (;;) {
     if (shouldStop()) return null;
     let epoch = await epochMod.current();
@@ -249,7 +339,29 @@ async function ensureLiveEpoch({ config, provider, chainId, parent, tokenMeta, e
       continue;
     }
 
-    // 3. live epoch with unfunded wallets: seed it, or wait for the parent
+    // 3. recycle the parent's token pile into WL1X before judging whether it can
+    //    seed. These are the previous roster's positions, swept in kind; as
+    //    tokens they cannot be distributed and are simply dead capital.
+    if (execute && config.rotateConsolidateParent && !parentRecycled) {
+      parentRecycled = true;
+      const valueBag = await bagValuer({ provider, config, tokenMeta, log });
+      const psnap = await walletsMod.snapshot({ provider, address: parent.address, config, tokenMeta });
+      const tokenValue = Object.entries(psnap.tokens)
+        .filter(([, t]) => t.raw > 0n)
+        .reduce((a, [addr, t]) => { const v = valueBag(addr, t.human); return a + (Number.isFinite(v) ? v : 0); }, 0);
+      if (tokenValue >= config.consolidateMinWl1x) {
+        log(`parent holds ${tokenValue.toFixed(4)} WL1X of tokens from the last sweep — selling them back to WL1X`);
+        const r = await consolidateWallet({
+          provider, signer: parent, walletIdx: null, config, tokenMeta, execute, log, nonces,
+          recordTrade: recordFor(epoch.id), minBagWl1x: config.consolidateMinWl1x,
+          maxCostBps: config.consolidateMaxCostBps, reason: 'rotation: recycling parent tokens to WL1X'
+        });
+        log(`parent recycled: ${r.sold} sold, ${r.recovered.toFixed(4)} WL1X recovered, ${r.dustLeft.toFixed(4)} left as dust`);
+        continue;   // re-evaluate seeding with the WL1X now available
+      }
+    }
+
+    // 4. live epoch with unfunded wallets: seed it, or wait for the parent
     const s = await seedRoster({ config, provider, epoch, parent, tokenMeta, execute, log, nonces, record: recordFor(epoch.id), ...seedOpts });
     if (s.waitingForFunds) {
       log(`epoch ${epoch.id}: parent holds ${s.parentWl1x.toFixed(4)} WL1X — enough for ${s.perWallet.toFixed(4)}/wallet, ` +
@@ -268,4 +380,4 @@ async function ensureLiveEpoch({ config, provider, chainId, parent, tokenMeta, e
   }
 }
 
-module.exports = { bagValuer, leftovers, sweepAndVerify, seedTarget, planSeed, seedRoster, ensureLiveEpoch };
+module.exports = { bagValuer, leftovers, consolidateWallet, sweepAndVerify, seedTarget, planSeed, seedRoster, ensureLiveEpoch };

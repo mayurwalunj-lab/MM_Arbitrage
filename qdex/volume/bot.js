@@ -225,7 +225,19 @@ async function run() {
     }
   }
 
-  const fullRoster = await epochMod.loadSigners({ config, epochId: epoch.id, provider });
+  let fullRoster = await epochMod.loadSigners({ config, epochId: epoch.id, provider });
+  // Trade only the wallets that were actually seeded. When the parent cannot fund
+  // the whole roster it funds FEWER wallets properly rather than all of them too
+  // thinly — the unfunded ones would otherwise be picked in turn and skip every
+  // time, burying real activity in noise. If nothing is marked funded, the roster
+  // was funded some other way, so use all of it.
+  const walletRows = await db.getWallets(epoch.id);
+  const seeded = new Set(walletRows.filter((r) => r.funded_at).map((r) => r.idx));
+  if (seeded.size && seeded.size < fullRoster.length) {
+    const skipped = fullRoster.filter((s) => !seeded.has(s.idx)).map((s) => 'w' + pad2(s.idx));
+    fullRoster = fullRoster.filter((s) => seeded.has(s.idx));
+    log(`trading ${fullRoster.length} seeded wallet(s); ${skipped.length} not yet funded and excluded: ${skipped.join(' ')}`);
+  }
   const walletLimit = Number.isFinite(cliWallets) && cliWallets > 0 ? cliWallets : config.activeWallets;
   const wsel = guards.applyWalletLimit(fullRoster, walletLimit);
   const signers = wsel.signers;

@@ -242,10 +242,28 @@ Native gas is swept last, less `QVT_NATIVE_SWEEP_RESERVE` (0.01 L1X) so the
 drain can pay for itself — this chain reports a 1-wei gas price that the node
 does not actually accept.
 
-**Tokens stay at the parent.** With `QVT_DISTRIBUTE_MODE=wl1x` (the default) the
-new roster is seeded with WL1X only. Splitting a dozen token types across ten
-wallets hands every wallet a bag too small to sell — the fragmentation that
-stalls a fleet, recreated on day one.
+**Tokens stay at the parent, then get recycled.** With `QVT_DISTRIBUTE_MODE=wl1x`
+(the default) the new roster is seeded with WL1X only — splitting a dozen token
+types across ten wallets hands every wallet a bag too small to sell, which is the
+fragmentation that stalls a fleet, recreated on day one.
+
+But the sweep is in kind, so the previous roster's positions arrive as tokens,
+and a WL1X-only distribution cannot hand them back out. Left alone they are dead
+capital: epoch 16 sat unseeded for five days holding 6.5 WL1X while **7.6 WL1X of
+the fleet's own value** was parked at the parent as 12 token bags.
+`QVT_ROTATE_CONSOLIDATE_PARENT` (default on) sells them back to WL1X before
+seeding, so each rotation puts that value back to work. By hand:
+
+```bash
+node qdex/volume/cli.js consolidate --parent --execute
+```
+
+**A thin parent funds fewer wallets, it does not idle.** If the parent cannot give
+every unfunded wallet `QVT_SEED_MIN_WL1X`, it fully funds as many as it can and
+splits everything available across those — eight wallets that can trade beat ten
+that cannot, and both beat waiting. The rest stay unfunded and are seeded when
+there is more. The bot trades only the seeded wallets, so the unfunded ones do not
+fill the log with skips.
 
 ### Automatic rotation — `QVT_AUTO_ROTATE=true`
 

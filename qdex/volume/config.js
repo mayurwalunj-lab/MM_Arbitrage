@@ -207,6 +207,12 @@ function getConfig() {
     // float at which a position can reach minTrade and still be sold. Seeding
     // below that produces a fleet that seizes up within hours.
     seedMinWl1x: envNum('QVT_SEED_MIN_WL1X', NaN),
+    // The sweep is in kind, so a retired roster's positions land at the parent as
+    // TOKENS, and a WL1X-only distribution cannot hand them back out. Without
+    // this they accumulate every rotation and are never reused — epoch 16 sat
+    // unseeded for five days with 7.58 WL1X of the fleet's own value stuck at the
+    // parent as tokens. Selling them back to WL1X before seeding recycles it.
+    rotateConsolidateParent: envBool('QVT_ROTATE_CONSOLIDATE_PARENT', true),
     // How often an underfunded bot re-checks the parent. Send WL1X to the parent
     // and trading resumes on the next check — no restart needed.
     fundPollMs: envNum('QVT_FUND_POLL_MS', 300000),

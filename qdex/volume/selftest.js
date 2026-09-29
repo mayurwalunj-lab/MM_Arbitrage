@@ -612,6 +612,33 @@ test('seeding is a top-up: already-funded amounts are not paid twice', () => {
   assert.ok(plan.needFromParent <= 18 * 0.9 + 1e-9, 'never asks the parent for more than it can give');
 });
 
+test('a thin parent funds FEWER wallets properly rather than all of them badly', () => {
+  // The live case: 6.5438 WL1X could not give ten wallets the 1.55 each they need,
+  // so the bot waited and the fleet sat idle for five days. Three funded wallets
+  // that can trade is strictly better.
+  const plan = rotateMod.planSeed({ parentWl1x: 6.5438, unfundedBalances: Array(10).fill(0), reservePct: 10, target: 1.55 });
+  assert.strictEqual(plan.count, 3);
+  assert.ok(plan.perWallet >= 1.55, `each funded wallet must clear the target, got ${plan.perWallet}`);
+  // everything available is used, nothing is left idling at the parent
+  assert.ok(Math.abs(plan.perWallet * plan.count - 6.5438 * 0.9) < 1e-9);
+});
+
+test('a parent that cannot fund even one wallet reports nothing to seed', () => {
+  const plan = rotateMod.planSeed({ parentWl1x: 1, unfundedBalances: Array(10).fill(0), reservePct: 10, target: 1.55 });
+  assert.strictEqual(plan.count, 0, 'below one full wallet it must wait, not dribble');
+});
+
+test('a healthy parent still funds the whole roster', () => {
+  const plan = rotateMod.planSeed({ parentWl1x: 22.55, unfundedBalances: Array(10).fill(0), reservePct: 10, target: 1.55 });
+  assert.strictEqual(plan.count, 10);
+  assert.ok(plan.perWallet > 2, `got ${plan.perWallet}`);
+});
+
+test('no target given means split across everyone (old behaviour preserved)', () => {
+  const plan = rotateMod.planSeed({ parentWl1x: 1, unfundedBalances: Array(10).fill(0), reservePct: 10 });
+  assert.strictEqual(plan.count, 10);
+});
+
 // --- the lifecycle, with the chain and database replaced by an in-memory model
 function lifecycleHarness({ epochs, holdings = {}, parentWl1x = 0, sweepWorks = true, fundWorks = true }) {
   const dbm = require('./db'), ep = require('./epoch'), wal = require('./wallets'), fund = require('./funding');
@@ -695,6 +722,17 @@ serialTest('a roster that is NOT empty is never retired', async () => {
     assert.strictEqual(h.state.epochs[0].status, 'draining', 'it stays draining so the next run resumes');
     assert.ok(h.state.calls.filter((c) => c === 'sweep').length >= 2, 'it must keep re-sweeping');
     assert.strictEqual(h.state.created, 0, 'no new roster may open while the old one holds funds');
+  } finally { h.restore(); }
+});
+
+serialTest('a parent that can fund SOME wallets seeds those, rather than idling', async () => {
+  // 1.4 WL1X, target 0.55: enough for two of the two wallets in this harness.
+  const h = lifecycleHarness({ epochs: [{ id: 21, status: 'active' }], parentWl1x: 1.4 });
+  try {
+    const live = await h.run({ shouldStop: () => false });
+    assert.ok(live && live.id === 21);
+    assert.ok(h.state.calls.includes('fund'), 'it must actually seed rather than wait');
+    assert.strictEqual(h.state.wallets[21].filter((w) => w.funded_at).length, 2);
   } finally { h.restore(); }
 });
 
