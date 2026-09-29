@@ -141,9 +141,15 @@ async function cmdSeed(config) {
   const tokenMeta = await walletsMod.loadTokenMeta(provider, config);
   const r = await rotate.seedRoster({ config, provider, epoch: e, parent, tokenMeta, execute, log, nonces, record: mkRecord(e.id, execute) });
   if (r.waitingForFunds) {
+    const rows = await db.getWallets(e.id);
+    const ready = rows.filter((x) => x.funded_at).length;
     log(`not seeding: the parent holds ${r.parentWl1x.toFixed(4)} WL1X, enough for ${r.perWallet.toFixed(4)} per wallet;`);
     log(`a tradeable roster needs ${r.target.toFixed(4)}. Send ~${r.shortfall.toFixed(2)} WL1X to ${parent.address} and re-run.`);
-    process.exitCode = 3;
+    if (ready > 0) log(`${ready} of ${rows.length} wallet(s) are already seeded — the bot will trade with those.`);
+    // Only a total failure to seed is an error. A roster that is partly seeded is
+    // the intended outcome of a thin parent, and must not break a command chain
+    // like `seed --execute && pm2 restart` — which is how the bot was left down.
+    else process.exitCode = 3;
   } else if (r.ok) {
     log(r.seeded ? `seeded ${r.seeded} wallet(s)` : 'every wallet in this roster is already funded');
   }

@@ -725,6 +725,28 @@ serialTest('a roster that is NOT empty is never retired', async () => {
   } finally { h.restore(); }
 });
 
+serialTest('a partly seeded roster TRADES rather than waiting for the stragglers', async () => {
+  // Epoch 16: seven wallets funded and ready, the parent too thin for the last
+  // three, and the bot waited — doing nothing with 12.3 WL1X sitting ready.
+  const h = lifecycleHarness({ epochs: [{ id: 22, status: 'active' }], parentWl1x: 0.1 });
+  h.state.wallets[22] = [{ idx: 0, address: '0xE22W0', funded_at: new Date() }, { idx: 1, address: '0xE22W1', funded_at: null }];
+  let checks = 0;
+  try {
+    const live = await h.run({ shouldStop: () => ++checks > 30 });
+    assert.ok(live && live.id === 22, 'it must proceed to trade, not wait');
+    assert.ok(!h.state.calls.includes('fund'), 'and must not seed the straggler too thinly');
+  } finally { h.restore(); }
+});
+
+serialTest('a roster with NOTHING seeded still waits', async () => {
+  const h = lifecycleHarness({ epochs: [{ id: 23, status: 'active' }], parentWl1x: 0.1 });
+  let checks = 0;
+  try {
+    const live = await h.run({ shouldStop: () => ++checks > 20 });
+    assert.strictEqual(live, null, 'with no funded wallet there is nothing to trade with');
+  } finally { h.restore(); }
+});
+
 serialTest('a parent that can fund SOME wallets seeds those, rather than idling', async () => {
   // 1.4 WL1X, target 0.55: enough for two of the two wallets in this harness.
   const h = lifecycleHarness({ epochs: [{ id: 21, status: 'active' }], parentWl1x: 1.4 });

@@ -364,6 +364,19 @@ async function ensureLiveEpoch({ config, provider, chainId, parent, tokenMeta, e
     // 4. live epoch with unfunded wallets: seed it, or wait for the parent
     const s = await seedRoster({ config, provider, epoch, parent, tokenMeta, execute, log, nonces, record: recordFor(epoch.id), ...seedOpts });
     if (s.waitingForFunds) {
+      // If ANY wallet is already seeded, trade with those. Waiting for the
+      // stragglers while a funded majority sits idle is strictly worse than
+      // trading — and it is what left epoch 16 doing nothing with seven funded
+      // wallets, because the parent could not afford the last three. Only a
+      // roster with nothing seeded is worth waiting on.
+      const rows = await db.getWallets(epoch.id);
+      const ready = rows.filter((r) => r.funded_at).length;
+      if (ready > 0) {
+        log(`epoch ${epoch.id}: trading with the ${ready} seeded wallet(s); ${rows.length - ready} still unfunded ` +
+          `(parent has ${s.parentWl1x.toFixed(4)} WL1X, a wallet needs ${s.target.toFixed(4)}) — ` +
+          `send WL1X to ${parent.address} and they are seeded on the next restart`);
+        return epoch;
+      }
       log(`epoch ${epoch.id}: parent holds ${s.parentWl1x.toFixed(4)} WL1X — enough for ${s.perWallet.toFixed(4)}/wallet, ` +
         `but a tradeable roster needs ${s.target.toFixed(4)}. Send ~${s.shortfall.toFixed(2)} WL1X to ${parent.address}; ` +
         `re-checking every ${Math.round(config.fundPollMs / 60000)} min`);
