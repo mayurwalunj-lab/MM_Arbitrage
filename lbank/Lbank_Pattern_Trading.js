@@ -740,8 +740,12 @@ async function runLiveEngine() {
             const fenceLo = _bandCfg ? _bandCfg.absMin : CONFIG.hardFloorPrice;
             const fenceHi = _bandCfg ? _bandCfg.absMax : CONFIG.hardResistancePrice;
             if (bandFrozen) {
-                broadcastLog(`❄️ Band frozen (${bandReason}) — standing down; treasury handles it.`, 'warn');
-                await delay(5000); continue;
+                // A frozen band means "don't chase the DEX up", NOT "stop volume".
+                // The engine already holds the center frozen; we KEEP TRADING for
+                // volume at the current CEX market (the fence-bounded zone below).
+                // The treasury pulls the DEX gap closed separately. Standing down
+                // here was zeroing out volume for the entire freeze.
+                broadcastLog(`❄️ Band frozen (${bandReason}) — holding center, still trading volume at the CEX market.`, 'info');
             }
             if (bestAsk < fenceLo) {
                 broadcastLog(`🛑 GATEKEEPER: Best Ask (${bestAsk.toFixed(4)}) < floor ($${Number(fenceLo).toFixed(4)}). Waiting.`, 'warn');
