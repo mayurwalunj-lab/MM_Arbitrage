@@ -492,6 +492,17 @@ async function fetchOrderSafe(bot, orderId, pair) {
     try { return await bot.fetchOrder(orderId, pair); } catch (e) { return null; }
 }
 
+// A just-placed order can take a moment to become queryable; retry briefly before
+// giving up, so "not visible yet" is not mistaken for "gone".
+async function fetchFreshOrder(bot, orderId, pair, attempts = 3, gapMs = 150) {
+    for (let i = 0; i < attempts; i++) {
+        const order = await fetchOrderSafe(bot, orderId, pair);
+        if (order) return order;
+        if (i < attempts - 1) await delay(gapMs);
+    }
+    return null;
+}
+
 async function waitForBothFills({ makerBot, takerBot, makerOrderId, takerOrderId, pair, makerAmount, takerAmount, timeoutMs = 10000 }) {
     const start = Date.now();
     while ((Date.now() - start) < timeoutMs) {
@@ -933,18 +944,22 @@ async function runLiveEngine() {
             //                 ours (bot B would buy from them, not us).
             // On abort the maker is cancelled and the next round places a fresh order at
             // the current market — never chasing below the BAND_ABS_MIN fence.
-            // Ticker and order status are fetched together, so this is one round trip.
+            // The book and the order status are fetched together, so this is one round trip.
+            // LBank's ticker carries no bid/ask (ccxt leaves them undefined), so the best
+            // prices come from the order book.
             let isSafeToTrade = true;
             let makerStatusKnown = null;   // set when we can see the maker was already taken
             try {
                 const myPriceVal = parseFloat(finalPriceStr);
-                const [ticker, makerNow] = await Promise.all([
-                    fetchTickerCached(takerBot, CONFIG.pair),
-                    side === 'sell' ? fetchOrderSafe(makerBot, makerOrderId, CONFIG.pair) : Promise.resolve(null)
+                const [book, makerNow] = await Promise.all([
+                    takerBot.fetchOrderBook(CONFIG.pair),
+                    side === 'sell' ? fetchFreshOrder(makerBot, makerOrderId, CONFIG.pair) : Promise.resolve(null)
                 ]);
+                const bestBid = Number(book?.bids?.[0]?.[0]);
+                const bestAsk = Number(book?.asks?.[0]?.[0]);
                 if (side === 'buy') {
-                    if (ticker.bid > (myPriceVal + 0.0001)) {
-                        broadcastLog(`🛑 ABORT: Real bid ${ticker.bid} would take our fill.`, 'warn');
+                    if (Number.isFinite(bestBid) && bestBid > (myPriceVal + 0.0001)) {
+                        broadcastLog(`🛑 ABORT: Real bid ${bestBid} would take our fill.`, 'warn');
                         isSafeToTrade = false;
                     }
                 } else {
@@ -955,11 +970,8 @@ async function runLiveEngine() {
                         if (makerState === 'FILLED' || makerState === 'PARTIAL_FILLED') makerStatusKnown = makerState;
                         broadcastLog(`🛑 ABORT: our sell is no longer there untouched (${makerState}) — not buying.`, 'warn');
                         isSafeToTrade = false;
-                    } else if (!Number.isFinite(ticker.ask)) {
-                        broadcastLog(`🛑 ABORT: no ask in ticker — can't confirm our sell is the best price.`, 'warn');
-                        isSafeToTrade = false;
-                    } else if (ticker.ask < (myPriceVal - 0.0001)) {
-                        broadcastLog(`🛑 ABORT: Real ask ${ticker.ask} is below ours — bot B would buy from them.`, 'warn');
+                    } else if (Number.isFinite(bestAsk) && bestAsk < (myPriceVal - 0.0001)) {
+                        broadcastLog(`🛑 ABORT: Real ask ${bestAsk} is below ours — bot B would buy from them.`, 'warn');
                         isSafeToTrade = false;
                     }
                 }
