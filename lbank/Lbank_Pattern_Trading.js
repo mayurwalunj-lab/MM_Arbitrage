@@ -28,6 +28,10 @@ function envNonNeg(name, fallback) {
     return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 function envMs(name, fallback) { return Math.floor(envNonNeg(name, fallback)); }
+function envChoice(name, allowed, fallback) {
+    const v = String(process.env[name] || '').trim().toLowerCase();
+    return allowed.includes(v) ? v : fallback;
+}
 
 let CONFIG = {
     pair: 'L1X/USDT',
@@ -53,13 +57,17 @@ let CONFIG = {
     lingerMinMs: envMs('PATTERN_LINGER_MIN_MS', 0),
     lingerMaxMs: envMs('PATTERN_LINGER_MAX_MS', 150),
 
-    // SELL FIRST NEAR THE FLOOR (% above the BAND_ABS_MIN fence)
-    // Near the floor the flow is SELLERS. A waiting buy order there is the best bid
-    // on the book and gets sold into before bot B's order lands — 85% of pairs failed
-    // at <=8.505 and ~50% up to 8.80, against 15% above. A waiting SELL order there
-    // mostly sits untouched, because there are few buyers. So within this band the
-    // sell goes first and bot B buys it; above it, the buy goes first as before.
-    // 3.5% covers 8.50-8.80 at BAND_ABS_MIN=8.5. 0 disables (always buy first).
+    // WHICH ORDER GOES FIRST  (PATTERN_FIRST_SIDE)
+    //   sell  (default) — bot A places the SELL, bot B buys it. At every price.
+    //   buy   — the original behaviour: bot A buys, bot B sells into it.
+    //   floor — sell first only within PATTERN_SELL_FIRST_WITHIN_PCT above the
+    //           BAND_ABS_MIN fence, buy first above that.
+    // Whichever order waits on the book is the one an outsider can take. A waiting
+    // buy gets sold into when sellers are active (85% of pairs failed at the 8.5 floor
+    // under buy-first); a waiting sell gets bought when buyers are active.
+    // An unrecognised value falls back to 'sell'.
+    firstSide: envChoice('PATTERN_FIRST_SIDE', ['sell', 'buy', 'floor'], 'sell'),
+    // Used by 'floor' mode only. 3.5% covers 8.50-8.80 at BAND_ABS_MIN=8.5.
     sellFirstWithinPct: envNonNeg('PATTERN_SELL_FIRST_WITHIN_PCT', 3.5),
 
     // HARD FLOOR PRICE (USD)
@@ -718,6 +726,9 @@ async function runLiveEngine() {
     if (CONFIG.timeTargetEnabled) {
         broadcastLog(`⏱️ Time target enabled: $${Number(volumeTarget).toFixed(2)} in ${CONFIG.timeTargetHours} hour(s)`, 'info');
     }
+    broadcastLog(`🔀 First order: ${CONFIG.firstSide === 'floor'
+        ? `sell within ${CONFIG.sellFirstWithinPct}% of the floor, buy above`
+        : CONFIG.firstSide.toUpperCase() + ' at every price'} (PATTERN_FIRST_SIDE)`, 'info');
     await takeAndLogInventorySnapshot(botA, botB, 'initial');
 
     let lastMid = 0;
@@ -816,11 +827,13 @@ async function runLiveEngine() {
 
             // 6. EXECUTE
             const usdSize = randomVal(CONFIG.minTradeSize, CONFIG.maxTradeSize);
-            // Near the floor, sellers are active: a waiting buy gets sold into, a
-            // waiting sell mostly sits untouched. So the sell goes first there.
+            // Which order goes first — see CONFIG.firstSide. Anything that isn't
+            // 'buy' or 'floor' (including a bad dashboard value) means sell first.
             const nearFloor = CONFIG.sellFirstWithinPct > 0
                 && targetPrice <= fenceLo * (1 + CONFIG.sellFirstWithinPct / 100);
-            const side = nearFloor ? 'sell' : 'buy';
+            const side = CONFIG.firstSide === 'buy' ? 'buy'
+                : CONFIG.firstSide === 'floor' ? (nearFloor ? 'sell' : 'buy')
+                : 'sell';
             const [balA, balB] = await Promise.all([checkBalances(botA, 'botA'), checkBalances(botB, 'botB')]);
             const { preferredMakerBotName, reason: makerReason } = side === 'sell'
                 ? decidePreferredMakerForSell(balA, balB, targetPrice)
@@ -835,7 +848,7 @@ async function runLiveEngine() {
             const { makerBot, takerBot, makerBotName, takerBotName, finalAmountStr, finalPriceStr, finalUsdSize } = tradeInfo;
             const oppSide = side === 'buy' ? 'sell' : 'buy';
 
-            broadcastLog(`⚡ VOL: ${side.toUpperCase()} ${finalAmountStr} @ ${finalPriceStr} (${side} first${nearFloor ? ', near floor' : ''}: ${makerReason})`, 'info');
+            broadcastLog(`⚡ VOL: ${side.toUpperCase()} ${finalAmountStr} @ ${finalPriceStr} (${side} first [${CONFIG.firstSide}]: ${makerReason})`, 'info');
 
             if (CONFIG.dryRun) {
                 broadcastLog(`✅ Dry run: trade simulated. Counting volume.`, 'success');
