@@ -645,12 +645,19 @@ function calculateOrganicSleep(startTime, currentVol) {
 // ============================================================
 // 5. TRADE LOGIC
 // ============================================================
-// A sell-first maker needs L1X (and the taker USDT) — the mirror of buy-first.
+// A sell-first maker needs L1X and its buyer needs USDT. Pick the pairing with
+// the most room on BOTH sides. Choosing only "whoever holds more L1X" kept one bot
+// selling until the other's USDT was nearly gone: with the live balances, bot A
+// sold five times running, bot B fell from $120.89 to $20.89 USDT, and the pair
+// then ping-ponged with bot B pinned at the $10 reserve — unable to buy anything
+// over ~$11 while trades are $15-30. Weighing both sides keeps both bots able to
+// take either role.
 function decidePreferredMakerForSell(balA, balB, price) {
-    const aVal = (balA?.l1x || 0) * price;
-    const bVal = (balB?.l1x || 0) * price;
-    if (aVal > bVal) return { preferredMakerBotName: 'botA', reason: 'botA has more L1X' };
-    return { preferredMakerBotName: 'botB', reason: 'botB has more L1X' };
+    const minUsdt = 10;   // same reserve validateAndPlaceTradeWithFallback keeps
+    const room = (seller, buyer) => Math.min((seller?.l1x || 0) * price, (buyer?.usdt || 0) - minUsdt);
+    const aSells = room(balA, balB), bSells = room(balB, balA);
+    if (aSells >= bSells) return { preferredMakerBotName: 'botA', reason: `botA sells ($${aSells.toFixed(0)} room vs $${bSells.toFixed(0)})` };
+    return { preferredMakerBotName: 'botB', reason: `botB sells ($${bSells.toFixed(0)} room vs $${aSells.toFixed(0)})` };
 }
 
 function decidePreferredMakerForBuyOnly(balA, balB, price) {
@@ -834,6 +841,11 @@ async function runLiveEngine() {
             const side = CONFIG.firstSide === 'buy' ? 'buy'
                 : CONFIG.firstSide === 'floor' ? (nearFloor ? 'sell' : 'buy')
                 : 'sell';
+            // Decide on fresh balances. The cache lasts 3s and only the maker's entry
+            // was cleared after a trade, so the buyer's USDT could be one trade stale —
+            // the check could pass for a buy it can no longer afford, leaving the
+            // maker's order resting with nothing to match it.
+            invalidateBalanceCache('botA'); invalidateBalanceCache('botB');
             const [balA, balB] = await Promise.all([checkBalances(botA, 'botA'), checkBalances(botB, 'botB')]);
             const { preferredMakerBotName, reason: makerReason } = side === 'sell'
                 ? decidePreferredMakerForSell(balA, balB, targetPrice)
