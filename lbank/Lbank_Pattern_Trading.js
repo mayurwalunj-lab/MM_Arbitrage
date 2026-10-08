@@ -21,12 +21,13 @@ app.get('/', (req, res) => {
 // ============================================================
 // Non-negative integer ms from the environment, or the fallback. A typo must
 // not become NaN — delay(NaN) resolves immediately, silently changing timing.
-function envMs(name, fallback) {
+function envNonNeg(name, fallback) {
     const raw = process.env[name];
     if (raw == null || String(raw).trim() === '') return fallback;   // Number('') is 0, not "unset"
     const v = Number(raw);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : fallback;
+    return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
+function envMs(name, fallback) { return Math.floor(envNonNeg(name, fallback)); }
 
 let CONFIG = {
     pair: 'L1X/USDT',
@@ -51,6 +52,15 @@ let CONFIG = {
     // the old behaviour.
     lingerMinMs: envMs('PATTERN_LINGER_MIN_MS', 0),
     lingerMaxMs: envMs('PATTERN_LINGER_MAX_MS', 150),
+
+    // SELL FIRST NEAR THE FLOOR (% above the BAND_ABS_MIN fence)
+    // Near the floor the flow is SELLERS. A waiting buy order there is the best bid
+    // on the book and gets sold into before bot B's order lands — 85% of pairs failed
+    // at <=8.505 and ~50% up to 8.80, against 15% above. A waiting SELL order there
+    // mostly sits untouched, because there are few buyers. So within this band the
+    // sell goes first and bot B buys it; above it, the buy goes first as before.
+    // 3.5% covers 8.50-8.80 at BAND_ABS_MIN=8.5. 0 disables (always buy first).
+    sellFirstWithinPct: envNonNeg('PATTERN_SELL_FIRST_WITHIN_PCT', 3.5),
 
     // HARD FLOOR PRICE (USD)
     hardFloorPrice: 8.47,
@@ -627,6 +637,14 @@ function calculateOrganicSleep(startTime, currentVol) {
 // ============================================================
 // 5. TRADE LOGIC
 // ============================================================
+// A sell-first maker needs L1X (and the taker USDT) — the mirror of buy-first.
+function decidePreferredMakerForSell(balA, balB, price) {
+    const aVal = (balA?.l1x || 0) * price;
+    const bVal = (balB?.l1x || 0) * price;
+    if (aVal > bVal) return { preferredMakerBotName: 'botA', reason: 'botA has more L1X' };
+    return { preferredMakerBotName: 'botB', reason: 'botB has more L1X' };
+}
+
 function decidePreferredMakerForBuyOnly(balA, balB, price) {
     const minUsdt = 10;
     const aUsdt = Math.max(0, (balA?.usdt || 0) - minUsdt);
@@ -798,9 +816,15 @@ async function runLiveEngine() {
 
             // 6. EXECUTE
             const usdSize = randomVal(CONFIG.minTradeSize, CONFIG.maxTradeSize);
-            const side = 'buy';
+            // Near the floor, sellers are active: a waiting buy gets sold into, a
+            // waiting sell mostly sits untouched. So the sell goes first there.
+            const nearFloor = CONFIG.sellFirstWithinPct > 0
+                && targetPrice <= fenceLo * (1 + CONFIG.sellFirstWithinPct / 100);
+            const side = nearFloor ? 'sell' : 'buy';
             const [balA, balB] = await Promise.all([checkBalances(botA, 'botA'), checkBalances(botB, 'botB')]);
-            const { preferredMakerBotName, reason: makerReason } = decidePreferredMakerForBuyOnly(balA, balB, targetPrice);
+            const { preferredMakerBotName, reason: makerReason } = side === 'sell'
+                ? decidePreferredMakerForSell(balA, balB, targetPrice)
+                : decidePreferredMakerForBuyOnly(balA, balB, targetPrice);
             const tradeInfo = await validateAndPlaceTradeWithFallback(botA, botB, side, usdSize, targetPrice, preferredMakerBotName);
 
             if (!tradeInfo.success) {
@@ -809,9 +833,9 @@ async function runLiveEngine() {
             }
 
             const { makerBot, takerBot, makerBotName, takerBotName, finalAmountStr, finalPriceStr, finalUsdSize } = tradeInfo;
-            const oppSide = 'sell';
+            const oppSide = side === 'buy' ? 'sell' : 'buy';
 
-            broadcastLog(`⚡ VOL: ${side.toUpperCase()} ${finalAmountStr} @ ${finalPriceStr} (buy-only: ${makerReason})`, 'info');
+            broadcastLog(`⚡ VOL: ${side.toUpperCase()} ${finalAmountStr} @ ${finalPriceStr} (${side} first${nearFloor ? ', near floor' : ''}: ${makerReason})`, 'info');
 
             if (CONFIG.dryRun) {
                 broadcastLog(`✅ Dry run: trade simulated. Counting volume.`, 'success');
@@ -851,15 +875,45 @@ async function runLiveEngine() {
                 if (hi > 0) await delay(randomVal(lo, hi));
             }
 
-            // Anti-sniper
+            // Anti-sniper. Bot B's order matches the BEST price on the book, whoever
+            // placed it — an exchange will not let you pick one specific order. So
+            // before sending it, make sure no outside order sits in front of ours:
+            //   buy first  -> bot B SELLS: abort if a real bid is above ours.
+            //   sell first -> bot B BUYS:  abort if our sell is no longer there untouched
+            //                 (an outside buyer took it — buying now would leave bot B's
+            //                 bid resting to be sold into), or if a real ask sits below
+            //                 ours (bot B would buy from them, not us).
+            // On abort the maker is cancelled and the next round places a fresh order at
+            // the current market — never chasing below the BAND_ABS_MIN fence.
+            // Ticker and order status are fetched together, so this is one round trip.
             let isSafeToTrade = true;
+            let makerStatusKnown = null;   // set when we can see the maker was already taken
             try {
-                const ticker = await fetchTickerCached(takerBot, CONFIG.pair);
-                const currentBid = ticker.bid;
                 const myPriceVal = parseFloat(finalPriceStr);
-                if (currentBid > (myPriceVal + 0.0001)) {
-                    broadcastLog(`🛑 ABORT: Real bid ${currentBid} would take our fill.`, 'warn');
-                    isSafeToTrade = false;
+                const [ticker, makerNow] = await Promise.all([
+                    fetchTickerCached(takerBot, CONFIG.pair),
+                    side === 'sell' ? fetchOrderSafe(makerBot, makerOrderId, CONFIG.pair) : Promise.resolve(null)
+                ]);
+                if (side === 'buy') {
+                    if (ticker.bid > (myPriceVal + 0.0001)) {
+                        broadcastLog(`🛑 ABORT: Real bid ${ticker.bid} would take our fill.`, 'warn');
+                        isSafeToTrade = false;
+                    }
+                } else {
+                    const makerState = deriveDbOrderStatus(makerNow, Number(finalAmountStr));
+                    if (makerState !== 'OPEN') {
+                        // FILLED / PARTIAL_FILLED = an outside buyer took it. Anything else
+                        // (unreadable, cancelled) fails closed: don't buy blind.
+                        if (makerState === 'FILLED' || makerState === 'PARTIAL_FILLED') makerStatusKnown = makerState;
+                        broadcastLog(`🛑 ABORT: our sell is no longer there untouched (${makerState}) — not buying.`, 'warn');
+                        isSafeToTrade = false;
+                    } else if (!Number.isFinite(ticker.ask)) {
+                        broadcastLog(`🛑 ABORT: no ask in ticker — can't confirm our sell is the best price.`, 'warn');
+                        isSafeToTrade = false;
+                    } else if (ticker.ask < (myPriceVal - 0.0001)) {
+                        broadcastLog(`🛑 ABORT: Real ask ${ticker.ask} is below ours — bot B would buy from them.`, 'warn');
+                        isSafeToTrade = false;
+                    }
                 }
             } catch (e) {
                 broadcastLog(`⚠️ Anti-sniper check failed. Aborting.`, 'warn');
@@ -867,11 +921,19 @@ async function runLiveEngine() {
             }
 
             if (!isSafeToTrade) {
+                // Always record the outcome. Previously a failed cancel — e.g. because an
+                // outsider had already filled the order — skipped the log entirely, so
+                // the row stayed OPEN/PENDING and that leak never showed in the data.
+                let makerFinal = makerStatusKnown;
                 try {
                     await makerBot.cancelOrder(makerOrderId, CONFIG.pair);
                     broadcastLog(`↩️ ${makerBotName} Maker cancelled.`, 'warn');
-                    await logTradeHistory({ makerOrderId, makerOrderStatus: 'CANCELLED', takerOrderStatus: 'NOT_ATTEMPTED', executionTimeMs: Date.now() - makerStartTime }, true);
-                } catch (c) { broadcastLog(`⚠️ Cancel failed: ${c.message}`, 'warn'); }
+                    if (!makerFinal) makerFinal = 'CANCELLED';
+                } catch (c) {
+                    broadcastLog(`⚠️ Cancel failed: ${c.message}`, 'warn');
+                    if (!makerFinal) makerFinal = 'PENDING';   // syncOrderStatuses resolves it later
+                }
+                await logTradeHistory({ makerOrderId, makerOrderStatus: makerFinal, takerOrderStatus: 'NOT_ATTEMPTED', executionTimeMs: Date.now() - makerStartTime }, true);
                 io.emit('stats', { volume: stats.volume, balances });
                 await delay(5000);
                 continue;
