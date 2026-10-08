@@ -645,6 +645,23 @@ function calculateOrganicSleep(startTime, currentVol) {
 // ============================================================
 // 5. TRADE LOGIC
 // ============================================================
+// The CEX price the dynamic band compares against the DEX. This used to be the
+// order-book MID, which is not a price when one side of the book is thin: with
+// sellers at $8.65 and the best buyer at $7.00 the mid read $7.83, so a DEX at
+// $8.65 looked 10% high and the band froze ("treasury handles it"). The last trade
+// was $8.54 — 1.3% away — and the treasury, which reads the last trade, saw nothing
+// to do, so the pattern bot stood down indefinitely. The grid and the treasury
+// already use the last trade; this brings the pattern bot in line.
+// The last trade is kept inside the live spread, so a stale print from before a
+// move cannot stand in for the current market. No usable last trade -> 0, which the
+// band treats as "compare against my own centre" — never a false freeze.
+function bandReferencePrice(bestBid, bestAsk, lastTrade) {
+    if (!Number.isFinite(lastTrade) || lastTrade <= 0) return 0;
+    const lo = Number.isFinite(bestBid) && bestBid > 0 ? bestBid : lastTrade;
+    const hi = Number.isFinite(bestAsk) && bestAsk > 0 ? bestAsk : lastTrade;
+    return Math.min(hi, Math.max(lo, lastTrade));
+}
+
 // A sell-first maker needs L1X and its buyer needs USDT. Pick the pairing with
 // the most room on BOTH sides. Choosing only "whoever holds more L1X" kept one bot
 // selling until the other's USDT was nearly gone: with the live balances, bot A
@@ -738,17 +755,18 @@ async function runLiveEngine() {
         : CONFIG.firstSide.toUpperCase() + ' at every price'} (PATTERN_FIRST_SIDE)`, 'info');
     await takeAndLogInventorySnapshot(botA, botB, 'initial');
 
-    let lastMid = 0;
-    // Seed lastMid from the REAL current market so the band's first read references
-    // the live price, not the static box midpoint — otherwise the band seeds low
-    // (~$8.50) and the bot sits in "No trade room" while it slowly climbs. Best-effort.
+    let bandRef = 0;   // CEX price the band compares with the DEX — see bandReferencePrice
+    // Seed from the REAL current market so the band's first read references the
+    // live price, not the static box midpoint — otherwise the band seeds low (~$8.50)
+    // and the bot sits in "No trade room" while it slowly climbs. Best-effort.
     if (priceBand.isEnabled() && !CONFIG.dryRun) {
         try {
-            const seedBook = await botA.fetchOrderBook(CONFIG.pair);
-            if (seedBook?.bids?.[0]?.[0] && seedBook?.asks?.[0]?.[0]) {
-                lastMid = (seedBook.bids[0][0] + seedBook.asks[0][0]) / 2;
-                broadcastLog(`📊 Band seed: market mid $${lastMid.toFixed(4)}`, 'info');
-            }
+            const [seedBook, seedTick] = await Promise.all([
+                botA.fetchOrderBook(CONFIG.pair),
+                botA.fetchTicker(CONFIG.pair).catch(() => null)
+            ]);
+            bandRef = bandReferencePrice(seedBook?.bids?.[0]?.[0], seedBook?.asks?.[0]?.[0], Number(seedTick?.last));
+            if (bandRef > 0) broadcastLog(`📊 Band seed: last trade $${bandRef.toFixed(4)}`, 'info');
         } catch (e) { broadcastLog(`⚠️ band seed fetch failed: ${String(e.message).slice(0, 50)}`, 'warn'); }
     }
     while (isRunning && stats.volume < volumeTarget && Date.now() < timeLimit) {
@@ -761,14 +779,14 @@ async function runLiveEngine() {
             let bandFrozen = false, bandReason = 'ok';
             if (priceBand.isEnabled()) {
                 try {
-                    const band = await priceBand.getBand(lastMid); // 0/falsy => seed from the DEX, never a stale static mid (avoids false freeze)
+                    const band = await priceBand.getBand(bandRef); // 0/falsy => seed from the DEX, never a stale static mid (avoids false freeze)
                     bandFloor = band.floor; bandResist = band.resistance; bandMinAsk = band.minAsk; bandFrozen = !!band.frozen; bandReason = band.reason || 'ok';
-                    if (band.moved || band.frozen) broadcastLog(`📊 BAND center $${band.center.toFixed(4)} [$${bandFloor.toFixed(4)}–$${bandResist.toFixed(4)}] DEX $${band.dexPrice ? band.dexPrice.toFixed(4) : 'n/a'}${band.frozen ? ' FROZEN(' + band.reason + ')' : ''}`, 'info');
+                    if (band.moved || band.frozen) broadcastLog(`📊 BAND center $${band.center.toFixed(4)} [$${bandFloor.toFixed(4)}–$${bandResist.toFixed(4)}] DEX $${band.dexPrice ? band.dexPrice.toFixed(4) : 'n/a'} CEX(last) $${bandRef > 0 ? bandRef.toFixed(4) : 'n/a'}${band.frozen ? ' FROZEN(' + band.reason + ')' : ''}`, 'info');
                 } catch (e) { broadcastLog(`⚠️ band unavailable, using fixed box: ${String(e.message).slice(0, 60)}`, 'warn'); }
             }
 
             // 1. GET MARKET DATA
-            let bestBid, bestAsk;
+            let bestBid, bestAsk, lastTrade = NaN;
             if (CONFIG.dryRun) {
                 if (microTrend.targetPrice > 0) {
                     let move = (microTrend.targetPrice - simPrice) * 0.05;
@@ -779,15 +797,21 @@ async function runLiveEngine() {
                 bestBid = simPrice;
                 bestAsk = simPrice + 0.003;
             } else {
-                const book = await botA.fetchOrderBook(CONFIG.pair);
+                // The ticker (last trade) is for the band only; fetched alongside the
+                // book so it adds no latency, and a failure never blocks trading.
+                const [book, tick] = await Promise.all([
+                    botA.fetchOrderBook(CONFIG.pair),
+                    botA.fetchTicker(CONFIG.pair).catch(() => null)
+                ]);
                 bestBid = book.bids[0][0];
                 bestAsk = book.asks[0][0];
+                lastTrade = Number(tick?.last);
             }
 
             // Keep the band's reference price current EVERY tick — even if we bail out
             // below on "no trade room"/gatekeeper — so it never goes stale during a lockout.
             {
-                lastMid = (bestBid + bestAsk) / 2;
+                bandRef = CONFIG.dryRun ? (bestBid + bestAsk) / 2 : bandReferencePrice(bestBid, bestAsk, lastTrade);
             }
 
             // 2. SAFETY GATES — stand down ONLY when the band is FROZEN (a big DEX
@@ -821,7 +845,6 @@ async function runLiveEngine() {
 
             // 4. NATURAL PRICE CALCULATION
             const currentMid = (bestBid + bestAsk) / 2;
-            lastMid = currentMid;
             updateMicroTrend(currentMid, lowerBound, upperBound);
 
             const now = Date.now();
