@@ -19,6 +19,15 @@ app.get('/', (req, res) => {
 // ============================================================
 // 1. CONFIGURATION
 // ============================================================
+// Non-negative integer ms from the environment, or the fallback. A typo must
+// not become NaN — delay(NaN) resolves immediately, silently changing timing.
+function envMs(name, fallback) {
+    const raw = process.env[name];
+    if (raw == null || String(raw).trim() === '') return fallback;   // Number('') is 0, not "unset"
+    const v = Number(raw);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : fallback;
+}
+
 let CONFIG = {
     pair: 'L1X/USDT',
     dailyVolumeTarget: 100000, 
@@ -30,6 +39,18 @@ let CONFIG = {
     
     // SAFETY BUFFER (USD)
     safeZoneBuffer: 0.0005, 
+
+    // WAIT BETWEEN THE TWO ORDERS (ms)
+    // After bot A places order 1, it sits on the PUBLIC book until bot B's order 2
+    // arrives. Any outside trader can take it in that gap, leaving only one leg
+    // ours. This was a hardcoded 500-2000ms "Organic Linger" — pure waiting with no
+    // safety benefit (the anti-sniper check below still runs before order 2). Since
+    // Oct 6 ~60% of pairs went one-legged, worst at the BAND_ABS_MIN defend line
+    // where order 1 is the best price on the book (85% failure there).
+    // Override with PATTERN_LINGER_MIN_MS / PATTERN_LINGER_MAX_MS; 500/2000 restores
+    // the old behaviour.
+    lingerMinMs: envMs('PATTERN_LINGER_MIN_MS', 0),
+    lingerMaxMs: envMs('PATTERN_LINGER_MAX_MS', 150),
 
     // HARD FLOOR PRICE (USD)
     hardFloorPrice: 8.47,
@@ -823,7 +844,12 @@ async function runLiveEngine() {
                 continue;
             }
 
-            await delay(randomVal(500, 2000)); // Organic Linger
+            // Order 1 is exposed on the public book until order 2 lands — keep the gap short.
+            {
+                const lo = Math.min(CONFIG.lingerMinMs, CONFIG.lingerMaxMs);
+                const hi = Math.max(CONFIG.lingerMinMs, CONFIG.lingerMaxMs);
+                if (hi > 0) await delay(randomVal(lo, hi));
+            }
 
             // Anti-sniper
             let isSafeToTrade = true;
