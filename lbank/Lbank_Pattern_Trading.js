@@ -70,14 +70,13 @@ let CONFIG = {
     // Used by 'floor' mode only. 3.5% covers 8.50-8.80 at BAND_ABS_MIN=8.5.
     sellFirstWithinPct: envNonNeg('PATTERN_SELL_FIRST_WITHIN_PCT', 3.5),
 
-    // HARD FLOOR PRICE (USD)
-    hardFloorPrice: 8.47,
-
-    // HARD RESISTANCE PRICE (USD)
-    hardResistancePrice: 8.53,
-
-    // BEST-ASK SAFETY TRIGGER (USD)
-    minBestAskToTrade: 8.48,
+    // HARD FLOOR / RESISTANCE / BEST-ASK TRIGGER (USD)
+    // Only used when DYNAMIC_BAND is off (and for the dry-run price sim); with the
+    // band on, BAND_ABS_MIN / BAND_ABS_MAX are the fence. Defaulting to the same
+    // .env values keeps the bot trading if the band is switched off.
+    hardFloorPrice: envNonNeg('BAND_ABS_MIN', 7),
+    hardResistancePrice: envNonNeg('BAND_ABS_MAX', 30),
+    minBestAskToTrade: envNonNeg('BAND_ABS_MIN', 7) + 0.01,
 
     checkPressureEveryMinutes: 5, 
 
