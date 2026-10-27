@@ -84,14 +84,6 @@ const GRID_CONFIG = {
     
     baseCenterPrice: 8.50,
 
-    // BUY GUARD (DYNAMIC_BAND only): never bid above the DEX price minus this %.
-    // A bid above the DEX lets anyone buy on the DEX and sell to us at a profit.
-    // While the band is still walking down to the DEX, buys above the cap are
-    // skipped (and old ones cancelled). If the DEX price is unknown, no buys.
-    // GRID_BUY_DEX_MARGIN_PCT < 0 turns the guard off.
-    buyDexMarginPct: Number.isFinite(Number(process.env.GRID_BUY_DEX_MARGIN_PCT)) && process.env.GRID_BUY_DEX_MARGIN_PCT !== ''
-        ? Number(process.env.GRID_BUY_DEX_MARGIN_PCT) : 0.5,
-
     // Stop/restart cancels grid orders this many at a time, so they're all gone
     // before pm2 kills the process (the old 5-minute spread left most behind).
     stopCancelBatchSize: 5,
@@ -152,16 +144,6 @@ async function resolveGridCenter(marketPrice) {
         log(`⚠️ band unavailable, grid centered on market: ${String(e.message).slice(0, 60)}`, 'warn');
         return marketPrice;
     }
-}
-
-// Highest price a grid buy may sit at: the DEX price minus buyDexMarginPct.
-// Infinity = guard off (band off or negative margin); 0 = DEX unknown, no buys.
-function buyPriceCap() {
-    if (!priceBand.isEnabled() || GRID_CONFIG.buyDexMarginPct < 0) return Infinity;
-    const band = priceBand.getBandSync();
-    const dex = band ? Number(band.dexPrice) : NaN;
-    if (!(dex > 0)) return 0;
-    return dex * (1 - GRID_CONFIG.buyDexMarginPct / 100);
 }
 
 // Prefix for orders placed by the Grid Manager API. Only these are cancelled on refresh/stop.
@@ -541,14 +523,12 @@ async function maintainGrid(bot, centerPrice, symbol) {
         let visualGrid = { bids: [], asks: [] };
         
         if (GRID_CONFIG.priceRangeGrids && ranges.buy) {
-            const maxBuyPrice = buyPriceCap();
             for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
                 
                 for (let i = 0; i < prices.length; i++) {
                     const price = prices[i];
-                    if (price > maxBuyPrice) continue;
                     const orderSize = orderSizes[i];
                     const amount = orderSize / price;
                     visualGrid.bids.push({ 
@@ -613,12 +593,6 @@ async function maintainGrid(bot, centerPrice, symbol) {
         const existingSellOrders = [];
         const openGridOrderIds = [];
         let manualOrderCount = 0;
-        const maxBuyPrice = buyPriceCap();
-        if (maxBuyPrice !== Infinity) {
-            log(maxBuyPrice > 0
-                ? `🛡️ BUY GUARD: no buys above $${maxBuyPrice.toFixed(4)} (DEX - ${GRID_CONFIG.buyDexMarginPct}%)`
-                : '🛡️ BUY GUARD: DEX price unknown — placing no buys this refresh', maxBuyPrice > 0 ? 'info' : 'warn');
-        }
         
         for (const order of openOrders) {
             if (!isRunning) break;
@@ -627,36 +601,11 @@ async function maintainGrid(bot, centerPrice, symbol) {
                 continue;
             }
             openGridOrderIds.push(order.id);
-            const orderPrice = parseFloat(order.price);
             // Every old order is replaced one by one below (new placed first), even
             // when the center moved and it's outside the new ranges: cancelling
-            // those at once emptied the book until the new orders went up. Only a
-            // buy above the buy-guard cap goes at once — it's an open arbitrage.
-            const unsafeBuy = order.side === 'buy' && orderPrice > maxBuyPrice;
-
-            if (order.side === 'buy' && !unsafeBuy) {
-                existingBuyOrders.push(order);
-            } else if (order.side === 'sell') {
-                existingSellOrders.push(order);
-            } else {
-                // Buy above the guard cap - cancel immediately
-                try {
-                    await bot.cancelOrder(order.id, GRID_CONFIG.pair);
-                    log(`🗑️ Cancelled grid buy above the guard cap: @ $${order.price.toFixed(4)}`, 'info');
-                    await logGridOrderEvent({
-                        orderId: order.id,
-                        clientOrderId: order.clientOrderId || order.info?.custom_id,
-                        side: order.side,
-                        price: parseFloat(order.price),
-                        amount: order.amount != null ? parseFloat(order.amount) : null,
-                        action: 'CANCELLED',
-                        priceRange: 'guard'
-                    });
-                    await delay(100);
-                } catch (e) {
-                    // Ignore
-                }
-            }
+            // those at once emptied the book until the new orders went up.
+            if (order.side === 'buy') existingBuyOrders.push(order);
+            else if (order.side === 'sell') existingSellOrders.push(order);
         }
         
         await detectAndLogFilledOrders(openGridOrderIds);
@@ -673,7 +622,6 @@ async function maintainGrid(bot, centerPrice, symbol) {
         const targetSellOrders = [];
         
         // Generate BUY target orders
-        let skippedBuys = 0;
         if (buySideOn && GRID_CONFIG.priceRangeGrids && ranges.buy) {
             for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
@@ -687,7 +635,6 @@ async function maintainGrid(bot, centerPrice, symbol) {
                     // Apply precision using CCXT
                     const pricePrecision = bot.priceToPrecision(symbol, price);
                     const amountPrecision = bot.amountToPrecision(symbol, amount);
-                    if (parseFloat(pricePrecision) > maxBuyPrice) { skippedBuys++; continue; }
                     
                     targetBuyOrders.push({
                         side: 'buy',
@@ -726,7 +673,6 @@ async function maintainGrid(bot, centerPrice, symbol) {
             }
         }
         
-        if (skippedBuys > 0) log(`🛡️ BUY GUARD: skipped ${skippedBuys} buy order(s) priced above $${maxBuyPrice.toFixed(4)}`, 'warn');
         log(`📊 Target: ${targetBuyOrders.length} buy, ${targetSellOrders.length} sell | Existing grid: ${existingBuyOrders.length} buy, ${existingSellOrders.length} sell` + (manualOrderCount > 0 ? ` | Manual (untouched): ${manualOrderCount}` : ''), 'info');
         
         // Calculate total operations and delay per operation to spread over 5 minutes
