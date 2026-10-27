@@ -62,11 +62,11 @@ const GRID_CONFIG = {
         buy: [
             // $9 - $9.3: ~$660 cumulative (tight clustering near price)
             // { minPrice: 9.0, maxPrice: 9.3, totalValue: 660, ordersPerRange: 6, spacing: 'tight' },          
-            // $8 - $9: ~$200+ (main support band)
-            { minPrice: 8.46, maxPrice: 8.47, totalValue: 80, ordersPerRange: 5, spacing: 'medium' },  
-            { minPrice: 8.45, maxPrice: 8.46, totalValue: 50, ordersPerRange: 4, spacing: 'medium' },  
-            { minPrice: 8.4447, maxPrice: 8.45, totalValue: 10, ordersPerRange: 2, spacing: 'medium' },                 // Below $8: Smaller defensive liquidity (wider spacing)
-            { minPrice: 7.5, maxPrice: 8.4447, totalValue: 10, ordersPerRange: 1, spacing: 'wide' },
+            // $8 - $9: $520 total (main support band; was $150, same proportions)
+            { minPrice: 8.46, maxPrice: 8.47, totalValue: 280, ordersPerRange: 5, spacing: 'medium' },
+            { minPrice: 8.45, maxPrice: 8.46, totalValue: 170, ordersPerRange: 4, spacing: 'medium' },
+            { minPrice: 8.4447, maxPrice: 8.45, totalValue: 35, ordersPerRange: 2, spacing: 'medium' },                 // Below $8: Smaller defensive liquidity (wider spacing)
+            { minPrice: 7.5, maxPrice: 8.4447, totalValue: 35, ordersPerRange: 1, spacing: 'wide' },
             // { minPrice: 7.0, maxPrice: 7.5, totalValue: 25, ordersPerRange: 3, spacing: 'wide' },
             // { minPrice: 7.0, maxPrice: 7.5, totalValue: 30, ordersPerRange: 1, spacing: 'very_wide' }
         ]
