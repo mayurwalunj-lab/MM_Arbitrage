@@ -27,6 +27,16 @@ Each tick (`qdex/qdex_mm.js`):
    estimate, so a price-moving swap won't revert on the slippage floor.
 7. Dry-run by default; live only with `--execute` or `QDEX_EXECUTE=true`.
 
+### Safety checks
+- **Oracle age** — the oracle (`latestPriceData`) stores when WL1X was last updated
+  and keeps returning that price if its feeder stops. If the update is older than
+  `QDEX_ORACLE_MAX_AGE_SEC` (default 1 hour; it normally changes every ~5 min), the
+  tick is skipped with an `ALERT` log line and a `skipped` row.
+- **Wallet balance** — a trade is capped to what the wallet holds (WL1X to sell,
+  XUSD to buy). If that leaves less than `QDEX_MIN_TRADE_BASE`, it is skipped.
+- **Repeated failures** — after `QDEX_FAIL_BACKOFF_AFTER` failed swaps in a row,
+  swaps pause for `QDEX_FAIL_BACKOFF_MIN` minutes instead of resubmitting every tick.
+
 ## Run
 ```bash
 # PEG XUSD to $1 (dynamic oracle target):

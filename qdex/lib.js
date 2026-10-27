@@ -30,8 +30,11 @@ const SWAP_ROUTER_ABI = [
   'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)'
 ];
 // L1X price oracle — getLatestPrice(token) returns USD price with `decimals()` dp.
+// latestPriceData(token) also returns when that price was last written; the
+// contract never rejects an old price, so the caller has to check its age.
 const ORACLE_ABI = [
   'function getLatestPrice(address) view returns (uint256)',
+  'function latestPriceData(address) view returns (uint256 price, uint256 updatedAt, uint256 round)',
   'function decimals() view returns (uint8)'
 ];
 // Uniswap-V3 QuoterV2 (canonical off-chain quote — revert-based, needs no funds).
@@ -103,7 +106,12 @@ function getConfig() {
     maxDeviationPct: envNum('QDEX_MAX_DEVIATION_PCT', 5),
     maxTradeBase: envNum('QDEX_MAX_TRADE_BASE', 0),
     slippageBps: envNum('QDEX_SLIPPAGE_BPS', 100),
-    deadlineSeconds: envNum('QDEX_DEADLINE_SECONDS', 600)
+    deadlineSeconds: envNum('QDEX_DEADLINE_SECONDS', 600),
+    // safety
+    oracleMaxAgeSec: envNum('QDEX_ORACLE_MAX_AGE_SEC', 3600),  // skip if the oracle price is older (0 = off)
+    minTradeBase: envNum('QDEX_MIN_TRADE_BASE', 0.5),          // skip trades smaller than this after the balance cap
+    failBackoffAfter: envNum('QDEX_FAIL_BACKOFF_AFTER', 3),    // swap failures in a row before pausing (0 = off)
+    failBackoffMin: envNum('QDEX_FAIL_BACKOFF_MIN', 60)        // how long to pause swaps, minutes
   };
 }
 
@@ -187,6 +195,27 @@ async function getOraclePrice(config, provider, tokenAddress) {
   if (_oracleDecimals == null) _oracleDecimals = Number(await withRetry(() => oracle.decimals(), { label: 'oracle.decimals' }));
   const raw = await withRetry(() => oracle.getLatestPrice(tokenAddress), { label: 'oracle.getLatestPrice' });
   return Number(raw) / Math.pow(10, _oracleDecimals);
+}
+
+// The oracle's stored record for a token: { price, updatedAt (unix s), round },
+// or null if the oracle can't be read this way.
+async function getOracleRecord(config, provider, tokenAddress) {
+  const oracle = new ethers.Contract(config.oracleAddress, ORACLE_ABI, provider);
+  try {
+    if (_oracleDecimals == null) _oracleDecimals = Number(await withRetry(() => oracle.decimals(), { label: 'oracle.decimals' }));
+    const r = await withRetry(() => oracle.latestPriceData(tokenAddress), { label: 'oracle.latestPriceData' });
+    return { price: Number(r.price) / Math.pow(10, _oracleDecimals), updatedAt: Number(r.updatedAt), round: Number(r.round) };
+  } catch (e) {
+    if (isTransientRpcError(e)) throw e;
+    return null;
+  }
+}
+
+// Human-unit balance of a token for an address.
+async function getTokenBalance(provider, token, address) {
+  const erc = new ethers.Contract(token.address, ERC20_ABI, provider);
+  const raw = await withRetry(() => erc.balanceOf(address), { label: `balanceOf(${token.symbol})` });
+  return Number(ethers.formatUnits(raw, token.decimals));
 }
 
 // Amount of BASE to trade to move the pool price to `targetPrice`, using the
@@ -328,6 +357,6 @@ async function executeSwap({ config, provider, side, amountBase, price, slippage
 module.exports = {
   Q96, V3_POOL_ABI, ERC20_ABI,
   getConfig, validateConfig, getProvider, getWallet, loadPool, priceFromSqrt,
-  getPoolPrice, getOraclePrice, sizeToTarget, quoteAmountOut, estimateAmountOutWei, executeSwap,
+  getPoolPrice, getOraclePrice, getOracleRecord, getTokenBalance, sizeToTarget, quoteAmountOut, estimateAmountOutWei, executeSwap,
   withRetry, isTransientRpcError
 };
