@@ -32,6 +32,10 @@ function config() {
     alpha: num('BAND_SMOOTHING_ALPHA', 0.2),        // 9 EMA
     maxMovePct: num('BAND_MAX_MOVE_PCT', 1.0),      // per refresh
     followMaxPct: num('BAND_FOLLOW_MAX_PCT', 5),    // freeze beyond this DEX↔CEX gap
+    // Center the band this % BELOW the DEX (0 = on the DEX). With it set, an
+    // arbitrageur's profitable direction is buy on the CEX, sell on the DEX, so
+    // our CEX buys are never sold into from the DEX. Clamped to 0-20.
+    dexOffsetPct: clamp(num('BAND_DEX_OFFSET_PCT', 0), 0, 20),
     // Treasury only SELLS (lifts the DEX when it runs high), so it covers the
     // UPSIDE gap. On the downside nobody buys, so freezing there would leave the
     // CEX stranded above the market. With this true, we only freeze on the upside
@@ -108,9 +112,9 @@ async function refresh(cexRef, c) {
   state.lastGoodDex = dex;
   state.lastReadMs = now;
 
-  // EMA of the DEX price
+  // EMA of the DEX price; the band aims dexOffsetPct below it
   state.ema = (state.ema == null) ? dex : (c.alpha * dex + (1 - c.alpha) * state.ema);
-  const target = state.ema;
+  const target = state.ema * (1 - c.dexOffsetPct / 100);
 
   // seed center from the CEX on first run (no jump on restart)
   if (state.center == null) state.center = clamp(cexRef || dex, c.absMin, c.absMax);
@@ -144,7 +148,7 @@ async function refresh(cexRef, c) {
     else if (center === c.absMax) reason = 'holding at absolute ceiling (BAND_ABS_MAX)';
   }
 
-  state.lastBand = { ...buildBand(center, c), dexPrice: dex, dexEma: target, cexRef: ref, frozen, moved, reason };
+  state.lastBand = { ...buildBand(center, c), dexPrice: dex, dexEma: state.ema, target, cexRef: ref, frozen, moved, reason };
   return state.lastBand;
 }
 
