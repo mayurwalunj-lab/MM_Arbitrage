@@ -84,14 +84,6 @@ const GRID_CONFIG = {
     
     baseCenterPrice: 8.50,
 
-    // BUY GUARD (DYNAMIC_BAND only): never bid above the DEX price minus this %.
-    // A bid above the DEX lets anyone buy on the DEX and sell to us at a profit.
-    // While the band is still walking down to the DEX, buys above the cap are
-    // skipped (and old ones cancelled). If the DEX price is unknown, no buys.
-    // GRID_BUY_DEX_MARGIN_PCT < 0 turns the guard off.
-    buyDexMarginPct: Number.isFinite(Number(process.env.GRID_BUY_DEX_MARGIN_PCT)) && process.env.GRID_BUY_DEX_MARGIN_PCT !== ''
-        ? Number(process.env.GRID_BUY_DEX_MARGIN_PCT) : 0.5,
-
     // Stop/restart cancels grid orders this many at a time, so they're all gone
     // before pm2 kills the process (the old 5-minute spread left most behind).
     stopCancelBatchSize: 5,
@@ -152,16 +144,6 @@ async function resolveGridCenter(marketPrice) {
         log(`⚠️ band unavailable, grid centered on market: ${String(e.message).slice(0, 60)}`, 'warn');
         return marketPrice;
     }
-}
-
-// Highest price a grid buy may sit at: the DEX price minus buyDexMarginPct.
-// Infinity = guard off (band off or negative margin); 0 = DEX unknown, no buys.
-function buyPriceCap() {
-    if (!priceBand.isEnabled() || GRID_CONFIG.buyDexMarginPct < 0) return Infinity;
-    const band = priceBand.getBandSync();
-    const dex = band ? Number(band.dexPrice) : NaN;
-    if (!(dex > 0)) return 0;
-    return dex * (1 - GRID_CONFIG.buyDexMarginPct / 100);
 }
 
 // Prefix for orders placed by the Grid Manager API. Only these are cancelled on refresh/stop.
@@ -541,14 +523,12 @@ async function maintainGrid(bot, centerPrice, symbol) {
         let visualGrid = { bids: [], asks: [] };
         
         if (GRID_CONFIG.priceRangeGrids && ranges.buy) {
-            const maxBuyPrice = buyPriceCap();
             for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
                 
                 for (let i = 0; i < prices.length; i++) {
                     const price = prices[i];
-                    if (price > maxBuyPrice) continue;
                     const orderSize = orderSizes[i];
                     const amount = orderSize / price;
                     visualGrid.bids.push({ 
@@ -608,23 +588,11 @@ async function maintainGrid(bot, centerPrice, symbol) {
         const openOrders = await fetchOpenOrdersCached(bot, GRID_CONFIG.pair);
         if (!isRunning) return;
         
-        // Collect valid price ranges
-        const validRanges = {
-            buy: (ranges?.buy || []).map(r => ({ min: r.minPrice, max: r.maxPrice })),
-            sell: (ranges?.sell || []).map(r => ({ min: r.minPrice, max: r.maxPrice }))
-        };
-        
         // Separate orders by side and range (grid orders only; manual frontend orders are never touched)
         const existingBuyOrders = [];
         const existingSellOrders = [];
         const openGridOrderIds = [];
         let manualOrderCount = 0;
-        const maxBuyPrice = buyPriceCap();
-        if (maxBuyPrice !== Infinity) {
-            log(maxBuyPrice > 0
-                ? `🛡️ BUY GUARD: no buys above $${maxBuyPrice.toFixed(4)} (DEX - ${GRID_CONFIG.buyDexMarginPct}%)`
-                : '🛡️ BUY GUARD: DEX price unknown — placing no buys this refresh', maxBuyPrice > 0 ? 'info' : 'warn');
-        }
         
         for (const order of openOrders) {
             if (!isRunning) break;
@@ -633,45 +601,28 @@ async function maintainGrid(bot, centerPrice, symbol) {
                 continue;
             }
             openGridOrderIds.push(order.id);
-            const orderPrice = parseFloat(order.price);
-            const isBuyInRange = order.side === 'buy' && orderPrice <= maxBuyPrice
-                && validRanges.buy.some(r => orderPrice >= r.min && orderPrice <= r.max);
-            const isSellInRange = order.side === 'sell' && validRanges.sell.some(r => orderPrice >= r.min && orderPrice <= r.max);
-            
-            if (isBuyInRange) {
-                existingBuyOrders.push(order);
-            } else if (isSellInRange) {
-                existingSellOrders.push(order);
-            } else {
-                // Grid order outside range - cancel immediately
-                try {
-                    await bot.cancelOrder(order.id, GRID_CONFIG.pair);
-                    log(`🗑️ Cancelled grid order outside range: ${order.side} @ $${order.price.toFixed(4)}`, 'info');
-                    await logGridOrderEvent({
-                        orderId: order.id,
-                        clientOrderId: order.clientOrderId || order.info?.custom_id,
-                        side: order.side,
-                        price: parseFloat(order.price),
-                        amount: order.amount != null ? parseFloat(order.amount) : null,
-                        action: 'CANCELLED',
-                        priceRange: 'outside'
-                    });
-                    await delay(100);
-                } catch (e) {
-                    // Ignore
-                }
-            }
+            // Every old order is replaced one by one below (new placed first), even
+            // when the center moved and it's outside the new ranges: cancelling
+            // those at once emptied the book until the new orders went up.
+            if (order.side === 'buy') existingBuyOrders.push(order);
+            else if (order.side === 'sell') existingSellOrders.push(order);
         }
         
         await detectAndLogFilledOrders(openGridOrderIds);
+
+        // canBuy/canSell look at FREE balance only, which the grid's own open
+        // orders lock up: a fully placed side can show under the minimum and
+        // would then be cancelled entirely. A side with grid orders on the book
+        // is fundable — each old order frees its funds when it's replaced.
+        const buySideOn = canBuy || existingBuyOrders.length > 0;
+        const sellSideOn = canSell || existingSellOrders.length > 0;
         
         // Generate target orders for each range
         const targetBuyOrders = [];
         const targetSellOrders = [];
         
         // Generate BUY target orders
-        let skippedBuys = 0;
-        if (canBuy && GRID_CONFIG.priceRangeGrids && ranges.buy) {
+        if (buySideOn && GRID_CONFIG.priceRangeGrids && ranges.buy) {
             for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
@@ -684,7 +635,6 @@ async function maintainGrid(bot, centerPrice, symbol) {
                     // Apply precision using CCXT
                     const pricePrecision = bot.priceToPrecision(symbol, price);
                     const amountPrecision = bot.amountToPrecision(symbol, amount);
-                    if (parseFloat(pricePrecision) > maxBuyPrice) { skippedBuys++; continue; }
                     
                     targetBuyOrders.push({
                         side: 'buy',
@@ -698,7 +648,7 @@ async function maintainGrid(bot, centerPrice, symbol) {
         }
         
         // Generate SELL target orders
-        if (canSell && GRID_CONFIG.priceRangeGrids && ranges.sell) {
+        if (sellSideOn && GRID_CONFIG.priceRangeGrids && ranges.sell) {
             for (const range of ranges.sell) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
@@ -723,7 +673,6 @@ async function maintainGrid(bot, centerPrice, symbol) {
             }
         }
         
-        if (skippedBuys > 0) log(`🛡️ BUY GUARD: skipped ${skippedBuys} buy order(s) priced above $${maxBuyPrice.toFixed(4)}`, 'warn');
         log(`📊 Target: ${targetBuyOrders.length} buy, ${targetSellOrders.length} sell | Existing grid: ${existingBuyOrders.length} buy, ${existingSellOrders.length} sell` + (manualOrderCount > 0 ? ` | Manual (untouched): ${manualOrderCount}` : ''), 'info');
         
         // Calculate total operations and delay per operation to spread over 5 minutes
@@ -738,71 +687,76 @@ async function maintainGrid(bot, centerPrice, symbol) {
         
         log(`⏱️ Spreading ${totalOperations} operations over ${GRID_CONFIG.orderOperationTimeWindow}s (${(delayPerOperation/1000).toFixed(1)}s delay between operations)`, 'info');
         
-        // STEP 1: Replace BUY orders one-by-one
-        const maxReplacements = Math.max(existingBuyOrders.length, targetBuyOrders.length);
-        
-        for (let i = 0; i < maxReplacements; i++) {
-            if (!isRunning) break;
-            if (checkTime()) break;
-            
-            // Cancel old order if exists
-            if (i < existingBuyOrders.length) {
-                try {
-                    const oldOrder = existingBuyOrders[i];
-                    await bot.cancelOrder(oldOrder.id, GRID_CONFIG.pair);
-                    log(`🗑️ Cancelled buy order @ $${oldOrder.price.toFixed(4)}`, 'info');
-                    await logGridOrderEvent({
-                        orderId: oldOrder.id,
-                        clientOrderId: oldOrder.clientOrderId || oldOrder.info?.custom_id,
-                        side: 'buy',
-                        price: parseFloat(oldOrder.price),
-                        amount: oldOrder.amount != null ? parseFloat(oldOrder.amount) : null,
-                        action: 'CANCELLED',
-                        priceRange: null
-                    });
-                    await delay(delayPerOperation); // Wait to avoid rate limits
-                } catch (e) {
-                    log(`⚠️ Failed to cancel buy order: ${e.message}`, 'warn');
-                    await delay(delayPerOperation); // Still wait even on error
-                }
+        // Replace orders one at a time, PLACING the new order before CANCELLING
+        // the old one, so a side never goes empty and the depth within 1% holds
+        // mid-refresh (LBank's $500 rule). Only if the free balance can't fund
+        // the new order while the old one still locks funds is the old one
+        // cancelled first. Old orders with no new counterpart are cancelled.
+        const cancelOld = async (side, oldOrder) => {
+            try {
+                await bot.cancelOrder(oldOrder.id, GRID_CONFIG.pair);
+                log(`🗑️ Cancelled ${side} order @ $${parseFloat(oldOrder.price).toFixed(4)}`, 'info');
+                await logGridOrderEvent({
+                    orderId: oldOrder.id,
+                    clientOrderId: oldOrder.clientOrderId || oldOrder.info?.custom_id,
+                    side,
+                    price: parseFloat(oldOrder.price),
+                    amount: oldOrder.amount != null ? parseFloat(oldOrder.amount) : null,
+                    action: 'CANCELLED',
+                    priceRange: null
+                });
+            } catch (e) {
+                log(`⚠️ Failed to cancel ${side} order: ${e.message}`, 'warn');
             }
-            
-            // Place new order if exists
-            if (i < targetBuyOrders.length) {
-                if (!isRunning) break;
-                if (checkTime()) break;
-                
-                const newOrder = targetBuyOrders[i];
-                
+            await delay(delayPerOperation); // Wait to avoid rate limits
+        };
+        const canFund = (side, order, bal) => !!bal && (side === 'buy'
+            ? bal.usdt >= parseFloat(order.price) * parseFloat(order.amount)
+            : bal.l1x >= parseFloat(order.amount));
+
+        // Replace order i of one side: place the new one, then cancel the old one.
+        const replaceAt = async (side, existing, targets, i) => {
+                const label = side === 'buy' ? 'Buy' : 'Sell';
+                const oldOrder = i < existing.length ? existing[i] : null;
+                const newOrder = i < targets.length ? targets[i] : null;
+                if (!newOrder) { if (oldOrder) await cancelOld(side, oldOrder); return; }
+
                 // Refresh balance before placing
                 invalidateBalanceCache();
-                const currentBal = await checkBalances(bot);
-                
+                let currentBal = await checkBalances(bot);
+                let oldDone = false;
+                if (!canFund(side, newOrder, currentBal) && oldOrder) {
+                    await cancelOld(side, oldOrder); // free its funds, then place
+                    oldDone = true;
+                    invalidateBalanceCache();
+                    currentBal = await checkBalances(bot);
+                }
                 const orderSizeUsdt = parseFloat(newOrder.price) * parseFloat(newOrder.amount);
-                if (!currentBal || currentBal.usdt < orderSizeUsdt) {
-                    log(`⚠️ Insufficient/unknown USDT for buy order ${i+1}. Need $${orderSizeUsdt.toFixed(2)}, have $${currentBal ? currentBal.usdt.toFixed(2) : 'n/a'}`, 'warn');
+                if (!canFund(side, newOrder, currentBal)) {
+                    log(side === 'buy'
+                        ? `⚠️ Insufficient/unknown USDT for buy order ${i+1}. Need $${orderSizeUsdt.toFixed(2)}, have $${currentBal ? currentBal.usdt.toFixed(2) : 'n/a'}`
+                        : `⚠️ Insufficient/unknown L1X for sell order ${i+1}. Need ${newOrder.amount}, have ${currentBal ? currentBal.l1x.toFixed(4) : 'n/a'}`, 'warn');
                     await delay(delayPerOperation); // Still wait to maintain timing
-                    continue;
+                    return;
                 }
-                
+
                 try {
                     const cid = generateGridClientOrderId();
                     const placed = await bot.createOrder(
                         symbol,
                         'limit',
-                        'buy',
+                        side,
                         newOrder.amount,
                         newOrder.price,
                         { clientOrderId: cid }
                     );
-                    
-                    buyBudgetUsed += orderSizeUsdt;
-                    activeBuyOrders++;
-                    log(`✅ Buy ${i+1}/${targetBuyOrders.length}: $${orderSizeUsdt.toFixed(2)} @ $${newOrder.price} [${newOrder.range.minPrice}-${newOrder.range.maxPrice}]`, 'info');
+                    if (side === 'buy') { buyBudgetUsed += orderSizeUsdt; activeBuyOrders++; }
+                    else { sellBudgetUsed += orderSizeUsdt; activeSellOrders++; }
+                    log(`✅ ${label} ${i+1}/${targets.length}: $${orderSizeUsdt.toFixed(2)} @ $${newOrder.price} [${newOrder.range.minPrice}-${newOrder.range.maxPrice}]`, 'info');
                     await logGridOrderEvent({
                         orderId: placed.id,
                         clientOrderId: cid,
-                        side: 'buy',
+                        side,
                         price: parseFloat(newOrder.price),
                         amount: parseFloat(newOrder.amount),
                         valueUsdt: orderSizeUsdt,
@@ -811,89 +765,25 @@ async function maintainGrid(bot, centerPrice, symbol) {
                     });
                     await delay(delayPerOperation); // Wait to avoid rate limits
                 } catch (e) {
-                    log(`❌ Failed to place buy order ${i+1} @ $${newOrder.price}: ${e.message}`, 'warn');
+                    log(`❌ Failed to place ${side} order ${i+1} @ $${newOrder.price}: ${e.message}`, 'warn');
                     await delay(delayPerOperation); // Still wait even on error
                 }
-            }
-        }
-        
-        // STEP 2: Replace SELL orders one-by-one
-        const maxSellReplacements = Math.max(existingSellOrders.length, targetSellOrders.length);
-        
-        for (let i = 0; i < maxSellReplacements; i++) {
-            if (!isRunning) break;
-            if (checkTime()) break;
-            
-            // Cancel old order if exists
-            if (i < existingSellOrders.length) {
-                try {
-                    const oldOrder = existingSellOrders[i];
-                    await bot.cancelOrder(oldOrder.id, GRID_CONFIG.pair);
-                    log(`🗑️ Cancelled sell order @ $${oldOrder.price.toFixed(4)}`, 'info');
-                    await logGridOrderEvent({
-                        orderId: oldOrder.id,
-                        clientOrderId: oldOrder.clientOrderId || oldOrder.info?.custom_id,
-                        side: 'sell',
-                        price: parseFloat(oldOrder.price),
-                        amount: oldOrder.amount != null ? parseFloat(oldOrder.amount) : null,
-                        action: 'CANCELLED',
-                        priceRange: null
-                    });
-                    await delay(delayPerOperation); // Wait to avoid rate limits
-                } catch (e) {
-                    log(`⚠️ Failed to cancel sell order: ${e.message}`, 'warn');
-                    await delay(delayPerOperation); // Still wait even on error
-                }
-            }
-            
-            // Place new order if exists
-            if (i < targetSellOrders.length) {
-                if (!isRunning) break;
-                if (checkTime()) break;
-                
-                const newOrder = targetSellOrders[i];
-                
-                // Refresh balance before placing
-                invalidateBalanceCache();
-                const currentBal = await checkBalances(bot);
-                
-                if (!currentBal || currentBal.l1x < parseFloat(newOrder.amount)) {
-                    log(`⚠️ Insufficient/unknown L1X for sell order ${i+1}. Need ${newOrder.amount}, have ${currentBal ? currentBal.l1x.toFixed(4) : 'n/a'}`, 'warn');
-                    await delay(delayPerOperation); // Still wait to maintain timing
-                    continue;
-                }
-                
-                try {
-                    const cid = generateGridClientOrderId();
-                    const placed = await bot.createOrder(
-                        symbol,
-                        'limit',
-                        'sell',
-                        newOrder.amount,
-                        newOrder.price,
-                        { clientOrderId: cid }
-                    );
-                    
-                    const orderSizeUsdt = parseFloat(newOrder.price) * parseFloat(newOrder.amount);
-                    sellBudgetUsed += orderSizeUsdt;
-                    activeSellOrders++;
-                    log(`✅ Sell ${i+1}/${targetSellOrders.length}: $${orderSizeUsdt.toFixed(2)} @ $${newOrder.price} [${newOrder.range.minPrice}-${newOrder.range.maxPrice}]`, 'info');
-                    await logGridOrderEvent({
-                        orderId: placed.id,
-                        clientOrderId: cid,
-                        side: 'sell',
-                        price: parseFloat(newOrder.price),
-                        amount: parseFloat(newOrder.amount),
-                        valueUsdt: orderSizeUsdt,
-                        action: 'PLACED',
-                        priceRange: `${newOrder.range.minPrice}-${newOrder.range.maxPrice}`
-                    });
-                    await delay(delayPerOperation); // Wait to avoid rate limits
-                } catch (e) {
-                    log(`❌ Failed to place sell order ${i+1} @ $${newOrder.price}: ${e.message}`, 'warn');
-                    await delay(delayPerOperation); // Still wait even on error
-                }
-            }
+                if (oldOrder && !oldDone) await cancelOld(side, oldOrder);
+        };
+
+        // Nearest the center first on both sides, and alternate buy/sell, so the
+        // two sides move together and the spread stays tight while the center
+        // shifts (all buys then all sells left them ~1% apart for minutes).
+        existingBuyOrders.sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+        targetBuyOrders.sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+        existingSellOrders.sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        targetSellOrders.sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        const steps = Math.max(existingBuyOrders.length, targetBuyOrders.length, existingSellOrders.length, targetSellOrders.length);
+        for (let i = 0; i < steps; i++) {
+            if (!isRunning || checkTime()) break;
+            await replaceAt('buy', existingBuyOrders, targetBuyOrders, i);
+            if (!isRunning || checkTime()) break;
+            await replaceAt('sell', existingSellOrders, targetSellOrders, i);
         }
         
         invalidateOpenOrdersCache();
