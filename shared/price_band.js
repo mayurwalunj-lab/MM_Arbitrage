@@ -36,6 +36,13 @@ function config() {
     // arbitrageur's profitable direction is buy on the CEX, sell on the DEX, so
     // our CEX buys are never sold into from the DEX. Clamped to 0-20.
     dexOffsetPct: clamp(num('BAND_DEX_OFFSET_PCT', 0), 0, 20),
+    // Where the center starts after a (re)start:
+    //   cex (default) — the CEX price, then ease toward the target ≤ maxMovePct per
+    //                   refresh. A restart never jumps the book.
+    //   target        — straight at the target (DEX EMA minus dexOffsetPct), for
+    //                   when the price is being moved on purpose. Falls back to cex
+    //                   when the target is a gap the band would freeze on.
+    seed: (process.env.BAND_SEED || '').toLowerCase() === 'target' ? 'target' : 'cex',
     // Treasury only SELLS (lifts the DEX when it runs high), so it covers the
     // UPSIDE gap. On the downside nobody buys, so freezing there would leave the
     // CEX stranded above the market. With this true, we only freeze on the upside
@@ -116,13 +123,9 @@ async function refresh(cexRef, c) {
   state.ema = (state.ema == null) ? dex : (c.alpha * dex + (1 - c.alpha) * state.ema);
   const target = state.ema * (1 - c.dexOffsetPct / 100);
 
-  // seed center from the CEX on first run (no jump on restart)
-  if (state.center == null) state.center = clamp(cexRef || dex, c.absMin, c.absMax);
-  let center = state.center;
-
   // freeze-beyond: if the DEX (EMA) runs too far from the CEX, don't chase it.
   // signedPct > 0 means DEX is ABOVE the CEX (upside), < 0 means BELOW (downside).
-  const ref = (cexRef && cexRef > 0) ? cexRef : center;
+  const ref = (cexRef && cexRef > 0) ? cexRef : (state.center != null ? state.center : dex);
   const signedPct = (target - ref) / ref * 100;
   const divPct = Math.abs(signedPct);
   let frozen = false, moved = false, reason = 'ok';
@@ -133,7 +136,17 @@ async function refresh(cexRef, c) {
   // treasury does not buy the dip and a frozen CEX would just sit above the market.
   const upsideBreak = signedPct > c.followMaxPct;
   const downsideBreak = signedPct < -c.followMaxPct;
-  if (upsideBreak || (downsideBreak && !c.freezeUpsideOnly)) {
+  const wouldFreeze = upsideBreak || (downsideBreak && !c.freezeUpsideOnly);
+
+  // seed the center on first run: from the CEX (no jump on restart), or straight
+  // at the target with BAND_SEED=target unless that is a gap we would freeze on.
+  let seeded = null;
+  if (state.center == null) {
+    seeded = (c.seed === 'target' && !wouldFreeze) ? 'target' : 'cex';
+    state.center = clamp(seeded === 'target' ? target : (cexRef || dex), c.absMin, c.absMax);
+  }
+  let center = state.center;
+  if (wouldFreeze) {
     frozen = true;
     reason = `frozen: DEX ${divPct.toFixed(2)}% ${signedPct > 0 ? 'above' : 'below'} CEX > ${c.followMaxPct}% (treasury handles it)`;
   } else {
@@ -144,6 +157,7 @@ async function refresh(cexRef, c) {
     if (step !== 0) moved = true;
     center = clamp(center + step, c.absMin, c.absMax);
     state.center = center;
+    if (seeded === 'target') { moved = true; reason = 'started at target (BAND_SEED=target)'; }
     if (center === c.absMin) reason = 'holding at absolute floor (BAND_ABS_MIN)';
     else if (center === c.absMax) reason = 'holding at absolute ceiling (BAND_ABS_MAX)';
   }
