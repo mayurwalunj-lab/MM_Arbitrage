@@ -140,6 +140,17 @@ function effectiveRanges(centerPrice) {
     return { buy: shift(src.buy), sell: shift(src.sell) };
 }
 
+// Lowest center at which every grid buy still sits at or above BAND_ABS_MIN.
+// The band holds its center at the floor, but the buys sit below the center,
+// so without this they'd bid (and LBank would print) under the floor.
+function floorSafeCenter() {
+    const buys = GRID_CONFIG.priceRangeGrids?.buy || [];
+    const base = GRID_CONFIG.baseCenterPrice;
+    if (!buys.length || !(base > 0)) return 0;
+    const lowestRatio = Math.min(...buys.map(r => r.minPrice)) / base;
+    return priceBand.config().absMin / lowestRatio;
+}
+
 // The center the grid should build around: the DEX-following band center when
 // DYNAMIC_BAND is on, otherwise the current market price (today's behavior).
 async function resolveGridCenter(marketPrice) {
@@ -147,6 +158,11 @@ async function resolveGridCenter(marketPrice) {
     try {
         const band = await priceBand.getBand(marketPrice);
         log(`📊 BAND center $${band.center.toFixed(4)} (DEX $${band.dexPrice ? band.dexPrice.toFixed(4) : 'n/a'}${band.frozen ? ', FROZEN' : ''}) — grid follows`, 'info');
+        const minCenter = floorSafeCenter();
+        if (band.center < minCenter) {
+            log(`🧱 FLOOR: grid center lifted $${band.center.toFixed(4)} -> $${minCenter.toFixed(4)} so no buy sits below $${priceBand.config().absMin}`, 'info');
+            return minCenter;
+        }
         return band.center;
     } catch (e) {
         log(`⚠️ band unavailable, grid centered on market: ${String(e.message).slice(0, 60)}`, 'warn');
