@@ -18,7 +18,10 @@ module.exports = {
     {
       name: 'LBank_GridManager',
       script: 'lbank/LBank_GridManager.js',
-      cwd: __dirname
+      cwd: __dirname,
+      // Give the stop handler time to cancel every grid order before pm2
+      // force-kills (default is 1.6s).
+      kill_timeout: 30000
     },
     {
       name: 'Server',

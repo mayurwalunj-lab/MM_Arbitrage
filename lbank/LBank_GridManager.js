@@ -84,7 +84,19 @@ const GRID_CONFIG = {
     
     baseCenterPrice: 8.50,
 
-    
+    // BUY GUARD (DYNAMIC_BAND only): never bid above the DEX price minus this %.
+    // A bid above the DEX lets anyone buy on the DEX and sell to us at a profit.
+    // While the band is still walking down to the DEX, buys above the cap are
+    // skipped (and old ones cancelled). If the DEX price is unknown, no buys.
+    // GRID_BUY_DEX_MARGIN_PCT < 0 turns the guard off.
+    buyDexMarginPct: Number.isFinite(Number(process.env.GRID_BUY_DEX_MARGIN_PCT)) && process.env.GRID_BUY_DEX_MARGIN_PCT !== ''
+        ? Number(process.env.GRID_BUY_DEX_MARGIN_PCT) : 0.5,
+
+    // Stop/restart cancels grid orders this many at a time, so they're all gone
+    // before pm2 kills the process (the old 5-minute spread left most behind).
+    stopCancelBatchSize: 5,
+    stopCancelBatchDelayMs: 250,
+
     // Refresh interval (seconds)
     refreshIntervalSeconds: 600,
     
@@ -140,6 +152,16 @@ async function resolveGridCenter(marketPrice) {
         log(`⚠️ band unavailable, grid centered on market: ${String(e.message).slice(0, 60)}`, 'warn');
         return marketPrice;
     }
+}
+
+// Highest price a grid buy may sit at: the DEX price minus buyDexMarginPct.
+// Infinity = guard off (band off or negative margin); 0 = DEX unknown, no buys.
+function buyPriceCap() {
+    if (!priceBand.isEnabled() || GRID_CONFIG.buyDexMarginPct < 0) return Infinity;
+    const band = priceBand.getBandSync();
+    const dex = band ? Number(band.dexPrice) : NaN;
+    if (!(dex > 0)) return 0;
+    return dex * (1 - GRID_CONFIG.buyDexMarginPct / 100);
 }
 
 // Prefix for orders placed by the Grid Manager API. Only these are cancelled on refresh/stop.
@@ -519,12 +541,14 @@ async function maintainGrid(bot, centerPrice, symbol) {
         let visualGrid = { bids: [], asks: [] };
         
         if (GRID_CONFIG.priceRangeGrids && ranges.buy) {
+            const maxBuyPrice = buyPriceCap();
             for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
                 const orderSizes = randomizeOrderSizes(range.totalValue, range.ordersPerRange);
                 
                 for (let i = 0; i < prices.length; i++) {
                     const price = prices[i];
+                    if (price > maxBuyPrice) continue;
                     const orderSize = orderSizes[i];
                     const amount = orderSize / price;
                     visualGrid.bids.push({ 
@@ -595,6 +619,12 @@ async function maintainGrid(bot, centerPrice, symbol) {
         const existingSellOrders = [];
         const openGridOrderIds = [];
         let manualOrderCount = 0;
+        const maxBuyPrice = buyPriceCap();
+        if (maxBuyPrice !== Infinity) {
+            log(maxBuyPrice > 0
+                ? `🛡️ BUY GUARD: no buys above $${maxBuyPrice.toFixed(4)} (DEX - ${GRID_CONFIG.buyDexMarginPct}%)`
+                : '🛡️ BUY GUARD: DEX price unknown — placing no buys this refresh', maxBuyPrice > 0 ? 'info' : 'warn');
+        }
         
         for (const order of openOrders) {
             if (!isRunning) break;
@@ -604,7 +634,8 @@ async function maintainGrid(bot, centerPrice, symbol) {
             }
             openGridOrderIds.push(order.id);
             const orderPrice = parseFloat(order.price);
-            const isBuyInRange = order.side === 'buy' && validRanges.buy.some(r => orderPrice >= r.min && orderPrice <= r.max);
+            const isBuyInRange = order.side === 'buy' && orderPrice <= maxBuyPrice
+                && validRanges.buy.some(r => orderPrice >= r.min && orderPrice <= r.max);
             const isSellInRange = order.side === 'sell' && validRanges.sell.some(r => orderPrice >= r.min && orderPrice <= r.max);
             
             if (isBuyInRange) {
@@ -639,6 +670,7 @@ async function maintainGrid(bot, centerPrice, symbol) {
         const targetSellOrders = [];
         
         // Generate BUY target orders
+        let skippedBuys = 0;
         if (canBuy && GRID_CONFIG.priceRangeGrids && ranges.buy) {
             for (const range of ranges.buy) {
                 const prices = calculateRandomPriceDistribution(range);
@@ -652,6 +684,7 @@ async function maintainGrid(bot, centerPrice, symbol) {
                     // Apply precision using CCXT
                     const pricePrecision = bot.priceToPrecision(symbol, price);
                     const amountPrecision = bot.amountToPrecision(symbol, amount);
+                    if (parseFloat(pricePrecision) > maxBuyPrice) { skippedBuys++; continue; }
                     
                     targetBuyOrders.push({
                         side: 'buy',
@@ -690,6 +723,7 @@ async function maintainGrid(bot, centerPrice, symbol) {
             }
         }
         
+        if (skippedBuys > 0) log(`🛡️ BUY GUARD: skipped ${skippedBuys} buy order(s) priced above $${maxBuyPrice.toFixed(4)}`, 'warn');
         log(`📊 Target: ${targetBuyOrders.length} buy, ${targetSellOrders.length} sell | Existing grid: ${existingBuyOrders.length} buy, ${existingSellOrders.length} sell` + (manualOrderCount > 0 ? ` | Manual (untouched): ${manualOrderCount}` : ''), 'info');
         
         // Calculate total operations and delay per operation to spread over 5 minutes
@@ -966,7 +1000,9 @@ async function startGridManager() {
 }
 
 /**
- * Cancel all open orders with rate limit protection (spread over 5 minutes)
+ * Cancel all grid orders quickly (batches of stopCancelBatchSize), then re-check
+ * and retry once. Used on stop/restart, where pm2 kills the process soon after
+ * the signal: spreading cancels over 5 minutes left most orders on the book.
  */
 async function cancelAllOrders(bot, symbol) {
     if (GRID_CONFIG.dryRun) {
@@ -976,58 +1012,57 @@ async function cancelAllOrders(bot, symbol) {
     
     setGridRefreshFlag();
     try {
-        const openOrders = await fetchOpenOrdersCached(bot, GRID_CONFIG.pair);
-        const gridOrders = openOrders.filter(o => isGridOrder(o));
-
-        if (gridOrders.length === 0) {
-            log("ℹ️ No grid orders to cancel" + (openOrders.length > 0 ? ` (${openOrders.length} manual order(s) left untouched)` : ''), 'info');
-            return;
-        }
-        
-        log(`🛑 Cancelling ${gridOrders.length} grid order(s) over ${GRID_CONFIG.orderOperationTimeWindow}s` + (openOrders.length > gridOrders.length ? ` (${openOrders.length - gridOrders.length} manual order(s) left untouched)` : '') + '...', 'warn');
-        
-        // Calculate delay per operation (spread over 5 minutes with 10s buffer)
-        const operationTimeWindow = (GRID_CONFIG.orderOperationTimeWindow - 10) * 1000; // Convert to ms
-        const delayPerOperation = Math.max(1000, operationTimeWindow / gridOrders.length);
-        
-        log(`⏱️ Delay between cancellations: ${(delayPerOperation/1000).toFixed(1)}s`, 'info');
-        
         let cancelledCount = 0;
         let failedCount = 0;
-        
-        for (let i = 0; i < gridOrders.length; i++) {
-            const order = gridOrders[i];
-            try {
-                await bot.cancelOrder(order.id, GRID_CONFIG.pair);
-                cancelledCount++;
-                log(`🗑️ Cancelled grid order ${i+1}/${gridOrders.length}: ${order.side} @ $${order.price.toFixed(4)}`, 'info');
-                await logGridOrderEvent({
-                    orderId: order.id,
-                    clientOrderId: order.clientOrderId || order.info?.custom_id,
-                    side: order.side,
-                    price: parseFloat(order.price),
-                    amount: order.amount != null ? parseFloat(order.amount) : null,
-                    action: 'CANCELLED',
-                    priceRange: 'stop'
-                });
-                if (i < gridOrders.length - 1) {
-                    await delay(delayPerOperation);
-                }
-            } catch (e) {
-                failedCount++;
-                log(`⚠️ Failed to cancel grid order ${i+1}/${gridOrders.length} (${order.id}): ${e.message}`, 'warn');
-                if (i < gridOrders.length - 1) {
-                    await delay(delayPerOperation);
-                }
+        for (let pass = 1; pass <= 2; pass++) {
+            invalidateOpenOrdersCache();
+            const openOrders = await fetchOpenOrdersCached(bot, GRID_CONFIG.pair);
+            const gridOrders = openOrders.filter(o => isGridOrder(o));
+            const manual = openOrders.length - gridOrders.length;
+
+            if (gridOrders.length === 0) {
+                if (pass === 1) log("ℹ️ No grid orders to cancel" + (manual > 0 ? ` (${manual} manual order(s) left untouched)` : ''), 'info');
+                break;
             }
+            log(`🛑 ${pass === 1 ? 'Cancelling' : 'Retrying'} ${gridOrders.length} grid order(s)` + (manual > 0 ? ` (${manual} manual order(s) left untouched)` : '') + '...', 'warn');
+            failedCount = 0;
+
+            const size = GRID_CONFIG.stopCancelBatchSize;
+            for (let i = 0; i < gridOrders.length; i += size) {
+                const batch = gridOrders.slice(i, i + size);
+                const results = await Promise.allSettled(batch.map(o => bot.cancelOrder(o.id, GRID_CONFIG.pair)));
+                for (let j = 0; j < batch.length; j++) {
+                    const order = batch[j];
+                    if (results[j].status === 'fulfilled') {
+                        cancelledCount++;
+                        log(`🗑️ Cancelled grid order: ${order.side} @ $${parseFloat(order.price).toFixed(4)}`, 'info');
+                        await logGridOrderEvent({
+                            orderId: order.id,
+                            clientOrderId: order.clientOrderId || order.info?.custom_id,
+                            side: order.side,
+                            price: parseFloat(order.price),
+                            amount: order.amount != null ? parseFloat(order.amount) : null,
+                            action: 'CANCELLED',
+                            priceRange: 'stop'
+                        });
+                    } else {
+                        failedCount++;
+                        log(`⚠️ Failed to cancel grid order ${order.id}: ${results[j].reason?.message || results[j].reason}`, 'warn');
+                    }
+                }
+                if (i + size < gridOrders.length) await delay(GRID_CONFIG.stopCancelBatchDelayMs);
+            }
+            // Re-check once even on success: an order placed by a refresh that was
+            // mid-flight when the stop came in can appear after the first fetch.
+            await delay(1000);
         }
         
         invalidateOpenOrdersCache();
         invalidateBalanceCache();
         
-        log(`✅ Grid cancellation complete: ${cancelledCount} cancelled, ${failedCount} failed`, 'info');
+        log(`✅ Grid cancellation complete: ${cancelledCount} cancelled, ${failedCount} failed` + (failedCount > 0 ? ' — CHECK OPEN ORDERS ON LBANK' : ''), failedCount > 0 ? 'warn' : 'info');
     } catch (e) {
-        log(`❌ Error cancelling orders: ${e.message}`, 'warn');
+        log(`❌ Error cancelling orders: ${e.message} — CHECK OPEN ORDERS ON LBANK`, 'warn');
     } finally {
         clearGridRefreshFlag();
     }
@@ -1047,7 +1082,7 @@ async function stopGridManager() {
         gridLoopInterval = null;
     }
     
-    // Cancel all orders before stopping (with rate limit protection)
+    // Cancel all grid orders before stopping
     if (gridBot && gridSymbol) {
         await cancelAllOrders(gridBot, gridSymbol);
     }
@@ -1070,12 +1105,18 @@ if (require.main === module) {
     // Run if executed directly
     startGridManager();
     
-    // Handle shutdown
-    process.on('SIGINT', async () => {
-        console.log("\n🛑 DETECTED SHUTDOWN SIGNAL (Ctrl+C)");
+    // Handle shutdown: pm2 stop/restart sends SIGINT, a plain kill sends SIGTERM.
+    // pm2 waits kill_timeout (ecosystem.config.js) before force-killing.
+    let shuttingDown = false;
+    const shutdown = async (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log(`\n🛑 DETECTED SHUTDOWN SIGNAL (${signal})`);
         await stopGridManager();
         process.exit();
-    });
+    };
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 // Export for use in other files
