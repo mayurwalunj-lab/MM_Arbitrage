@@ -51,7 +51,7 @@ const GRID_CONFIG = {
     //
     // LBank listing rule: best bid <-> best ask spread <= 1%, and $500-$1000 of
     // orders within +/-1% of the price on EACH side, or LBank suspends the pair's
-    // API. The sell side keeps $800 within 0.35%-0.95% of the center, $550 of it
+    // API. The sell side keeps $600 within 0.35%-0.95% of the center, $530 of it
     // within 0.65%, so it stays at $500+ inside 1% even when LBank measures from
     // the other edge of our 0.7% spread, and under the $1000 cap when it measures
     // from this edge (the far sells start at +3%, out of reach).
@@ -60,16 +60,16 @@ const GRID_CONFIG = {
     priceRangeGrids: {
         // SELL SIDE (Asks) - Above current price. $1500 total.
         sell: [
-            // within 1%: $800
+            // within 1%: $600
             { minPrice: 8.5298, maxPrice: 8.5425, totalValue: 300, ordersPerRange: 5, spacing: 'medium' }, // +0.35-0.5%
-            { minPrice: 8.5425, maxPrice: 8.5545, totalValue: 250, ordersPerRange: 5, spacing: 'medium' }, // +0.5-0.65%
-            { minPrice: 8.5545, maxPrice: 8.5808, totalValue: 250, ordersPerRange: 5, spacing: 'medium' }, // +0.65-0.95%
-            // beyond 1%: $700 in five narrow steps with wide gaps between them
+            { minPrice: 8.5425, maxPrice: 8.5545, totalValue: 230, ordersPerRange: 5, spacing: 'medium' }, // +0.5-0.65%
+            { minPrice: 8.5545, maxPrice: 8.5808, totalValue: 70, ordersPerRange: 2, spacing: 'medium' },  // +0.65-0.95%
+            // beyond 1%: $900 in five narrow steps with wide gaps between them
             { minPrice: 8.755, maxPrice: 8.7975, totalValue: 50, ordersPerRange: 1, spacing: 'wide' },    // +3-3.5%
-            { minPrice: 9.18, maxPrice: 9.265, totalValue: 100, ordersPerRange: 2, spacing: 'wide' },      // +8-9%
-            { minPrice: 9.775, maxPrice: 9.9025, totalValue: 150, ordersPerRange: 2, spacing: 'wide' },    // +15-16.5%
-            { minPrice: 10.54, maxPrice: 10.71, totalValue: 200, ordersPerRange: 2, spacing: 'wide' },     // +24-26%
-            { minPrice: 11.475, maxPrice: 11.73, totalValue: 200, ordersPerRange: 2, spacing: 'wide' },    // +35-38%
+            { minPrice: 9.18, maxPrice: 9.265, totalValue: 125, ordersPerRange: 2, spacing: 'wide' },      // +8-9%
+            { minPrice: 9.775, maxPrice: 9.9025, totalValue: 200, ordersPerRange: 2, spacing: 'wide' },    // +15-16.5%
+            { minPrice: 10.54, maxPrice: 10.71, totalValue: 250, ordersPerRange: 2, spacing: 'wide' },     // +24-26%
+            { minPrice: 11.475, maxPrice: 11.73, totalValue: 275, ordersPerRange: 2, spacing: 'wide' },    // +35-38%
         ],
 
         // BUY SIDE (Bids) - Below current price. $520 total, all within 1%:
