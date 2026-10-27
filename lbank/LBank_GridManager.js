@@ -46,29 +46,40 @@ const GRID_CONFIG = {
     minL1xBalance: 5,
     
     // Price Range Grid Configuration (BitMart-style)
+    // Prices are written for a $8.50 center (baseCenterPrice); with DYNAMIC_BAND
+    // on, every range slides with the band center, so the % distances hold.
+    //
+    // LBank listing rule: best bid <-> best ask spread <= 1%, and $500-$1000 of
+    // orders within +/-1% of the price on EACH side, or LBank suspends the pair's
+    // API. So each side keeps $700 within 0.35%-0.95% of the center ($200 over
+    // the minimum to absorb fills between refreshes, under the $1000 cap). $550
+    // of it sits within 0.65%, so the side still has $500+ inside 1% even when
+    // LBank measures from a price at the other edge of our 0.7% spread. Beyond 1%
+    // size grows with distance, so the far budget only trades on big moves.
     priceRangeGrids: {
-        // SELL SIDE (Asks) - Above current price
+        // SELL SIDE (Asks) - Above current price. $950 total.
         sell: [
-            // $9.35 - $10: ~$650 total, evenly spread (tight clustering near price)
-            { minPrice: 11.0, maxPrice: 15.0, totalValue: 50, ordersPerRange:2, spacing: 'medium' },
-            { minPrice: 10.0, maxPrice: 11.0, totalValue: 50, ordersPerRange:2, spacing: 'medium' },
-            { minPrice: 8.9, maxPrice: 10.0, totalValue: 100, ordersPerRange:2, spacing: 'medium' },
-            { minPrice: 8.55, maxPrice: 8.585, totalValue: 100, ordersPerRange: 5, spacing: 'medium' }, 
-            { minPrice: 8.54, maxPrice: 8.55, totalValue: 350, ordersPerRange: 7, spacing: 'medium' },  
-            { minPrice: 8.53, maxPrice: 8.54, totalValue: 300, ordersPerRange: 7, spacing: 'medium' },  
+            // within 1%: $700
+            { minPrice: 8.5298, maxPrice: 8.5425, totalValue: 300, ordersPerRange: 5, spacing: 'medium' }, // +0.35-0.5%
+            { minPrice: 8.5425, maxPrice: 8.5545, totalValue: 250, ordersPerRange: 5, spacing: 'medium' }, // +0.5-0.65%
+            { minPrice: 8.5545, maxPrice: 8.5808, totalValue: 150, ordersPerRange: 4, spacing: 'medium' }, // +0.65-0.95%
+            // beyond 1%: $250
+            { minPrice: 8.585, maxPrice: 8.755, totalValue: 50, ordersPerRange: 2, spacing: 'medium' },    // +1-3%
+            { minPrice: 8.755, maxPrice: 9.01, totalValue: 50, ordersPerRange: 2, spacing: 'medium' },     // +3-6%
+            { minPrice: 9.01, maxPrice: 9.35, totalValue: 75, ordersPerRange: 2, spacing: 'wide' },        // +6-10%
+            { minPrice: 9.35, maxPrice: 10.2, totalValue: 75, ordersPerRange: 2, spacing: 'wide' },        // +10-20%
         ],
-        
-        // BUY SIDE (Bids) - Below current price
+
+        // BUY SIDE (Bids) - Below current price. $1000 total.
         buy: [
-            // $9 - $9.3: ~$660 cumulative (tight clustering near price)
-            // { minPrice: 9.0, maxPrice: 9.3, totalValue: 660, ordersPerRange: 6, spacing: 'tight' },          
-            // $8 - $9: $520 total (main support band; was $150, same proportions)
-            { minPrice: 8.46, maxPrice: 8.47, totalValue: 280, ordersPerRange: 5, spacing: 'medium' },
-            { minPrice: 8.45, maxPrice: 8.46, totalValue: 170, ordersPerRange: 4, spacing: 'medium' },
-            { minPrice: 8.4447, maxPrice: 8.45, totalValue: 35, ordersPerRange: 2, spacing: 'medium' },                 // Below $8: Smaller defensive liquidity (wider spacing)
-            { minPrice: 7.5, maxPrice: 8.4447, totalValue: 35, ordersPerRange: 1, spacing: 'wide' },
-            // { minPrice: 7.0, maxPrice: 7.5, totalValue: 25, ordersPerRange: 3, spacing: 'wide' },
-            // { minPrice: 7.0, maxPrice: 7.5, totalValue: 30, ordersPerRange: 1, spacing: 'very_wide' }
+            // within 1%: $700
+            { minPrice: 8.4575, maxPrice: 8.4702, totalValue: 300, ordersPerRange: 5, spacing: 'medium' }, // -0.35-0.5%
+            { minPrice: 8.4448, maxPrice: 8.4575, totalValue: 250, ordersPerRange: 5, spacing: 'medium' }, // -0.5-0.65%
+            { minPrice: 8.4193, maxPrice: 8.4448, totalValue: 150, ordersPerRange: 4, spacing: 'medium' }, // -0.65-0.95%
+            // beyond 1%: $300
+            { minPrice: 8.245, maxPrice: 8.415, totalValue: 75, ordersPerRange: 2, spacing: 'medium' },    // -1-3%
+            { minPrice: 7.99, maxPrice: 8.245, totalValue: 100, ordersPerRange: 2, spacing: 'medium' },    // -3-6%
+            { minPrice: 7.65, maxPrice: 7.99, totalValue: 125, ordersPerRange: 2, spacing: 'wide' },       // -6-10%
         ]
     },
     
