@@ -19,6 +19,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), 
 
 const lib = require('./lib');
 const db = require('./db');
+const guards = require('./guards');
 
 const execute = process.argv.includes('--execute') ||
   (process.env.QDEX_EXECUTE || '').toLowerCase() === 'true';
@@ -33,6 +34,9 @@ const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 // / momentary spike. If it stays off that long, it's real -> correct it.
 const breakerConfirmTicks = Number(process.env.QDEX_BREAKER_CONFIRM_TICKS) || 3;
 let breachCount = 0;
+
+// Set up in main() from config: pauses swaps after repeated failures.
+let backoff = null;
 
 async function tick() {
   const config = lib.getConfig();
@@ -68,6 +72,16 @@ async function tick() {
     const devPct = ((xusdPrice - config.xusdPeg) / config.xusdPeg) * 100;
     rec.deviationPct = devPct;
     pegInfo = `XUSD=$${xusdPrice.toFixed(5)} (peg $${config.xusdPeg}, dev ${devPct.toFixed(3)}%) | WL1X oracle=$${oracleWL1X.toFixed(4)}`;
+    // The oracle keeps returning its last price if its feeder stops, so check
+    // how old that price is before trusting it (and before the breaker counts it).
+    const age = guards.checkOracleAge(await lib.getOracleRecord(config, provider, market.base.address),
+      Math.floor(Date.now() / 1000), config.oracleMaxAgeSec);
+    if (!age.ok) {
+      log(`ALERT: ${age.reason} — not trading on it. ${pegInfo}`);
+      breachCount = 0;
+      await record('skipped', age.reason);
+      return;
+    }
     if (Math.abs(devPct) > config.maxDeviationPct) {
       breachCount++;
       if (breachCount < breakerConfirmTicks) {
@@ -108,6 +122,27 @@ async function tick() {
   if (config.maxTradeBase > 0) sizeBase = Math.min(sizeBase, config.maxTradeBase);
   if (!(sizeBase > 0)) { log('no feasible size — skipping.'); await record('skipped', 'no feasible size'); return; }
 
+  // Never try to spend more than the wallet holds — that swap can only revert.
+  const wallet = lib.getWallet(config, provider);
+  const walletAddress = (wallet && wallet.address) || config.walletAddress;
+  if (walletAddress) {
+    const [balanceBase, balanceQuote] = await Promise.all([
+      lib.getTokenBalance(provider, market.base, walletAddress),
+      lib.getTokenBalance(provider, market.quote, walletAddress)
+    ]);
+    const cap = guards.capToBalance({ side, sizeBase, price, balanceBase, balanceQuote, minTradeBase: config.minTradeBase });
+    if (!(cap.sizeBase > 0)) {
+      const msg = side === 'sell'
+        ? `not enough ${market.base.symbol}: have ${balanceBase.toFixed(4)}, want to sell ${sizeBase.toFixed(4)}`
+        : `not enough ${market.quote.symbol}: have ${balanceQuote.toFixed(2)}, need ~${(sizeBase * price).toFixed(2)}`;
+      log(`ALERT: ${msg} — skipping.`);
+      await record('skipped', msg);
+      return;
+    }
+    if (cap.capped) log(`size capped to wallet balance: ${sizeBase.toFixed(4)} -> ${cap.sizeBase.toFixed(4)} ${market.base.symbol}`);
+    sizeBase = cap.sizeBase;
+  }
+
   const notional = sizeBase * price;
   rec.sizeBase = sizeBase;
   rec.notionalQuote = notional;
@@ -124,15 +159,25 @@ async function tick() {
     await record('executed', 'dry-run simulated');
     return;
   }
+  if (backoff && backoff.blocked(Date.now())) {
+    const mins = Math.ceil(backoff.remainingMs(Date.now()) / 60000);
+    log(`swaps paused after repeated failures — resuming in ${mins}m.`);
+    await record('skipped', `swaps paused after repeated failures (${mins}m left)`);
+    return;
+  }
   try {
     const receipt = await lib.executeSwap({ config, provider, side, amountBase: sizeBase, price, slippageBps: config.slippageBps, minOutHuman: q.minOutHuman, log });
     rec.txHash = receipt && receipt.hash;
     rec.blockNumber = receipt && receipt.blockNumber != null ? Number(receipt.blockNumber) : null;
     if (receipt && receipt.gasUsed != null) rec.gasUsed = receipt.gasUsed.toString();
     log(`swap sent: ${rec.txHash || '(no hash)'}`);
+    if (backoff) backoff.onSuccess();
     await record('executed', 'live swap');
   } catch (e) {
     log(`swap FAILED: ${String(e.message).slice(0, 160)}`);
+    if (backoff && backoff.onFailure(Date.now())) {
+      log(`ALERT: ${config.failBackoffAfter} swap failures in a row — pausing swaps for ${config.failBackoffMin}m.`);
+    }
     await record('skipped', 'swap failed: ' + String(e.message).slice(0, 100));
   }
 }
@@ -157,6 +202,9 @@ async function main() {
   log(`QDex MM starting — ${execute ? 'LIVE (real swaps)' : 'DRY-RUN (simulate)'} poll=${pollMs}ms once=${once}`);
   try { lib.validateConfig(lib.getConfig()); }
   catch (e) { console.error(`CONFIG ERROR: ${e.message}`); process.exit(1); }
+  const cfg = lib.getConfig();
+  backoff = guards.createFailureBackoff({ after: cfg.failBackoffAfter, pauseMs: cfg.failBackoffMin * 60 * 1000 });
+  log(`safety: oracle max age ${cfg.oracleMaxAgeSec > 0 ? guards.formatAge(cfg.oracleMaxAgeSec) : 'off'} | min trade ${cfg.minTradeBase} | pause swaps ${cfg.failBackoffMin}m after ${cfg.failBackoffAfter} failures`);
   try { await db.init(); log('accounting DB connected (qdex_actions)'); }
   catch (e) { log(`WARN accounting DB not connected (${String(e.message).slice(0, 80)}) — running without recording`); }
   // eslint-disable-next-line no-constant-condition
