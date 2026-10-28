@@ -206,6 +206,20 @@ npm run test:balances        # + private balance reads
 npm run test:production      # everything
 ```
 
+### Telegram alerts (`alerts_monitor`, read-only)
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (thresholds: the
+`ALERT_*` block in `.env.example`). Every minute it checks the DEX price vs the
+floor and Uniswap swaps, the LBank grid book (empty side, depth within 1% under
+$500, spread over 1%), pm2 bots stopping or restarting, and big grid fills.
+
+```bash
+npm run alerts:test          # send one test message to the chat
+npm run alerts:once          # run every check twice, print the result, exit
+npm run test:alerts          # unit tests for the alert rules
+pm2 start ecosystem.config.js --only alerts_monitor && pm2 save
+```
+
 ---
 
 ## 5. Checklists

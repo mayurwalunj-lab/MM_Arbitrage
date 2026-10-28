@@ -55,6 +55,16 @@ module.exports = {
       max_restarts: 50
     },
     {
+      // Telegram alerts (read-only): DEX price vs the floor and big Uniswap
+      // swaps, LBank grid book empty/thin, pm2 bots down/restarting, big grid
+      // fills. Needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env.
+      name: 'alerts_monitor',
+      script: 'alerts/alerts_monitor.js',
+      cwd: __dirname,
+      restart_delay: 10000,
+      max_restarts: 50
+    },
+    {
       // QDex market maker — holds the WL1X/XUSD pool to peg XUSD ($1). Live vs
       // dry-run is driven by QDEX_EXECUTE in .env (true = real swaps; else
       // simulate). Loop cadence = QDEX_POLL_MS; size cap = QDEX_MAX_TRADE_BASE.
