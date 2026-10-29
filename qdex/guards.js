@@ -2,17 +2,17 @@
 
 // Pure decision helpers for the QDex MM — no I/O, so they can be tested directly.
 
-// Is the oracle price fresh enough to act on? `record` is from
-// lib.getOracleRecord ({ price, updatedAt } or null). maxAgeSec <= 0 disables
-// the check. An unreadable or implausible timestamp fails closed: an oracle we
-// can't date is treated like a stale one.
-function checkOracleAge(record, nowSec, maxAgeSec) {
+// Is the price fresh enough to act on? `record` is { price, updatedAt } or null
+// (lib.getOracleRecord or backend_price.getBackendPrice); `label` names it in
+// the reason. maxAgeSec <= 0 disables the check. An unreadable or implausible
+// timestamp fails closed: a price we can't date is treated like a stale one.
+function checkOracleAge(record, nowSec, maxAgeSec, label = 'oracle') {
   if (!(maxAgeSec > 0)) return { ok: true, ageSec: null, reason: 'age check off' };
   const t = record ? Number(record.updatedAt) : NaN;
-  if (!Number.isFinite(t) || t <= 0) return { ok: false, ageSec: null, reason: 'oracle update time unreadable' };
+  if (!Number.isFinite(t) || t <= 0) return { ok: false, ageSec: null, reason: `${label} update time unreadable` };
   const ageSec = nowSec - t;
-  if (ageSec < -600) return { ok: false, ageSec, reason: 'oracle update time is in the future' };
-  if (ageSec > maxAgeSec) return { ok: false, ageSec, reason: `oracle stale: last update ${formatAge(ageSec)} ago (limit ${formatAge(maxAgeSec)})` };
+  if (ageSec < -600) return { ok: false, ageSec, reason: `${label} update time is in the future` };
+  if (ageSec > maxAgeSec) return { ok: false, ageSec, reason: `${label} stale: last update ${formatAge(ageSec)} ago (limit ${formatAge(maxAgeSec)})` };
   return { ok: true, ageSec, reason: 'fresh' };
 }
 

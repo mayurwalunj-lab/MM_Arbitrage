@@ -20,6 +20,8 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), 
 const lib = require('./lib');
 const db = require('./db');
 const guards = require('./guards');
+const backendPrice = require('./backend_price');
+const priceBand = require('../shared/price_band');
 
 const execute = process.argv.includes('--execute') ||
   (process.env.QDEX_EXECUTE || '').toLowerCase() === 'true';
@@ -37,6 +39,23 @@ let breachCount = 0;
 
 // Set up in main() from config: pauses swaps after repeated failures.
 let backoff = null;
+
+// WL1X USD price from the configured source, plus the record used for the
+// freshness check. backend_db errors (DB unreachable) come back as `error`.
+async function readWl1xPrice(config, provider, market) {
+  if (config.priceSource === 'backend_db') {
+    try {
+      const r = await backendPrice.getBackendPrice(config.backendPriceKey);
+      return { label: 'backend price', maxAgeSec: config.backendMaxAgeSec, price: r ? r.price : null, record: r, checkDexGap: true };
+    } catch (e) {
+      return { label: 'backend price', error: String(e.message).slice(0, 120) };
+    }
+  }
+  // The oracle keeps returning its last price if its feeder stops, so its
+  // update time is read too (latestPriceData) and checked before trusting it.
+  const price = await lib.getOraclePrice(config, provider, market.base.address);
+  return { label: 'oracle', maxAgeSec: config.oracleMaxAgeSec, price, record: await lib.getOracleRecord(config, provider, market.base.address), checkDexGap: false };
+}
 
 async function tick() {
   const config = lib.getConfig();
@@ -64,23 +83,41 @@ async function tick() {
   // 2. figure out the TARGET pool ratio + circuit breaker.
   let target, pegInfo = '';
   if (pegMode) {
-    const oracleWL1X = await lib.getOraclePrice(config, provider, market.base.address);
-    if (!(oracleWL1X > 0)) { log('oracle returned no WL1X price — skipping.'); await record('skipped', 'oracle no price'); return; }
+    const src = await readWl1xPrice(config, provider, market);
+    if (src.error) { log(`ALERT: ${src.label} unreadable (${src.error}) — skipping.`); breachCount = 0; await record('skipped', `${src.label} unreadable`); return; }
+    const oracleWL1X = src.price;
+    if (!(oracleWL1X > 0)) { log(`${src.label} returned no WL1X price — skipping.`); await record('skipped', `${src.label} no price`); return; }
     rec.oracleWl1xUsd = oracleWL1X;
     const xusdPrice = oracleWL1X / price;                 // current XUSD in USD
     rec.xusdPrice = xusdPrice;
     const devPct = ((xusdPrice - config.xusdPeg) / config.xusdPeg) * 100;
     rec.deviationPct = devPct;
-    pegInfo = `XUSD=$${xusdPrice.toFixed(5)} (peg $${config.xusdPeg}, dev ${devPct.toFixed(3)}%) | WL1X oracle=$${oracleWL1X.toFixed(4)}`;
-    // The oracle keeps returning its last price if its feeder stops, so check
-    // how old that price is before trusting it (and before the breaker counts it).
-    const age = guards.checkOracleAge(await lib.getOracleRecord(config, provider, market.base.address),
-      Math.floor(Date.now() / 1000), config.oracleMaxAgeSec);
+    pegInfo = `XUSD=$${xusdPrice.toFixed(5)} (peg $${config.xusdPeg}, dev ${devPct.toFixed(3)}%) | WL1X ${src.label}=$${oracleWL1X.toFixed(4)}`;
+    // Check how old the price is before trusting it (and before the breaker counts it).
+    const age = guards.checkOracleAge(src.record, Math.floor(Date.now() / 1000), src.maxAgeSec, src.label);
     if (!age.ok) {
       log(`ALERT: ${age.reason} — not trading on it. ${pegInfo}`);
       breachCount = 0;
       await record('skipped', age.reason);
       return;
+    }
+    // backend_db: an off-chain price far from Uniswap is more likely wrong than
+    // a real move, so skip it. If Uniswap can't be read, trade on the age check alone.
+    if (src.checkDexGap && config.priceMaxDexGapPct > 0) {
+      let dex = null;
+      try { dex = await priceBand.readDexPrice(); }
+      catch (e) { log(`WARN Uniswap price unreadable, gap check skipped: ${String(e.message).slice(0, 80)}`); }
+      if (dex > 0) {
+        const gapPct = ((oracleWL1X - dex) / dex) * 100;
+        pegInfo += ` | Uniswap=$${dex.toFixed(4)} (${gapPct >= 0 ? '+' : ''}${gapPct.toFixed(2)}%)`;
+        if (Math.abs(gapPct) > config.priceMaxDexGapPct) {
+          const reason = `${src.label} $${oracleWL1X.toFixed(4)} is ${gapPct.toFixed(2)}% from Uniswap $${dex.toFixed(4)} (limit ${config.priceMaxDexGapPct}%)`;
+          log(`ALERT: ${reason} — not trading on it. ${pegInfo}`);
+          breachCount = 0;
+          await record('skipped', reason);
+          return;
+        }
+      }
     }
     if (Math.abs(devPct) > config.maxDeviationPct) {
       breachCount++;
@@ -204,7 +241,10 @@ async function main() {
   catch (e) { console.error(`CONFIG ERROR: ${e.message}`); process.exit(1); }
   const cfg = lib.getConfig();
   backoff = guards.createFailureBackoff({ after: cfg.failBackoffAfter, pauseMs: cfg.failBackoffMin * 60 * 1000 });
-  log(`safety: oracle max age ${cfg.oracleMaxAgeSec > 0 ? guards.formatAge(cfg.oracleMaxAgeSec) : 'off'} | min trade ${cfg.minTradeBase} | pause swaps ${cfg.failBackoffMin}m after ${cfg.failBackoffAfter} failures`);
+  log(cfg.priceSource === 'backend_db'
+    ? `WL1X price: backend DB Config.${cfg.backendPriceKey} (max age ${cfg.backendMaxAgeSec > 0 ? guards.formatAge(cfg.backendMaxAgeSec) : 'off'}, max gap to Uniswap ${cfg.priceMaxDexGapPct > 0 ? cfg.priceMaxDexGapPct + '%' : 'off'})`
+    : `WL1X price: on-chain oracle (max age ${cfg.oracleMaxAgeSec > 0 ? guards.formatAge(cfg.oracleMaxAgeSec) : 'off'})`);
+  log(`safety: min trade ${cfg.minTradeBase} | pause swaps ${cfg.failBackoffMin}m after ${cfg.failBackoffAfter} failures`);
   try { await db.init(); log('accounting DB connected (qdex_actions)'); }
   catch (e) { log(`WARN accounting DB not connected (${String(e.message).slice(0, 80)}) — running without recording`); }
   // eslint-disable-next-line no-constant-condition
@@ -214,6 +254,8 @@ async function main() {
     await sleep(pollMs);
   }
   await db.end().catch(() => {});
+  await backendPrice.close();
+  process.exit(0); // --once: the Uniswap provider (gap check) would keep the process alive
 }
 
 main().catch((e) => { console.error(`FATAL: ${e.message}`); process.exit(1); });

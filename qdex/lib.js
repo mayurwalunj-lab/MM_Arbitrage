@@ -105,7 +105,11 @@ function getConfig() {
     routerAddress: envAddr('QDEX_ROUTER_ADDRESS'),
     baseToken: envAddr('QDEX_BASE_TOKEN'),        // WL1X — the token whose price we hold
     quoteToken: envAddr('QDEX_QUOTE_TOKEN'),      // XUSD
-    oracleAddress: envAddr('QDEX_ORACLE_ADDRESS'), // authoritative WL1X USD price
+    oracleAddress: envAddr('QDEX_ORACLE_ADDRESS'), // on-chain WL1X USD price (QDEX_PRICE_SOURCE=oracle)
+    // where the WL1X USD price comes from: 'oracle' (on-chain, default) or
+    // 'backend_db' (L1X app backend Config table, see qdex/backend_price.js)
+    priceSource: (process.env.QDEX_PRICE_SOURCE || 'oracle').toLowerCase() === 'backend_db' ? 'backend_db' : 'oracle',
+    backendPriceKey: process.env.QDEX_BACKEND_PRICE_KEY || 'MEXC_L1X_RATE',
     quoterAddress: envAddr('QDEX_QUOTER_ADDRESS'), // optional QuoterV2 (else pool-math quote)
     // wallet
     walletAddress: envAddr('QDEX_WALLET_ADDRESS') || null,
@@ -121,6 +125,8 @@ function getConfig() {
     deadlineSeconds: envNum('QDEX_DEADLINE_SECONDS', 600),
     // safety
     oracleMaxAgeSec: envNum('QDEX_ORACLE_MAX_AGE_SEC', 3600),  // skip if the oracle price is older (0 = off)
+    backendMaxAgeSec: envNum('QDEX_BACKEND_MAX_AGE_SEC', 7200), // same for backend_db (it updates ~hourly)
+    priceMaxDexGapPct: envNum('QDEX_PRICE_MAX_DEX_GAP_PCT', 10), // backend_db: skip if > this % from Uniswap (0 = off)
     minTradeBase: envNum('QDEX_MIN_TRADE_BASE', 0.5),          // skip trades smaller than this after the balance cap
     failBackoffAfter: envNum('QDEX_FAIL_BACKOFF_AFTER', 3),    // swap failures in a row before pausing (0 = off)
     failBackoffMin: envNum('QDEX_FAIL_BACKOFF_MIN', 60)        // how long to pause swaps, minutes
@@ -136,7 +142,10 @@ function validateConfig(config) {
   if (!config.routerAddress) missing.push('QDEX_ROUTER_ADDRESS');
   if (!config.baseToken) missing.push('QDEX_BASE_TOKEN');
   if (!config.quoteToken) missing.push('QDEX_QUOTE_TOKEN');
-  if (config.xusdPeg > 0 && !config.oracleAddress) missing.push('QDEX_ORACLE_ADDRESS (peg mode needs it)');
+  if (config.xusdPeg > 0 && config.priceSource === 'oracle' && !config.oracleAddress) missing.push('QDEX_ORACLE_ADDRESS (peg mode needs it)');
+  if (config.xusdPeg > 0 && config.priceSource === 'backend_db') {
+    for (const k of ['MARIADB_HOST', 'MARIADB_USERNAME', 'MARIADB_PASSWORD', 'MARIADB_DC']) if (!process.env[k]) missing.push(`${k} (QDEX_PRICE_SOURCE=backend_db)`);
+  }
   if (missing.length) throw new Error('Missing QDex config in .env: ' + missing.join(', '));
 }
 
