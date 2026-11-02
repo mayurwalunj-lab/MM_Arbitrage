@@ -27,11 +27,24 @@ Each tick (`qdex/qdex_mm.js`):
    estimate, so a price-moving swap won't revert on the slippage floor.
 7. Dry-run by default; live only with `--execute` or `QDEX_EXECUTE=true`.
 
+### WL1X price source
+`QDEX_PRICE_SOURCE` picks where peg mode gets the WL1X USD price:
+- `oracle` (default) — the on-chain oracle `QDEX_ORACLE_ADDRESS`.
+- `backend_db` — the L1X app backend database (`MARIADB_*`, read-only is enough):
+  `Config.ConfigValue` for `QDEX_BACKEND_PRICE_KEY` (default `MEXC_L1X_RATE`, which
+  the backend's `update:l1x_rate` job fills with CoinMarketCap's L1X price, about
+  hourly). Its update time is the later of `Config.UpdatedAt` (moves only when the
+  value changes) and the newest `L1XCoinMarketPrice` row.
+
 ### Safety checks
-- **Oracle age** — the oracle (`latestPriceData`) stores when WL1X was last updated
-  and keeps returning that price if its feeder stops. If the update is older than
-  `QDEX_ORACLE_MAX_AGE_SEC` (default 1 hour; it normally changes every ~5 min), the
-  tick is skipped with an `ALERT` log line and a `skipped` row.
+- **Price age** — the oracle keeps returning its last price if its feeder stops,
+  and the backend price freezes if its job stops. If the last update is older than
+  `QDEX_ORACLE_MAX_AGE_SEC` (oracle, default 1 hour; it normally changes every ~5 min)
+  or `QDEX_BACKEND_MAX_AGE_SEC` (backend_db, default 2 hours), the tick is skipped
+  with an `ALERT` log line and a `skipped` row. An unreadable backend DB skips too.
+- **Gap to Uniswap** (backend_db) — if the backend price is more than
+  `QDEX_PRICE_MAX_DEX_GAP_PCT` (default 10%) away from the Uniswap L1X price, the
+  tick is skipped. If Uniswap can't be read, the age check alone decides.
 - **Wallet balance** — a trade is capped to what the wallet holds (WL1X to sell,
   XUSD to buy). If that leaves less than `QDEX_MIN_TRADE_BASE`, it is skipped.
 - **Repeated failures** — after `QDEX_FAIL_BACKOFF_AFTER` failed swaps in a row,
