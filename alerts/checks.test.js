@@ -3,7 +3,7 @@
 // Run: node --test alerts/checks.test.js
 const test = require('node:test');
 const assert = require('node:assert');
-const { dexZone, gridBookHealth, pm2Changes, recentFills, createAlerter } = require('./checks');
+const { dexZone, blockChunks, gridBookHealth, pm2Changes, recentFills, createAlerter } = require('./checks');
 
 test('dexZone: below / near / ok around a $7 floor, 3% near band', () => {
   assert.strictEqual(dexZone(6.99, 7, 3), 'below');
@@ -11,6 +11,13 @@ test('dexZone: below / near / ok around a $7 floor, 3% near band', () => {
   assert.strictEqual(dexZone(7.20, 7, 3), 'near');
   assert.strictEqual(dexZone(7.21, 7, 3), 'ok');
   assert.strictEqual(dexZone(NaN, 7, 3), 'unknown');
+});
+
+test('blockChunks: pieces of at most 10 blocks covering the whole range', () => {
+  assert.deepStrictEqual(blockChunks(100, 104, 10), [[100, 104]]);
+  assert.deepStrictEqual(blockChunks(100, 124, 10), [[100, 109], [110, 119], [120, 124]]);
+  assert.deepStrictEqual(blockChunks(100, 109, 10), [[100, 109]]);
+  assert.deepStrictEqual(blockChunks(105, 104, 10), []);
 });
 
 const order = (side, price, usd, cid = 'grid_1') => ({ side, price, amount: usd / price, clientOrderId: cid });

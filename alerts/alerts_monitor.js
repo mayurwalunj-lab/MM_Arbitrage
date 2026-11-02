@@ -28,7 +28,7 @@ const mysql = require('mysql2/promise');
 const { ethers } = require('ethers');
 const telegram = require('../shared/telegram');
 const uni = require('../uniswap/lib');
-const { dexZone, gridBookHealth, pm2Changes, recentFills, createAlerter } = require('./checks');
+const { dexZone, blockChunks, gridBookHealth, pm2Changes, recentFills, createAlerter } = require('./checks');
 
 function envNum(name, fallback) {
   const raw = process.env[name];
@@ -50,7 +50,9 @@ const CONFIG = {
     on: envOn('ALERT_DEX'),
     floor: envNum('ALERT_DEX_FLOOR', envNum('BAND_ABS_MIN', 7)),
     nearPct: envNum('ALERT_DEX_NEAR_PCT', 3),
-    swapMinUsd: envNum('ALERT_DEX_SWAP_MIN_USD', 50)
+    swapMinUsd: envNum('ALERT_DEX_SWAP_MIN_USD', 50),
+    logChunkBlocks: Math.max(1, envNum('ALERT_DEX_LOG_CHUNK_BLOCKS', 10)),
+    logMaxBlocks: Math.max(1, envNum('ALERT_DEX_LOG_MAX_BLOCKS', 50))
   },
   grid: {
     on: envOn('ALERT_GRID'),
@@ -87,6 +89,23 @@ async function readOk(key, what) {
 const SWAP = new ethers.Interface(['event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)']);
 const dexState = { cfg: null, provider: null, lastBlock: null, zone: null };
 
+async function reportSwaps(m, eth, usdAt, from, to) {
+  const { cfg, provider } = dexState;
+  const l1xIs0 = m.pool.token0.toLowerCase() === m.l1x.address.toLowerCase();
+  for (const [a, b] of blockChunks(from, to, CONFIG.dex.logChunkBlocks)) {
+    const logs = await provider.getLogs({ address: cfg.poolAddress, topics: [SWAP.getEvent('Swap').topicHash], fromBlock: a, toBlock: b });
+    for (const l of logs) {
+      const e = SWAP.parseLog(l);
+      const l1xRaw = l1xIs0 ? e.args.amount0 : e.args.amount1;
+      const wethRaw = l1xIs0 ? e.args.amount1 : e.args.amount0;
+      const l1x = -Number(ethers.formatUnits(l1xRaw, m.l1x.decimals)); // + = bought from the pool
+      const usd = Math.abs(Number(ethers.formatUnits(wethRaw, m.weth.decimals))) * eth.price;
+      if (usd < CONFIG.dex.swapMinUsd) continue;
+      await telegram.send(`${l1x > 0 ? '🟢 DEX BUY' : '🔴 DEX SELL'} ${Math.abs(l1x).toFixed(2)} L1X (~$${usd.toFixed(0)}) on Uniswap\nprice after: $${usdAt(e.args.sqrtPriceX96).toFixed(4)}\nwallet: ${e.args.recipient}\ntx: https://etherscan.io/tx/${l.transactionHash}`);
+    }
+  }
+}
+
 async function checkDex() {
   if (!dexState.cfg) {
     dexState.cfg = uni.getConfig();
@@ -99,19 +118,17 @@ async function checkDex() {
   const price = usdAt(m.pool.sqrtPriceX96);
   const latest = await provider.getBlockNumber();
 
-  // swaps since the last check (capped so a long outage doesn't ask for too much)
+  // swaps since the last check. Read in chunks of ALERT_DEX_LOG_CHUNK_BLOCKS
+  // (free RPC plans allow only ~10 blocks per eth_getLogs) and look back at
+  // most ALERT_DEX_LOG_MAX_BLOCKS. A failed read skips those blocks and moves
+  // on, so the range can't keep growing, and never blocks the price check.
   if (dexState.lastBlock != null && latest > dexState.lastBlock) {
-    const from = Math.max(dexState.lastBlock + 1, latest - 2000);
-    const logs = await provider.getLogs({ address: cfg.poolAddress, topics: [SWAP.getEvent('Swap').topicHash], fromBlock: from, toBlock: latest });
-    const l1xIs0 = m.pool.token0.toLowerCase() === m.l1x.address.toLowerCase();
-    for (const l of logs) {
-      const e = SWAP.parseLog(l);
-      const l1xRaw = l1xIs0 ? e.args.amount0 : e.args.amount1;
-      const wethRaw = l1xIs0 ? e.args.amount1 : e.args.amount0;
-      const l1x = -Number(ethers.formatUnits(l1xRaw, m.l1x.decimals)); // + = bought from the pool
-      const usd = Math.abs(Number(ethers.formatUnits(wethRaw, m.weth.decimals))) * eth.price;
-      if (usd < CONFIG.dex.swapMinUsd) continue;
-      await telegram.send(`${l1x > 0 ? '🟢 DEX BUY' : '🔴 DEX SELL'} ${Math.abs(l1x).toFixed(2)} L1X (~$${usd.toFixed(0)}) on Uniswap\nprice after: $${usdAt(e.args.sqrtPriceX96).toFixed(4)}\nwallet: ${e.args.recipient}\ntx: https://etherscan.io/tx/${l.transactionHash}`);
+    const from = Math.max(dexState.lastBlock + 1, latest - CONFIG.dex.logMaxBlocks + 1);
+    try {
+      await reportSwaps(m, eth, usdAt, from, latest);
+      await readOk('dexswaps', 'Uniswap swaps');
+    } catch (e) {
+      await readFailed('dexswaps', `Uniswap swaps (blocks ${from}-${latest}, skipped)`, e);
     }
   }
   dexState.lastBlock = latest;
