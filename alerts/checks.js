@@ -11,6 +11,14 @@ function dexZone(price, floor, nearPct) {
   return 'ok';
 }
 
+// Split the inclusive block range [from, to] into [a, b] pieces of at most
+// `size` blocks each, for RPCs that cap the eth_getLogs range.
+function blockChunks(from, to, size) {
+  const out = [];
+  for (let a = from; a <= to; a += size) out.push([a, Math.min(a + size - 1, to)]);
+  return out;
+}
+
 // Health of the grid's own book from its open orders. Only orders whose client
 // id starts with `prefix` are counted (manual orders are ignored). Depth is the
 // USDT value of grid orders within 1% of the mid between the best grid bid/ask.
@@ -87,4 +95,4 @@ function createAlerter({ send, cooldownMs = 30 * 60 * 1000, now = () => Date.now
   };
 }
 
-module.exports = { dexZone, gridBookHealth, pm2Changes, recentFills, createAlerter };
+module.exports = { dexZone, blockChunks, gridBookHealth, pm2Changes, recentFills, createAlerter };
