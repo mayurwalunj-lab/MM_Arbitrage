@@ -73,14 +73,60 @@ function recentFills(fills, nowMs, windowMs) {
   return { kept: inWindow, buyUsd: sum('buy'), sellUsd: sum('sell'), count: inWindow.length };
 }
 
+// "3h 12m", "23m", "45s", "4d 2h" for a number of seconds.
+function fmtAgo(sec) {
+  if (sec == null || !Number.isFinite(sec)) return 'unknown';
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+  if (d > 0) return `${d}d ${h % 24}h`;
+  if (h > 0) return `${h}h ${m % 60}m`;
+  return `${m}m`;
+}
+
+function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ''); }
+
+// Why a bot isn't trading, from its own log lines. Checked newest line first;
+// the first line matching any rule wins. kind 'room' = no price room to trade.
+const REASON_RULES = [
+  ['room', 'no trade room', /No trade room/i],
+  ['room', 'best ask below the floor (gatekeeper)', /GATEKEEPER/],
+  ['frozen', 'price band frozen', /Band frozen/i],
+  ['funds', 'not enough balance', /Funds low|insufficient|not enough|Send ~[\d.]+ WL1X/i],
+  ['stopped', 'engine stopped', /ENGINE STOPPED|STOP file|HALT/],
+  ['api', 'exchange / RPC unreachable', /Failed to connect|fetch failed|ENOTFOUND|EAI_AGAIN|Could not resolve|ECONNRESET|ETIMEDOUT|Gateway Time-out|nonsupport|Too Many Requests|\b429\b/i],
+  ['price', 'price source stale / unreadable', /stale|unreadable|no price|gap to Uniswap/i],
+  ['paused', 'swaps paused after failures', /swaps paused/i],
+  ['failed', 'orders failing', /ABORT|Aborting|Fills not confirmed|Maker Failed|Taker Failed|swap failed|FAILED/],
+  ['error', 'error', /FATAL|❌|\bError\b/]
+];
+
+function lastReason(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = stripAnsi(lines[i]).trim();
+    if (!line) continue;
+    for (const [kind, label, re] of REASON_RULES) {
+      if (re.test(line)) return { kind, label, line: line.slice(0, 220) };
+    }
+  }
+  return null;
+}
+
+// Restarts at or after (nowMs - windowMs), from a list of restart times (ms).
+function recentRestarts(times, nowMs, windowMs) {
+  return times.filter((t) => nowMs - t <= windowMs);
+}
+
 // Alert de-duplication: the same key fires at most once per cooldown while the
-// problem lasts, and a recovery message is sent once when it clears.
+// problem lasts, and a recovery message is sent once when it clears. A raise can
+// pass its own { cooldownMs } (e.g. hourly reminders for long outages).
 function createAlerter({ send, cooldownMs = 30 * 60 * 1000, now = () => Date.now() }) {
   const active = new Map(); // key -> last sent ms
   return {
-    async raise(key, text) {
+    async raise(key, text, opts = {}) {
       const last = active.get(key);
-      if (last != null && now() - last < cooldownMs) return false;
+      const wait = opts.cooldownMs != null ? opts.cooldownMs : cooldownMs;
+      if (last != null && now() - last < wait) return false;
       active.set(key, now());
       await send(text);
       return true;
@@ -95,4 +141,7 @@ function createAlerter({ send, cooldownMs = 30 * 60 * 1000, now = () => Date.now
   };
 }
 
-module.exports = { dexZone, blockChunks, gridBookHealth, pm2Changes, recentFills, createAlerter };
+module.exports = {
+  dexZone, blockChunks, gridBookHealth, pm2Changes, recentFills, createAlerter,
+  fmtAgo, stripAnsi, lastReason, recentRestarts
+};

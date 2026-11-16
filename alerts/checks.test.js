@@ -3,7 +3,7 @@
 // Run: node --test alerts/checks.test.js
 const test = require('node:test');
 const assert = require('node:assert');
-const { dexZone, blockChunks, gridBookHealth, pm2Changes, recentFills, createAlerter } = require('./checks');
+const { dexZone, blockChunks, gridBookHealth, pm2Changes, recentFills, createAlerter, fmtAgo, lastReason, recentRestarts } = require('./checks');
 
 test('dexZone: below / near / ok around a $7 floor, 3% near band', () => {
   assert.strictEqual(dexZone(6.99, 7, 3), 'below');
@@ -87,4 +87,41 @@ test('createAlerter: once per cooldown, recovery sent once', async () => {
   assert.strictEqual(await a.clear('k', 'up'), false);     // not active any more
   assert.strictEqual(await a.clear('never', 'x'), false);
   assert.deepStrictEqual(sent, ['down', 'down', 'up']);
+});
+
+test('fmtAgo: seconds, minutes, hours, days', () => {
+  assert.strictEqual(fmtAgo(45), '45s');
+  assert.strictEqual(fmtAgo(23 * 60 + 10), '23m');
+  assert.strictEqual(fmtAgo(3 * 3600 + 12 * 60), '3h 12m');
+  assert.strictEqual(fmtAgo(110 * 86400 + 5 * 3600), '110d 5h');
+  assert.strictEqual(fmtAgo(null), 'unknown');
+});
+
+test('lastReason: newest matching line wins; info spam is skipped; colours stripped', () => {
+  const room = '\x1b[90m[12:19:06]\x1b[0m \x1b[33m⚠️ No trade room. Spread 7.0001-7.0400 outside fence [$6.98-$7.02] or tighter than buffer.\x1b[0m';
+  const band = '\x1b[90m[12:19:11]\x1b[0m \x1b[36m📊 BAND center $7.0000 [$6.9755–$7.0245] DEX $7.0734\x1b[0m';
+  const r = lastReason(['[12:00:00] ❌ Maker Failed: timeout', room, band, band]);
+  assert.strictEqual(r.kind, 'room');
+  assert.ok(r.line.startsWith('[12:19:06] ⚠️ No trade room'));
+  assert.strictEqual(lastReason(['[23:39:54] [GRID] ❌ Failed to connect: bitmart GET https://api-cloud.bitmart.com fetch failed']).kind, 'api');
+  assert.strictEqual(lastReason(['🛑 GATEKEEPER: Best Ask (6.9) < floor ($7.0000). Waiting.']).kind, 'room');
+  assert.strictEqual(lastReason(['🛑 ENGINE STOPPED.']).kind, 'stopped');
+  assert.strictEqual(lastReason(['epoch 21: parent holds 0.4767 WL1X — Send ~16.75 WL1X to 0x1471']).kind, 'funds');
+  assert.strictEqual(lastReason(['backend price unreadable']).kind, 'price');
+  assert.strictEqual(lastReason(['📊 BAND center', '']), null);
+});
+
+test('recentRestarts: only restarts inside the window', () => {
+  const now = 1_000_000;
+  assert.deepStrictEqual(recentRestarts([now - 11 * 60000, now - 9 * 60000, now], now, 10 * 60000), [now - 9 * 60000, now]);
+});
+
+test('createAlerter: a raise can use its own cooldown', async () => {
+  let t = 0; const sent = [];
+  const a = createAlerter({ send: async (m) => sent.push(m), cooldownMs: 1000, now: () => t });
+  await a.raise('idle', 'x', { cooldownMs: 5000 });
+  t = 2000;
+  assert.strictEqual(await a.raise('idle', 'x', { cooldownMs: 5000 }), false);
+  t = 5000;
+  assert.strictEqual(await a.raise('idle', 'x', { cooldownMs: 5000 }), true);
 });

@@ -1,8 +1,9 @@
 'use strict';
 
-// TELEGRAM SENDER — posts plain-text messages to one chat via the Bot API.
-// TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID come from .env; with either missing,
-// messages are only logged (so the monitor still runs, e.g. locally).
+// TELEGRAM SENDER — posts plain-text messages to one chat via the Bot API, and
+// reads commands sent to the bot (getUpdates). TELEGRAM_BOT_TOKEN and
+// TELEGRAM_CHAT_ID come from .env; with either missing, messages are only
+// logged (so the monitor still runs, e.g. locally).
 
 const https = require('https');
 
@@ -18,15 +19,15 @@ function isEnabled() {
   return !!(c.token && c.chatId);
 }
 
-function post(token, body) {
+function post(token, body, method = 'sendMessage', timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = https.request({
       hostname: 'api.telegram.org',
-      path: `/bot${token}/sendMessage`,
+      path: `/bot${token}/${method}`,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
-      timeout: 15000
+      timeout: timeoutMs
     }, (res) => {
       let raw = '';
       res.on('data', (c) => { raw += c; });
@@ -70,4 +71,26 @@ async function send(text) {
   return false;
 }
 
-module.exports = { config, isEnabled, send };
+// Messages sent to the bot from the configured chat only, after `offset`.
+// Long-polls up to waitSec. Returns { ok, messages: [{ id, text, date }], offset }.
+// Never throws; on any error ok is false, with no messages and the same offset.
+async function getCommands(offset, waitSec = 0) {
+  const c = config();
+  if (!c.token || !c.chatId) return { ok: false, messages: [], offset };
+  try {
+    const r = await post(c.token, { offset, timeout: waitSec, allowed_updates: ['message'] }, 'getUpdates', (waitSec + 15) * 1000);
+    if (!r.json || !r.json.ok) return { ok: false, messages: [], offset };
+    let next = offset;
+    const messages = [];
+    for (const u of r.json.result) {
+      next = Math.max(next || 0, u.update_id + 1);
+      const m = u.message;
+      if (m && m.text && String(m.chat && m.chat.id) === c.chatId) messages.push({ id: m.message_id, text: m.text.trim(), date: m.date });
+    }
+    return { ok: true, messages, offset: next };
+  } catch (_) {
+    return { ok: false, messages: [], offset };
+  }
+}
+
+module.exports = { config, isEnabled, send, getCommands };
