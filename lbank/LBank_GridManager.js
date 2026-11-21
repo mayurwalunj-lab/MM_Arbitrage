@@ -72,13 +72,13 @@ const GRID_CONFIG = {
             { minPrice: 11.475, maxPrice: 11.73, totalValue: 275, ordersPerRange: 1, spacing: 'wide' },    // +35-38%
         ],
 
-        // BUY SIDE (Bids) - Below current price. $520 total, all within 1%:
-        // $500 inside 0.65% (the minimum at either edge of the spread), so any
-        // fill can take this side under LBank's $500 until the next refresh.
+        // BUY SIDE (Bids) - Below current price. $120 total for now (the grid
+        // account is short of USDT), all within 1%. This is under LBank's $500
+        // depth rule; the full side was $520 (270 / 230 / 20).
         buy: [
-            { minPrice: 8.4575, maxPrice: 8.4702, totalValue: 270, ordersPerRange: 5, spacing: 'medium' }, // -0.35-0.5%
-            { minPrice: 8.4448, maxPrice: 8.4575, totalValue: 230, ordersPerRange: 5, spacing: 'medium' }, // -0.5-0.65%
-            { minPrice: 8.4193, maxPrice: 8.4448, totalValue: 20, ordersPerRange: 1, spacing: 'medium' },  // -0.65-0.95%
+            { minPrice: 8.4575, maxPrice: 8.4702, totalValue: 62, ordersPerRange: 5, spacing: 'medium' }, // -0.35-0.5%
+            { minPrice: 8.4448, maxPrice: 8.4575, totalValue: 53, ordersPerRange: 5, spacing: 'medium' }, // -0.5-0.65%
+            { minPrice: 8.4193, maxPrice: 8.4448, totalValue: 5, ordersPerRange: 1, spacing: 'medium' },  // -0.65-0.95%
         ]
     },
     
