@@ -34,6 +34,17 @@ test('gridBookHealth: a healthy grid has no problems', () => {
   assert.strictEqual(h.sells, 2);
   assert.ok(Math.abs(h.buyDepth - 520) < 1e-6);
   assert.ok(h.spreadPct < 1);
+  assert.deepStrictEqual(h.topBuys.map((o) => o.price), [6.97, 6.96]);  // highest first, manual order left out
+  assert.deepStrictEqual(h.topSells.map((o) => o.price), [7.03, 7.04]); // lowest first
+  assert.ok(Math.abs(h.topBuys[0].usd - 300) < 1e-6);
+});
+
+test('gridBookHealth: the 3 nearest orders per side', () => {
+  const buys = [6.9, 6.95, 6.97, 6.93].map((p) => order('buy', p, 50));
+  const sells = [7.1, 7.02, 7.05, 7.3].map((p) => order('sell', p, 50));
+  const h = gridBookHealth(buys.concat(sells));
+  assert.deepStrictEqual(h.topBuys.map((o) => o.price), [6.97, 6.95, 6.93]);
+  assert.deepStrictEqual(h.topSells.map((o) => o.price), [7.02, 7.05, 7.1]);
 });
 
 test('gridBookHealth: empty sell side (27 Oct screenshot)', () => {

@@ -22,7 +22,8 @@ function blockChunks(from, to, size) {
 // Health of the grid's own book from its open orders. Only orders whose client
 // id starts with `prefix` are counted (manual orders are ignored). Depth is the
 // USDT value of grid orders within 1% of the mid between the best grid bid/ask.
-function gridBookHealth(orders, { prefix = 'grid_', minDepthUsd = 500, maxSpreadPct = 1 } = {}) {
+// topBuys / topSells: the `top` grid orders nearest the mid on each side.
+function gridBookHealth(orders, { prefix = 'grid_', minDepthUsd = 500, maxSpreadPct = 1, top = 3 } = {}) {
   const grid = (orders || []).filter((o) => {
     const cid = o.clientOrderId || (o.info && o.info.custom_id);
     return typeof cid === 'string' && cid.startsWith(prefix);
@@ -46,7 +47,12 @@ function gridBookHealth(orders, { prefix = 'grid_', minDepthUsd = 500, maxSpread
   if (mid && sellDepth < minDepthUsd) problems.push(`sell depth within 1% $${sellDepth.toFixed(0)} < $${minDepthUsd}`);
   if (spreadPct != null && spreadPct > maxSpreadPct) problems.push(`spread ${spreadPct.toFixed(2)}% > ${maxSpreadPct}%`);
 
-  return { buys: buys.length, sells: sells.length, bestBid, bestAsk, mid, buyDepth, sellDepth, spreadPct, problems };
+  // nearest grid orders to the mid: highest buys, lowest sells
+  const row = (o) => ({ price: px(o), amount: left(o), usd: px(o) * left(o) });
+  const topBuys = buys.map(row).sort((a, b) => b.price - a.price).slice(0, top);
+  const topSells = sells.map(row).sort((a, b) => a.price - b.price).slice(0, top);
+
+  return { buys: buys.length, sells: sells.length, bestBid, bestAsk, mid, buyDepth, sellDepth, spreadPct, problems, topBuys, topSells };
 }
 
 // pm2 changes between two snapshots ({ name: { status, restarts } }).

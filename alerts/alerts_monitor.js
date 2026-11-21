@@ -538,6 +538,15 @@ async function statusReport() {
     L.push(`buy depth: ${mark(`$${h.buyDepth.toFixed(0)}`, h.buyDepth >= CONFIG.grid.minDepthUsd)} (need ≥ $${CONFIG.grid.minDepthUsd})`);
     L.push(`sell depth: ${mark(`$${h.sellDepth.toFixed(0)}`, h.sellDepth >= CONFIG.grid.minDepthUsd)} (need ≥ $${CONFIG.grid.minDepthUsd})`);
     if (h.spreadPct != null) L.push(`spread: ${mark(`${h.spreadPct.toFixed(2)}%`, h.spreadPct <= 1)} (${h.spreadPct <= 1 ? 'less' : 'MORE'} than 1%)`);
+    // nearest orders laid out like a book: sells (highest first), mid, buys
+    const ord = (o) => `$${o.price.toFixed(4)}  ${o.amount.toFixed(2)} L1X  $${o.usd.toFixed(2)}`;
+    L.push(`\nNEAREST ${h.topSells.length} SELL (grid)`);
+    if (h.topSells.length) h.topSells.slice().reverse().forEach((o) => L.push(`🔴 ${ord(o)}`));
+    else L.push('🔴 none');
+    L.push(`— mid ${h.mid ? `$${h.mid.toFixed(4)}` : 'n/a'} —`);
+    if (h.topBuys.length) h.topBuys.forEach((o) => L.push(`🟢 ${ord(o)}`));
+    else L.push('🟢 none');
+    L.push(`NEAREST ${h.topBuys.length} BUY (grid)`);
   }
 
   const now = Date.now();
