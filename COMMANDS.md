@@ -211,11 +211,16 @@ npm run test:production      # everything
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (thresholds: the
 `ALERT_*` block in `.env.example`). Every minute it checks the DEX price vs the
 floor and Uniswap swaps, the LBank grid book (empty side, depth within 1% under
-$500, spread over 1%), pm2 bots stopping or restarting, and big grid fills.
+$500, spread over 1%), pm2 bots stopping, restarting or crash-looping, big grid
+fills and every single grid fill, bots that are online but NOT trading (how
+long, and why: no trade room, API down, balance, stale price…), and LBank
+botA / botB / grid balances. A status report goes out every hour; send
+`/status` to the bot for one any time.
 
 ```bash
 npm run alerts:test          # send one test message to the chat
 npm run alerts:once          # run every check twice, print the result, exit
+node alerts/alerts_monitor.js --status   # print the status report and exit
 npm run test:alerts          # unit tests for the alert rules
 pm2 start ecosystem.config.js --only alerts_monitor && pm2 save
 ```
