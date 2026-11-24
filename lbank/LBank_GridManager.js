@@ -10,6 +10,7 @@ const path = require('path');
 const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const priceBand = require('../shared/price_band'); // dynamic DEX-following band (off unless DYNAMIC_BAND=true)
+const { classifyGoneOrder } = require('./gridFills');
 
 // Signals the arb monitor (arb/monitor.js) that our orders are being
 // mass-cancelled, so it must not trust the L1X orderbook during this window.
@@ -286,10 +287,16 @@ async function logGridOrderEvent(event) {
 }
 
 /**
- * Find grid orders we PLACED (no CANCELLED/FILLED) that are no longer open → they filled.
- * Log FILLED for each so they're marked in DB.
+ * Grid orders we PLACED (no CANCELLED/FILLED row yet) that are no longer open.
+ * An order leaving the book doesn't mean it filled: a cancel can time out on
+ * our side and still go through on LBank. So ask LBank what happened to each
+ * one and log FILLED only for the amount that really traded, CANCELLED when
+ * nothing traded. If LBank can't be asked, leave it for the next round.
+ * openGridOrderIds must come from a successful open-orders read.
  */
-async function detectAndLogFilledOrders(openGridOrderIds) {
+const FILL_CHECKS_PER_ROUND = 20; // order lookups per refresh (rate limits)
+
+async function detectAndLogFilledOrders(bot, openGridOrderIds) {
     if (!dbPool || GRID_CONFIG.dryRun) return;
     const openSet = new Set(openGridOrderIds);
     try {
@@ -297,25 +304,45 @@ async function detectAndLogFilledOrders(openGridOrderIds) {
             SELECT order_id, client_order_id, side, price, amount, value_usdt, price_range
             FROM lbank_grid_log e1
             WHERE e1.action = 'PLACED' AND e1.order_id IS NOT NULL
+            AND e1.created_at > NOW() - INTERVAL 7 DAY
             AND NOT EXISTS (
                 SELECT 1 FROM lbank_grid_log e2
                 WHERE e2.order_id = e1.order_id AND e2.action IN ('CANCELLED', 'FILLED')
             )
+            ORDER BY e1.id DESC
         `);
-        for (const r of rows || []) {
-            if (openSet.has(r.order_id)) continue;
-            await logGridOrderEvent({
-                orderId: r.order_id,
-                clientOrderId: r.client_order_id,
-                side: r.side,
-                price: parseFloat(r.price),
-                amount: r.amount != null ? parseFloat(r.amount) : null,
-                valueUsdt: r.value_usdt != null ? parseFloat(r.value_usdt) : null,
-                action: 'FILLED',
-                priceRange: r.price_range
-            });
-            log(`📗 FILLED (logged): ${r.side} order ${r.order_id} @ $${parseFloat(r.price).toFixed(4)}`, 'info');
+        const gone = (rows || []).filter((r) => !openSet.has(r.order_id));
+        let checked = 0;
+        for (const r of gone) {
+            if (!isRunning || checked >= FILL_CHECKS_PER_ROUND) break;
+            checked++;
+            const loggedPrice = parseFloat(r.price);
+            let order;
+            try {
+                order = await bot.fetchOrder(r.order_id, GRID_CONFIG.pair);
+            } catch (e) {
+                log(`⚠️ Could not check grid order ${r.order_id} (${r.side} @ $${loggedPrice.toFixed(4)}): ${e.message} — will check again`, 'warn');
+                await delay(300);
+                continue;
+            }
+            const res = classifyGoneOrder(order, loggedPrice);
+            const base = { orderId: r.order_id, clientOrderId: r.client_order_id, side: r.side, priceRange: r.price_range };
+            if (res.action === 'FILLED') {
+                await logGridOrderEvent({ ...base, action: 'FILLED', price: res.price, amount: res.amount, valueUsdt: res.valueUsdt });
+                const part = r.amount != null && res.amount < parseFloat(r.amount) - 1e-9 ? ` (part: ${res.amount} of ${parseFloat(r.amount)})` : '';
+                log(`📗 FILLED (confirmed by LBank): ${r.side} ${res.amount} @ $${res.price.toFixed(4)} = $${res.valueUsdt.toFixed(2)}${part} — order ${r.order_id}`, 'info');
+            } else if (res.action === 'CANCELLED') {
+                await logGridOrderEvent({
+                    ...base, action: 'CANCELLED', price: loggedPrice,
+                    amount: r.amount != null ? parseFloat(r.amount) : null, priceRange: 'gone-unfilled'
+                });
+                log(`🗑️ Order gone with nothing filled (cancelled on LBank): ${r.side} @ $${loggedPrice.toFixed(4)} — order ${r.order_id}`, 'info');
+            } else if (res.action === 'UNKNOWN') {
+                log(`⚠️ Grid order ${r.order_id} status unclear (${order && order.status}) — will check again`, 'warn');
+            }
+            await delay(300);
         }
+        if (gone.length > checked) log(`ℹ️ ${gone.length - checked} more gone grid order(s) to check next round`, 'info');
     } catch (e) {
         log(`❌ DB detectAndLogFilledOrders failed: ${e.message}`, 'warn');
     }
@@ -389,7 +416,7 @@ async function fetchOpenOrdersCached(bot, pair) {
         return orders;
     } catch (e) {
         log(`⚠️ Error fetching orders: ${e.message}`, 'warn');
-        return [];
+        return null; // unknown — a FAILED read is not an empty book
     }
 }
 
@@ -587,7 +614,13 @@ async function maintainGrid(bot, centerPrice, symbol) {
         if (!isRunning) return;
         const openOrders = await fetchOpenOrdersCached(bot, GRID_CONFIG.pair);
         if (!isRunning) return;
-        
+        // Can't see the book: skip this round. Treating it as empty marked every
+        // live order FILLED and placed a second full grid on top of the first.
+        if (openOrders == null) {
+            log(`⏭️ Open orders unreadable — skipping this refresh; existing orders stay as they are`, 'warn');
+            return;
+        }
+
         // Separate orders by side and range (grid orders only; manual frontend orders are never touched)
         const existingBuyOrders = [];
         const existingSellOrders = [];
@@ -608,7 +641,7 @@ async function maintainGrid(bot, centerPrice, symbol) {
             else if (order.side === 'sell') existingSellOrders.push(order);
         }
         
-        await detectAndLogFilledOrders(openGridOrderIds);
+        await detectAndLogFilledOrders(bot, openGridOrderIds);
 
         // canBuy/canSell look at FREE balance only, which the grid's own open
         // orders lock up: a fully placed side can show under the minimum and
@@ -906,7 +939,7 @@ async function cancelAllOrders(bot, symbol) {
         let failedCount = 0;
         for (let pass = 1; pass <= 2; pass++) {
             invalidateOpenOrdersCache();
-            const openOrders = await fetchOpenOrdersCached(bot, GRID_CONFIG.pair);
+            const openOrders = (await fetchOpenOrdersCached(bot, GRID_CONFIG.pair)) || [];
             const gridOrders = openOrders.filter(o => isGridOrder(o));
             const manual = openOrders.length - gridOrders.length;
 
